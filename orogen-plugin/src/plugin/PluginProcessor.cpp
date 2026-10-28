@@ -692,6 +692,77 @@ bool OrogenProcessor::savePresetFile (const juce::File& f, const juce::String& n
     return f.replaceWithText (json);
 }
 
+
+juce::var OrogenProcessor::bankToVar() const
+{
+    auto* o = new juce::DynamicObject();
+    o->setProperty ("format", "OROGEN bank");
+    o->setProperty ("version", 1);
+    juce::Array<juce::var> list;
+    for (const auto& pr : presets)
+        list.add (presetToVar (pr.name, pr.patch, pr.fx));
+    o->setProperty ("programs", list);
+    return juce::var (o);
+}
+
+bool OrogenProcessor::saveBankFile (const juce::File& f) const
+{
+    return f.replaceWithText (juce::JSON::toString (bankToVar(), false));
+}
+
+bool OrogenProcessor::loadBankFile (const juce::File& f)
+{
+    if (! f.existsAsFile()) return false;
+    auto parsed = juce::JSON::parse (f.loadFileAsString());
+    auto* o = parsed.getDynamicObject();
+    if (o == nullptr) return false;
+    const auto arr = o->getProperty ("programs");
+    if (auto* list = arr.getArray())
+    {
+        if (list->isEmpty()) return false;
+
+        // разбираем целиком, прежде чем что-то менять: битый банк не должен
+        // оставить плагин без пресетов
+        std::vector<Preset> loaded;
+        loaded.reserve ((size_t) list->size());
+        for (const auto& item : *list)
+        {
+            Patch p;
+            FxChain::Settings fx;
+            juce::String name;
+            if (! presetFromVar (item, p, fx, name)) return false;
+            if (name.isEmpty()) name = "Program " + juce::String ((int) loaded.size() + 1);
+            loaded.push_back ({ name, p, fx });
+        }
+
+        presets = std::move (loaded);
+        currentProgram = 0;
+        loadPreset (0);
+        return true;
+    }
+
+    // одиночный пресет тоже принимаем как банк из одной программы
+    Patch p;
+    FxChain::Settings fx;
+    juce::String name;
+    if (! presetFromVar (parsed, p, fx, name)) return false;
+    presets.clear();
+    presets.push_back ({ name.isEmpty() ? juce::String ("Program 1") : name, p, fx });
+    currentProgram = 0;
+    loadPreset (0);
+    return true;
+}
+
+int OrogenProcessor::addProgram (const juce::String& name)
+{
+    Patch p;
+    FxChain::Settings fx;
+    collectPatch (p, fx);
+    presets.push_back ({ name.isEmpty() ? juce::String ("Program ") + juce::String ((int) presets.size() + 1)
+                                         : name, p, fx });
+    return (int) presets.size() - 1;
+}
+
 void OrogenProcessor::getStateInformation (juce::MemoryBlock& dest)
 {
     // Состояние = параметры + имя патча. Пресетный JSON хранится отдельно:

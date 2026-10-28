@@ -534,6 +534,86 @@ int main()
     }
 
     // ---------------------------------------------------------------- 4
+
+    // ---------------------------------------------------------------- 3b
+    std::printf ("\n--- 3b. Банк программ ---\n");
+    {
+        OrogenProcessor p;
+        p.setPlayConfigDetails (0, 2, sr, 512);
+        p.prepareToPlay (sr, 512);
+
+        const int base = p.getNumPrograms();
+        // программа 1 (Terra Pad) + правки + новая программа из текущих значений
+        p.setCurrentProgram (1);
+        setP (p, "fx_chorusDelay", 91.0f);
+        setP (p, "fx_glitchFold", 2.5f);
+        setP (p, "gl_glide", 0.42f);
+        FxChain::Settings fxEdited;
+        Patch patchEdited;
+        p.collectPatch (patchEdited, fxEdited);
+        const int added = p.addProgram ("User Wave");
+        check (added == base, "программа добавляется в конец", num ((double) added, 0));
+        check (p.getNumPrograms() == base + 1, "число программ выросло",
+               num ((double) p.getNumPrograms(), 0));
+
+        const auto file = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                              .getChildFile ("orogen_bank.json");
+        check (p.saveBankFile (file), "банк сохраняется на диск");
+        const auto text = file.loadFileAsString();
+        check (text.contains ("OROGEN bank"), "в файле есть заголовок банка");
+        check (text.contains ("User Wave"), "имя новой программы в банке");
+        std::printf ("   банк: %d программ, %d байт\n", p.getNumPrograms(), (int) text.length());
+
+        // сбиваем состояние, потом грузим банк
+        p.setCurrentProgram (0);
+        setP (p, "fx_chorusDelay", 5.0f);
+        setP (p, "fx_glitchFold", 0.0f);
+        setP (p, "gl_glide", 0.0f);
+        check (p.loadBankFile (file), "банк загружается обратно");
+        check (p.getNumPrograms() == base + 1, "после загрузки то же число программ",
+               num ((double) p.getNumPrograms(), 0));
+
+        // правки лежат в добавленной программе (addProgram снял текущее состояние),
+        // а фабричная 1-я остаётся как была — так и работает банк
+        p.setCurrentProgram (added);
+        FxChain::Settings fxBack;
+        Patch patchBack;
+        p.collectPatch (patchBack, fxBack);
+        const double dDelay = std::fabs ((double) fxBack.chorusFw[0] - 91.0);
+        const double dFold  = std::fabs ((double) fxBack.glitchFold - 2.5);
+        const double dGlide = std::fabs ((double) patchBack.glide - 0.42);
+        std::printf ("   после круга: DEL %.1f, FOLD %.2f, glide %.2f\n",
+                     (double) fxBack.chorusFw[0], (double) fxBack.glitchFold, (double) patchBack.glide);
+        check (dDelay < 0.5 && dFold < 0.01 && dGlide < 0.01, "правки переживают банк",
+               num (std::max (dDelay, std::max (dFold, dGlide)), 3));
+
+        // имя программы тоже сохраняется (changeProgramName раньше жило только в памяти)
+        p.changeProgramName (0, "Renamed Init");
+        check (p.saveBankFile (file) && p.loadBankFile (file), "банк с переименованием");
+        check (p.getProgramName (0) == "Renamed Init", "переименование переживает банк",
+               p.getProgramName (0));
+
+        // битый файл не должен ломать набор программ
+        const auto bad = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                             .getChildFile ("orogen_bank_bad.json");
+        bad.replaceWithText ("{ \"format\": \"OROGEN bank\", \"programs\": [ {} ] }");
+        const int before = p.getNumPrograms();
+        check (! p.loadBankFile (bad), "битый банк отвергается");
+        check (p.getNumPrograms() == before, "после битого банка программы целы",
+               num ((double) p.getNumPrograms(), 0));
+
+        // одиночный пресет принимается как банк из одной программы
+        const auto one = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                             .getChildFile ("orogen_single.json");
+        p.savePresetFile (one, "Single");
+        check (p.loadBankFile (one), "одиночный пресет грузится как банк");
+        check (p.getNumPrograms() == 1 && p.getProgramName (0) == "Single",
+               "банк из одного пресета", p.getProgramName (0));
+
+        file.deleteFile();
+        bad.deleteFile();
+        one.deleteFile();
+    }
     std::printf ("\n--- 4. Задержка ---\n");
     {
         OrogenProcessor p;

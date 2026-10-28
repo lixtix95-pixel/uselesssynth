@@ -14,7 +14,7 @@ DSP-ядро на C++ без зависимостей + обёртка VST3 на
 Документы: `orogen-dsp/FX.md` (эффекты и замеры), `orogen-dsp/INSTRUMENT.md`,
 `orogen-dsp/FILTERS.md` (16 моделей фильтра и их АЧХ),
 `orogen-dsp/VERIFICATION.md` (263 проверки), `orogen-dsp/PERFORMANCE.md`,
-`orogen-plugin/PLUGIN.md` (обёртка), `gui-spec.md` (раскладка UI и сверка с макетом).
+`orogen-plugin/PLUGIN.md` (обёртка, банк программ), `gui-spec.md` (раскладка UI и сверка с макетом).
 
 Сборка плагина на **Windows / Visual Studio 2022** — распаковать
 `OROGEN-vst3-vs2022.zip` и запустить `build_vst3.bat` (JUCE скачается сам).

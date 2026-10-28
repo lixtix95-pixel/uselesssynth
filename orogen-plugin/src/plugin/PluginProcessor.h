@@ -73,6 +73,14 @@ public:
     void loadPreset (int index);
     bool loadPresetFile (const juce::File& f);
     bool savePresetFile (const juce::File& f, const juce::String& name) const;
+
+    // Банк: все программы (имя + патч + настройки FX) в одном JSON-файле.
+    // Нужен потому, что changeProgramName() меняет имя только в памяти, а
+    // хостовый «Save preset» сохраняет один патч, а не набор.
+    juce::var bankToVar() const;
+    bool saveBankFile (const juce::File& f) const;
+    bool loadBankFile (const juce::File& f);
+    int  addProgram (const juce::String& name);      // копия текущих параметров
     const Patch& currentPatch() const { return patch; }
 
     Instrument& engine() { return inst; }
