@@ -44,13 +44,16 @@ public:
     // --- главный экран: интерактивные зоны (чипы FX, дорожки мод-редактора) ---
     // Тот же путь, что и у мыши: mouseDown/mouseDrag/mouseUp вызывают эти методы,
     // поэтому тест дёргает ровно ту логику, что и пользователь.
-    enum class MainHit { none, fxChip, modNode, envAttack, envDecay, envSustain, lfoLane };
+    enum class MainHit { none, fxChip, fxChipPage, display, modNode, envAttack, envDecay, envSustain, lfoLane };
     MainHit hitMain (juce::Point<float> designPos, int& index) const;
     bool clickMain (juce::Point<float> designPos);      // клик: переключение чипа FX
     MainHit beginMainDrag (juce::Point<float> designPos);   // нажатие мыши
     bool dragMain  (juce::Point<float> designPos);      // перетаскивание узла/чипа
     void releaseMain();
     int  mainScreenHitCount() const;                    // сколько целей на экране (для теста)
+    int  chipPageCount() const;                         // страниц чипов FX
+    int  chipCount() const;                             // всего чипов (эффекты с ручкой доли)
+    juce::String chipParamId (int index) const;         // параметр чипа по порядку
 
     // --- банк программ (был только в API процессора) ---
     bool saveBankTo (const juce::File& f);              // весь банк в JSON
@@ -152,7 +155,9 @@ private:
     juce::Point<float> dragLast;
     bool dragMoved = false;
     // последняя ненулевая величина каждого чипа FX (для включения по клику)
-    std::array<float, 5> chipLast { 0.45f, 0.50f, 0.40f, 0.35f, 0.50f };
+    std::array<float, 10> chipLast { 0.45f, 0.50f, 0.40f, 0.35f, 0.45f,
+                                     0.50f, 0.45f, 0.40f, 0.45f, 0.50f };
+    int chipPage = 0;
 
     std::array<float, 8> slotLevels { };
     float masterLevel = 0.0f;

@@ -16,6 +16,38 @@ namespace orogen
 {
 
 // ---------------------------------------------------------------------------
+// Чипы эффектов на главном экране: все 10 эффектов с ручкой доли, по 5 на
+// страницу. Раньше чипов было ровно пять — остальные эффекты жили только в
+// колонке FX CHAIN и в оверлее.
+// ---------------------------------------------------------------------------
+namespace
+{
+    // Все эффекты, у которых есть ручка доли (mix): 10 штук, по 5 на страницу.
+    // EQ, DYNAMICS и WIDTH доли не имеют — они всегда в цепи и правятся в
+    // колонке FX CHAIN, поэтому чипов у них нет.
+    struct ChipDef { const char* name; int glyph; const char* id; float onValue; };
+    const ChipDef kChips[] =
+    {
+        { "DRIVE",   0, "fx_drive",       0.45f },
+        { "CHORUS",  1, "fx_chorusMix",   0.50f },
+        { "DELAY",   2, "fx_delayMix",    0.40f },
+        { "REVERB",  3, "fx_reverbMix",   0.35f },
+        { "PLATE",   3, "fx_plateMix",    0.40f },
+        { "MATERIAL",4, "fx_materialMix", 0.45f },
+        { "SPECTRE", 5, "fx_spectreMix",  0.50f },
+        { "GLITCH",  6, "fx_glitchMix",   0.40f },
+        { "ROBIN",   7, "fx_robinMix",    0.45f },
+        { "COMB",    8, "fx_combMix",     0.45f }
+    };
+    constexpr int kChipTotal = (int) (sizeof (kChips) / sizeof (kChips[0]));
+    constexpr int kChipsPerPage = 5;
+
+    juce::Rectangle<float> chipPagerRect() { return { 886.0f, 578.0f, 78.0f, 16.0f }; }
+    // сам дисплей с волной: раньше только показывал, теперь и тянется
+    juce::Rectangle<float> displayRect() { return { 248.0f, 66.0f, 736.0f, 214.0f }; }
+}
+
+// ---------------------------------------------------------------------------
 // Кэш вейвтейблов: банк строится один раз (≈70 мс) и переиспользуется всеми
 // экземплярами редактора. Дисплей рисует настоящую форму волны выбранной
 // таблицы, а не «декоративную синусоиду».
@@ -1693,33 +1725,25 @@ void OrogenEditor::paintCentreKnobs (juce::Graphics& g)
 // ------- отрисовка: цепь эффектов ------------------------------------------
 void OrogenEditor::paintChips (juce::Graphics& g)
 {
-    struct Chip { const char* name; int glyph; const char* id; };
-    static const Chip chips[5] =
+    // чипы эффектов: по 5 на страницу, все 10 эффектов с ручкой доли
+    for (int i = 0; i < kChipsPerPage; ++i)
     {
-        { "DRIVE",   0, "fx_drive" },
-        { "CHORUS",  1, "fx_chorusMix" },
-        { "DELAY",   2, "fx_delayMix" },
-        { "REVERB",  3, "fx_reverbMix" },
-        { "SPECTRE", 4, "fx_spectreMix" }
-    };
+        const int idx = chipPage * kChipsPerPage + i;
+        if (idx >= kChipTotal) break;
 
-    for (int i = 0; i < 5; ++i)
-    {
-        const float x = 254.0f + 146.0f * (float) i;
-        const juce::Rectangle<float> r (x, 598.0f, 120.0f, 34.0f);
-
-        const float mix = juce::jlimit (0.0f, 1.0f, pv (chips[i].id));
+        const auto r = chipRect (i);
+        const float mix = juce::jlimit (0.0f, 1.0f, pv (kChips[idx].id));
         const bool on = mix > 0.005f;
 
         draw::panel (g, r, 3.0f, on ? Palette::panelAlt : Palette::panel,
                      on ? Palette::lineMid : Palette::line);
 
-        draw::fxGlyph (g, chips[i].glyph, { r.getX() + 9.0f, r.getCentreY() - 8.0f, 16.0f, 16.0f },
+        draw::fxGlyph (g, kChips[idx].glyph, { r.getX() + 9.0f, r.getCentreY() - 8.0f, 16.0f, 16.0f },
                        on ? Palette::text : Palette::textFaint);
 
         g.setColour (on ? Palette::textDim : Palette::textFaint);
         g.setFont (orFont (6.8f));
-        g.drawText (spaced (chips[i].name),
+        g.drawText (spaced (kChips[idx].name),
                     juce::Rectangle<int> ((int) r.getX() + 30, (int) r.getY() + 6, 80, 10),
                     juce::Justification::centredLeft, false);
 
@@ -1731,7 +1755,7 @@ void OrogenEditor::paintChips (juce::Graphics& g)
         g.fillRoundedRectangle (bar.withWidth (juce::jmax (0.0f, bar.getWidth() * mix)), 1.5f);
 
         // пунктирный «кабель» между чипами
-        if (i < 4)
+        if (i < kChipsPerPage - 1 && idx + 1 < kChipTotal)
         {
             const float x0 = r.getRight() + 3.0f, x1 = r.getRight() + 23.0f;
             const float y = r.getCentreY();
@@ -1743,6 +1767,17 @@ void OrogenEditor::paintChips (juce::Graphics& g)
             g.setColour (Palette::lineMid);
             g.fillEllipse (x1 + 1.0f, y - 1.5f, 3.0f, 3.0f);
         }
+    }
+
+    // кнопка страниц чипов (та же логика, что у колонки FX CHAIN)
+    if (chipPageCount() > 1)
+    {
+        const auto rr = chipPagerRect().reduced (0.5f);
+        draw::panel (g, rr, 3.0f, Palette::panelAlt, Palette::line);
+        g.setColour (Palette::textDim);
+        g.setFont (orFont (7.5f));
+        g.drawText ("<  " + juce::String (chipPage + 1) + " / " + juce::String (chipPageCount()) + "  >",
+                    rr.toNearestInt(), juce::Justification::centred, false);
     }
 }
 
@@ -1907,8 +1942,6 @@ void OrogenEditor::showBankMenu()
 
 namespace
 {
-    // «рабочие» величины смеси для включения чипа кликом
-    constexpr float kChipOnValue[5] = { 0.45f, 0.50f, 0.40f, 0.35f, 0.50f };
     // сколько пикселей макета соответствует полному ходу параметра
     constexpr float kPxPerFullRange = 260.0f;
     constexpr float kNodeGrabPx = 13.0f;
@@ -1918,6 +1951,20 @@ juce::Rectangle<float> OrogenEditor::chipRect (int i) const
 {
     return { 254.0f + 146.0f * (float) i, 598.0f, 120.0f, 34.0f };
 }
+
+int OrogenEditor::chipCount() const { return kChipTotal; }
+
+int OrogenEditor::chipPageCount() const
+{
+    return (kChipTotal + kChipsPerPage - 1) / kChipsPerPage;
+}
+
+juce::String OrogenEditor::chipParamId (int index) const
+{
+    if (index < 0 || index >= kChipTotal) return {};
+    return kChips[index].id;
+}
+
 
 juce::Rectangle<float> OrogenEditor::modLane (int lane) const
 {
@@ -1954,8 +2001,17 @@ OrogenEditor::MainHit OrogenEditor::hitMain (juce::Point<float> p, int& index) c
 {
     index = -1;
 
-    for (int i = 0; i < 5; ++i)
-        if (chipRect (i).contains (p)) { index = i; return MainHit::fxChip; }
+    if (chipPagerRect().contains (p)) { index = -1; return MainHit::fxChipPage; }
+
+    for (int i = 0; i < kChipsPerPage && chipPage * kChipsPerPage + i < kChipTotal; ++i)
+        if (chipRect (i).contains (p))
+        {
+            index = chipPage * kChipsPerPage + i;
+            return MainHit::fxChip;
+        }
+
+    // дисплей: горизонталь — позиция в таблице (p0), вертикаль — варп (p1)
+    if (displayRect().contains (p)) { index = -1; return MainHit::display; }
 
     // дорожка мод-матрицы: узел каждого из 8 маршрутов
     {
@@ -2005,8 +2061,8 @@ bool OrogenEditor::nudgeParam (const juce::String& id, float deltaNorm)
 
 int OrogenEditor::mainScreenHitCount() const
 {
-    // 5 чипов FX + 8 узлов матрицы + полоса LFO + 3 узла конверта
-    return 5 + 8 + 1 + 3;
+    // дисплей + 5 чипов на странице + кнопка страниц + 8 узлов матрицы + полоса LFO + 3 узла конверта
+    return 1 + kChipsPerPage + 1 + 8 + 1 + 3;
 }
 
 bool OrogenEditor::clickMain (juce::Point<float> designPos)
@@ -2014,11 +2070,17 @@ bool OrogenEditor::clickMain (juce::Point<float> designPos)
     int index = -1;
     const auto hit = hitMain (designPos, index);
 
-    if (hit == MainHit::fxChip && index >= 0 && index < 5)
+    if (hit == MainHit::fxChipPage)
     {
-        static const char* ids[5] = { "fx_drive", "fx_chorusMix", "fx_delayMix",
-                                      "fx_reverbMix", "fx_spectreMix" };
-        if (auto* prm = proc.apvts.getParameter (ids[index]))
+        const int n = chipPageCount();
+        chipPage = n <= 1 ? 0 : (chipPage + 1) % n;
+        repaint();
+        return true;
+    }
+
+    if (hit == MainHit::fxChip && index >= 0 && index < kChipTotal)
+    {
+        if (auto* prm = proc.apvts.getParameter (kChips[index].id))
         {
             const float now = prm->getValue();
             if (now > 0.001f)
@@ -2028,9 +2090,8 @@ bool OrogenEditor::clickMain (juce::Point<float> designPos)
             }
             else
             {
-                // возвращаем прежнюю величину, если она была, иначе рабочую
                 float target = chipLast[(size_t) index];
-                if (target <= 0.001f) target = kChipOnValue[index];
+                if (target <= 0.001f) target = kChips[index].onValue;
                 prm->setValueNotifyingHost (juce::jlimit (0.0f, 1.0f, target));
             }
             repaint();
@@ -2051,12 +2112,18 @@ bool OrogenEditor::dragMain (juce::Point<float> designPos)
     switch (dragTarget)
     {
         case MainHit::fxChip:
-        {
-            static const char* ids[5] = { "fx_drive", "fx_chorusMix", "fx_delayMix",
-                                          "fx_reverbMix", "fx_spectreMix" };
-            if (dragIndex >= 0 && dragIndex < 5) nudgeParam (ids[dragIndex], d.x / kPxPerFullRange);
+            if (dragIndex >= 0 && dragIndex < kChipTotal)
+                nudgeParam (kChips[dragIndex].id, d.x / kPxPerFullRange);
             break;
-        }
+
+        case MainHit::fxChipPage:
+            break;
+
+        case MainHit::display:
+            // волна на дисплее следует за p0/p1, поэтому тянем именно их
+            nudgeParam (slotId ("p0"), d.x / kPxPerFullRange * 2.2f);
+            nudgeParam (slotId ("p1"), -d.y / juce::jmax (1.0f, displayRect().getHeight()) * 2.2f);
+            break;
 
         case MainHit::modNode:
             // вертикаль: полный ход дорожки = весь диапазон −1…+1
@@ -2129,7 +2196,8 @@ void OrogenEditor::mouseUp (const juce::MouseEvent& e)
 {
     const juce::Point<float> designPos { e.position.x / juce::jmax (0.01f, kx()),
                                          e.position.y / juce::jmax (0.01f, ky()) };
-    if (dragTarget == MainHit::fxChip && ! dragMoved) clickMain (designPos);
+    if ((dragTarget == MainHit::fxChip || dragTarget == MainHit::fxChipPage) && ! dragMoved)
+        clickMain (designPos);
     releaseMain();
 }
 

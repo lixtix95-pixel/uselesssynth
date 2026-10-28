@@ -1547,27 +1547,77 @@ int main()
 
                 // 10.1 чипы FX: клик включает эффект, повторный — выключает
                 {
-                    static const char* ids[5] = { "fx_drive", "fx_chorusMix", "fx_delayMix",
-                                                  "fx_reverbMix", "fx_spectreMix" };
                     int ok = 0;
                     juce::StringArray bad;
                     for (int i = 0; i < 5; ++i)
                     {
+                        const juce::String idS = ore->chipParamId (i);
+                        const char* ids[1] = { idS.toRawUTF8() };
                         const juce::Point<float> chip (254.0f + 146.0f * (float) i + 60.0f, 615.0f);
                         // приводим смесь к нулю: тест проверяет именно жест, а не патч
-                        if (auto* prm = p.apvts.getParameter (ids[i])) prm->setValueNotifyingHost (0.0f);
-                        const float before = norm (ids[i]);
+                        if (auto* prm = p.apvts.getParameter (ids[0])) prm->setValueNotifyingHost (0.0f);
+                        const float before = norm (ids[0]);
                         ore->clickMain (chip);
-                        const float on = norm (ids[i]);
+                        const float on = norm (ids[0]);
                         ore->clickMain (chip);
-                        const float off = norm (ids[i]);
+                        const float off = norm (ids[0]);
                         std::printf ("   чип %-16s: %.3f -> %.3f -> %.3f\n",
-                                     ids[i], (double) before, (double) on, (double) off);
-                        if (on > before + 0.01f && off < 0.01f) ++ok; else bad.add (ids[i]);
+                                     ids[0], (double) before, (double) on, (double) off);
+                        if (on > before + 0.01f && off < 0.01f) ++ok; else bad.add (ids[0]);
                     }
                     std::printf ("   чипы FX: %d / 5 включаются кликом\n", ok);
                     check (ok == 5, "клик по чипу FX включает и выключает эффект",
                            bad.isEmpty() ? juce::String ("5 / 5") : bad.joinIntoString (", "));
+                }
+
+                // 10.1b страницы чипов: все 10 эффектов с ручкой доли достижимы
+                {
+                    const int pages = ore->chipPageCount();
+                    juce::StringArray seen;
+                    for (int pg = 0; pg < pages; ++pg)
+                    {
+                        for (int i = 0; i < 5; ++i)
+                        {
+                            const int idx = pg * 5 + i;
+                            if (idx < ore->chipCount()) seen.addIfNotAlreadyThere (ore->chipParamId (idx));
+                        }
+                        ore->clickMain ({ 886.0f + 39.0f, 586.0f });     // кнопка «‹ 1 / 2 ›»
+                    }
+                    std::printf ("   чипы: страниц %d, эффектов всего %d, собрано по страницам %d\n",
+                                 pages, ore->chipCount(), seen.size());
+                    check (pages == 2 && ore->chipCount() == 10 && seen.size() == 10,
+                           "чипы FX листаются, все 10 эффектов с ручкой доли доступны",
+                           juce::String (seen.size()) + " / 10 на " + juce::String (pages) + " стр.");
+
+                    // чип второй страницы (GLITCH) обязан работать
+                    ore->clickMain ({ 886.0f + 39.0f, 586.0f });         // на страницу 2
+                    if (auto* prm = p.apvts.getParameter ("fx_glitchMix"))
+                        prm->setValueNotifyingHost (0.0f);
+                    ore->clickMain ({ 254.0f + 146.0f * 2.0f + 60.0f, 615.0f });   // третий чип 2-й стр.
+                    const float gOn = norm ("fx_glitchMix");
+                    ore->clickMain ({ 254.0f + 146.0f * 2.0f + 60.0f, 615.0f });
+                    const float gOff = norm ("fx_glitchMix");
+                    std::printf ("   чип GLITCH со 2-й страницы: %.3f -> %.3f\n", (double) gOn, (double) gOff);
+                    check (gOn > 0.01f && gOff < 0.01f, "чип со второй страницы включает эффект",
+                           num ((double) gOn, 3));
+
+                    // возвращаемся на первую страницу
+                    ore->clickMain ({ 886.0f + 39.0f, 586.0f });
+                }
+
+                // 10.1c дисплей: горизонталь — позиция таблицы (P1), вертикаль — варп (P2)
+                {
+                    const float p0before = norm ("sA_p0"), p1before = norm ("sA_p1");
+                    ore->beginMainDrag ({ 500.0f, 170.0f });
+                    ore->dragMain ({ 560.0f, 150.0f });
+                    ore->releaseMain();
+                    const float p0after = norm ("sA_p0"), p1after = norm ("sA_p1");
+                    std::printf ("   дисплей: P1 %.3f -> %.3f, P2 %.3f -> %.3f\n",
+                                 (double) p0before, (double) p0after,
+                                 (double) p1before, (double) p1after);
+                    check (p0after > p0before && p1after > p1before,
+                           "перетаскивание по дисплею меняет позицию и варп таблицы",
+                           num ((double) p0after, 3) + " / " + num ((double) p1after, 3));
                 }
 
                 // 10.2 узлы мод-матрицы: тянем вверх — количество растёт
@@ -1677,6 +1727,8 @@ int main()
                     };
 
                     for (int i = 0; i < 5; ++i)      { ++targets; probe ({ 254.0f + 146.0f * (float) i + 60.0f, 615.0f }); }
+                    ++targets; probe ({ 886.0f + 39.0f, 586.0f });   // кнопка страниц чипов
+                    ++targets; probe ({ 500.0f, 170.0f });           // дисплей
                     for (int i = 0; i < 8; ++i)
                     {
                         ++targets;
