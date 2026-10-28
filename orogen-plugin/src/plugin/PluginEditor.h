@@ -34,6 +34,9 @@ public:
     int paramsTabCount() const;
     int paramsSectionCount() const;
     juce::String paramsSectionName (int index) const;
+    juce::StringArray mainScreenParamIds() const;   // что привязано к карточкам главного экрана
+    int fxColumnPageCount() const;                  // страниц в FX-колонке (для теста)
+    void nextFxColumnPage();
     bool keyPressed (const juce::KeyPress&) override;
 
     static constexpr float kDesignW = 1280.0f;  // система координат макета

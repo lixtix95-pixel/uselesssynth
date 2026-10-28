@@ -62,6 +62,7 @@ struct OrogenEditor::Bound
     void bind (juce::AudioProcessorValueTreeState& apvts, const juce::String& id)
     {
         att.reset();
+        slider.getProperties().set ("paramId", id);
         if (apvts.getParameter (id) != nullptr)
             att = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (apvts, id, slider);
     }
@@ -136,6 +137,7 @@ public:
         comboAtts.push_back (std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (
             proc.apvts, id, *box));
         boxes.add (box);
+        ids.add (id);                       // для теста «что видно на главном экране»
         return *this;
     }
 
@@ -149,6 +151,7 @@ public:
         knobAtts.push_back (std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
             proc.apvts, id, *s));
         knobs.add (s);
+        ids.add (id);
         return *this;
     }
 
@@ -159,6 +162,7 @@ public:
         toggleAtts.push_back (std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
             proc.apvts, id, *t));
         toggles.add (t);
+        ids.add (id);
         return *this;
     }
 
@@ -208,6 +212,7 @@ public:
     OrogenProcessor& proc;
     juce::String title;
     int glyph;
+    juce::StringArray ids;                  // параметры, к которым привязаны контролы карточки
     juce::OwnedArray<juce::ComboBox> boxes;
     juce::OwnedArray<juce::Slider> knobs;
     juce::OwnedArray<juce::ToggleButton> toggles;
@@ -224,7 +229,10 @@ private:
 class OrogenEditor::PatchColumn : public juce::Component
 {
 public:
-    PatchColumn (OrogenProcessor& p, juce::String t) : proc (p), title (std::move (t)) {}
+    PatchColumn (OrogenProcessor& p, juce::String t) : proc (p), title (std::move (t)), pages (*this)
+    {
+        addAndMakeVisible (pages);
+    }
 
     ParamCard& addCard (juce::String name, int icon)
     {
@@ -234,11 +242,40 @@ public:
         return *c;
     }
 
+    int pageCountPublic() const { return pageCount(); }
+    int pagePublic() const { return page; }
+    void nextPage() { setPage (page + 1); }
+
+    // Кнопка в шапке колонки: листает страницы. Отдельный компонент, а не
+    // mouseDown по колонке — иначе перехватывались бы клики дочерних карточек.
+    class PageButton : public juce::Button
+    {
+    public:
+        explicit PageButton (PatchColumn& o) : juce::Button ("pages"), owner (o) {}
+        void paintButton (juce::Graphics& g, bool, bool) override
+        {
+            if (owner.pageCount() <= 1) return;
+            const auto r = getLocalBounds().toFloat().reduced (0.5f);
+            draw::panel (g, r, 3.0f, Palette::panelAlt, Palette::line);
+            g.setColour (Palette::textDim);
+            g.setFont (orFont (7.5f));
+            g.drawText ("<  " + juce::String (owner.getPage() + 1) + " / "
+                            + juce::String (owner.pageCount()) + "  >",
+                        getLocalBounds(), juce::Justification::centred, false);
+        }
+        void clicked() override { owner.setPage (owner.getPage() + 1); }   // по кругу
+        PatchColumn& owner;
+    };
+
     void paint (juce::Graphics& g) override
     {
+        paintHeader (g);
+
         // кабели: правая грань карточки i → левая грань карточки i+1
         for (int i = 0; i + 1 < cards.size(); ++i)
         {
+            if (pagesEnabled && (pageOf (i) != page || pageOf (i + 1) != page)) continue;
+            if (! cards[i]->isVisible() || ! cards[i + 1]->isVisible()) continue;
             const auto a = cards[i]->getBounds().toFloat();
             const auto b = cards[i + 1]->getBounds().toFloat();
             const float cx = a.getCentreX();
@@ -258,13 +295,51 @@ public:
 
     void resized() override
     {
+        pages.setBounds (getWidth() - 92, 3, 78, 16);
+        // на странице — не больше kPerPage карточек; остальные скрыты
+        int shown = 0;
         for (int i = 0; i < cards.size(); ++i)
-            cards[i]->setBounds (40, 8 + i * 86, 184, 78);
+        {
+            const bool visible = ! pagesEnabled || pageOf (i) == page;
+            cards[i]->setVisible (visible);
+            if (visible) cards[i]->setBounds (40, 24 + shown++ * 80, 184, 72);
+        }
     }
+
+    int pageCount() const
+    {
+        if (! pagesEnabled || cards.isEmpty()) return 1;
+        return (cards.size() + kPerPage - 1) / kPerPage;
+    }
+    int getPage() const { return page; }
+
+    void setPage (int p)
+    {
+        const int n = pageCount();
+        page = n <= 1 ? 0 : ((p % n) + n) % n;
+        resized();
+        repaint();
+    }
+
+    void paintHeader (juce::Graphics&) const {}   // индикатор страниц — PageButton
+
+    juce::StringArray allIds() const
+    {
+        juce::StringArray out;
+        for (auto* c : cards) out.addArray (c->ids);
+        return out;
+    }
+
+    static constexpr int kPerPage = 6;
+    bool pagesEnabled = true;             // у колонок с ≤ 6 карточками страниц нет
+
+    int pageOf (int index) const { return index / kPerPage; }
 
     OrogenProcessor& proc;
     juce::String title;
     juce::OwnedArray<ParamCard> cards;
+    PageButton pages;
+    int page = 0;
 };
 
 //============================================================================
@@ -897,9 +972,11 @@ void OrogenEditor::buildColumns()
         columns.add (col);
     }
 
-    // --- FX ---
+    // --- FX: три страницы по шесть карточек, чтобы с главного экрана были
+    // доступны все 16 эффектов, а не только первые шесть
     {
         auto& c = *columns[0];
+        // страница 1 — окрас и пространство
         c.addCard ("DRIVE", 0).combo ("fx_driveModel", itemsOf ("fx_driveModel"))
                               .knob ("fx_drive").knob ("fx_driveTone");
         // хорус: полный набор ручек ядра OS 1.32B — MIX/DEP/SPD и DEL/FB/WID/LP/INP
@@ -911,6 +988,30 @@ void OrogenEditor::buildColumns()
                                        .knob ("fx_chorusLowpass").knob ("fx_chorusInput");
         c.addCard ("DELAY", 2).knob ("fx_delayMix").knob ("fx_delayTime").knob ("fx_delayFb");
         c.addCard ("REVERB", 3).knob ("fx_reverbMix").knob ("fx_reverbSize").knob ("fx_reverbDamp");
+
+        // страница 2 — пространство и характер
+        c.addCard ("PLATE", 3).knob ("fx_plateMix").knob ("fx_plateDecay").knob ("fx_plateDiffusion");
+        c.addCard ("MATERIAL", 4).combo ("fx_materialMode", itemsOf ("fx_materialMode"))
+                                .knob ("fx_materialMix").knob ("fx_materialExcite");
+        c.addCard ("SPECTRE", 5).combo ("fx_spectreModel", itemsOf ("fx_spectreModel"))
+                               .knob ("fx_spectreMix").knob ("fx_spectreProminence");
+        c.addCard ("GLITCH", 6).knob ("fx_glitchMix").knob ("fx_glitchChance")
+                              .knob ("fx_glitchLengthMs");
+        c.addCard ("ROBIN", 7).knob ("fx_robinMix").knob ("fx_robinSemis").knob ("fx_robinSize");
+        c.addCard ("COMB", 8).combo ("fx_combModel", itemsOf ("fx_combModel"))
+                            .knob ("fx_combMix").knob ("fx_combFreqA");
+
+        // страница 3 — тон, динамика, полоса
+        c.addCard ("EQ", 9).knob ("fx_eqLow").knob ("fx_eqHigh");
+        c.addCard ("DYNAMICS", 10).knob ("fx_compThreshold").knob ("fx_compRatio")
+                                 .knob ("fx_compMakeup");
+        c.addCard ("WIDTH / OUTPUT", 11).knob ("fx_width");
+        c.addCard ("SPECTRE BAND", 5).knob ("fx_spectreLow").knob ("fx_spectreHigh")
+                                    .toggle ("fx_spectreFreeze");
+        c.addCard ("MATERIAL TONE", 4).knob ("fx_materialTone").knob ("fx_materialDamp")
+                                     .knob ("fx_materialSize");
+        c.addCard ("COMB TONE", 8).knob ("fx_combFeedback").knob ("fx_combHighpass")
+                                 .knob ("fx_combTune");
     }
     // --- MOD MATRIX ---
     {
@@ -1066,6 +1167,29 @@ void OrogenEditor::showPage (int index)
 int OrogenEditor::paramsTabCount() const
 {
     return paramsPage != nullptr ? paramsPage->tabCount() : 0;
+}
+
+// Параметры, до которых можно дотянуться с главного экрана (карточки всех
+// четырёх колонок, а не только открытой) — нужно тесту «эффект есть в GUI».
+// Для теста: сколько карточек-страниц в FX-колонке и листнуть её.
+int OrogenEditor::fxColumnPageCount() const
+{
+    return columns.isEmpty() ? 0 : columns[0]->pageCountPublic();
+}
+
+void OrogenEditor::nextFxColumnPage()
+{
+    if (! columns.isEmpty()) columns[0]->nextPage();
+}
+
+juce::StringArray OrogenEditor::mainScreenParamIds() const
+{
+    juce::StringArray out;
+    for (auto* c : columns) out.addArray (c->allIds());
+    for (auto* k : centreKnobs) out.add (k->slider.getProperties().getWithDefault ("paramId", {}).toString());
+    for (auto* b : centreBars)  out.add (b->slider.getProperties().getWithDefault ("paramId", {}).toString());
+    out.removeEmptyStrings();
+    return out;
 }
 
 juce::String OrogenEditor::paramsSectionName (int index) const

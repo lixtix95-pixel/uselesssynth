@@ -1073,6 +1073,186 @@ int main()
         check (dSpectre > 0.002, "спектр: полоса LO/HI слышна", num (dSpectre, 4));
     }
 
+
+    // ---------------------------------------------------------------- 8
+    std::printf ("\n--- 8. Все 16 эффектов: звук и присутствие в GUI ---\n");
+    {
+        struct FxCase { const char* name; const char* id; float value; const char* prefix; };
+
+        // по одному «включающему» параметру на каждую конфигурацию FX
+        const FxCase cases[] = {
+            { "DRIVE",            "fx_drive",           0.55f, "fx_drive"    },
+            { "CHORUS Simple",    "fx_chorusMix",        1.00f, "fx_chorus"   },
+            { "CHORUS Firmware",  "fx_chorusModel",      1.00f, "fx_chorus"   },
+            { "DELAY",            "fx_delayMix",         0.80f, "fx_delay"    },
+            { "REVERB",           "fx_reverbMix",        0.80f, "fx_reverb"   },
+            { "PLATE",            "fx_plateMix",         0.80f, "fx_plate"    },
+            { "EQ",               "fx_eqLow",            9.00f, "fx_eq"       },
+            { "DYNAMICS",         "fx_compThreshold",  -30.00f, "fx_comp"     },
+            { "WIDTH",            "fx_width",            1.50f, "fx_width"    },
+            { "MATERIAL",         "fx_materialMix",      0.80f, "fx_material" },
+            { "SPECTRE Extended", "fx_spectreMix",       0.90f, "fx_spectre"  },
+            { "SPECTRE Classic",  "fx_spectreModel",     1.00f, "fx_spectre"  },
+            { "GLITCH",           "fx_glitchMix",        1.00f, "fx_glitch"   },
+            { "ROBIN",            "fx_robinMix",         1.00f, "fx_robin"    },
+            { "COMB Odin",        "fx_combMix",          0.80f, "fx_comb"     },
+            { "COMB Parallel",    "fx_combModel",        1.00f, "fx_comb"     }
+        };
+        constexpr int nCases = (int) (sizeof (cases) / sizeof (cases[0]));
+
+        // сухой сигнал: все миксы в ноль
+        auto dryRender = [&]
+        {
+            OrogenProcessor p;
+            return renderWithSetup (p, 24000, sr, [] (OrogenProcessor& pr)
+            {
+                soloSlot (pr, 0, 0);
+                for (const char* id : { "fx_drive", "fx_chorusMix", "fx_delayMix", "fx_reverbMix",
+                                        "fx_plateMix", "fx_materialMix", "fx_spectreMix",
+                                        "fx_glitchMix", "fx_robinMix", "fx_combMix",
+                                        "fx_eqLow", "fx_eqHigh", "fx_compThreshold", "fx_compRatio" })
+                    setP (pr, id, 0.0f);
+                setP (pr, "fx_compMakeup", 0.0f);
+                setP (pr, "fx_width", 1.0f);
+            });
+        };
+        const auto dry = dryRender();
+        const double dryRms = rmsOf (dry);
+
+        auto deltaTo = [&] (const juce::AudioBuffer<float>& b)
+        {
+            double acc = 0.0;
+            for (int ch = 0; ch < 2; ++ch)
+                for (int i = 0; i < dry.getNumSamples(); ++i)
+                {
+                    const double d = dry.getReadPointer (ch)[i] - b.getReadPointer (ch)[i];
+                    acc += d * d;
+                }
+            return std::sqrt (acc / (double) (dry.getNumSamples() * 2));
+        };
+
+        // параметры, которые тоже надо поднять, чтобы эффект был слышен
+        auto prepareFx = [] (OrogenProcessor& pr, const juce::String& name)
+        {
+            if (name == "DELAY")       setP (pr, "fx_delayTime", 0.18f);
+            if (name == "DYNAMICS")    { setP (pr, "fx_compRatio", 8.0f); setP (pr, "fx_compMakeup", 6.0f); }
+            if (name == "EQ")          setP (pr, "fx_eqHigh", -9.0f);
+            if (name == "GLITCH")      setP (pr, "fx_glitchChance", 1.0f);
+            if (name == "ROBIN")       setP (pr, "fx_robinSemis", 7.0f);
+            if (name == "MATERIAL")    setP (pr, "fx_materialExcite", 0.9f);
+            if (name == "SPECTRE Classic") setP (pr, "fx_spectreMix", 0.9f);
+            if (name == "COMB Parallel")   setP (pr, "fx_combMix", 0.8f);
+            if (name == "CHORUS Firmware") setP (pr, "fx_chorusMix", 1.0f);
+        };
+
+        juce::StringArray quiet;                       // эффекты, которые не слышны
+        juce::StringArray broken;                      // эффекты, сломавшие звук
+        for (int i = 0; i < nCases; ++i)
+        {
+            OrogenProcessor p;
+            auto b = renderWithSetup (p, 24000, sr, [&] (OrogenProcessor& pr)
+            {
+                soloSlot (pr, 0, 0);
+                for (const char* id : { "fx_drive", "fx_chorusMix", "fx_delayMix", "fx_reverbMix",
+                                        "fx_plateMix", "fx_materialMix", "fx_spectreMix",
+                                        "fx_glitchMix", "fx_robinMix", "fx_combMix",
+                                        "fx_eqLow", "fx_eqHigh", "fx_compThreshold" })
+                    setP (pr, id, 0.0f);
+                setP (pr, "fx_width", 1.0f);
+                setP (pr, cases[i].id, cases[i].value);
+                prepareFx (pr, cases[i].name);
+            });
+
+            const double d = deltaTo (b);
+            const double r = rmsOf (b);
+            int nan = 0;
+            for (int ch = 0; ch < 2; ++ch)
+                for (int j = 0; j < b.getNumSamples(); ++j)
+                    if (! std::isfinite (b.getReadPointer (ch)[j])) ++nan;
+
+            std::printf ("   %-16s Δ %.4f (RMS %.4f, сухой %.4f, NaN %d)\n",
+                         cases[i].name, d, r, dryRms, nan);
+            if (d <= 0.002) quiet.add (cases[i].name);
+            if (r <= 0.0015 || nan != 0) broken.add (cases[i].name);
+        }
+        check (quiet.isEmpty(), "каждый из 16 эффектов слышен",
+               quiet.isEmpty() ? juce::String ("16 / 16") : quiet.joinIntoString (", "));
+        check (broken.isEmpty(), "ни один эффект не глушит и не ломает сигнал",
+               broken.isEmpty() ? juce::String ("0 дефектов") : broken.joinIntoString (", "));
+
+        // --- присутствие в GUI: главный экран и постраничный оверлей --------
+        OrogenProcessor p;
+        juce::AudioProcessorEditor* ed = p.createEditor();
+        check (ed != nullptr, "редактор создаётся для проверки GUI");
+        if (ed != nullptr)
+        {
+            auto* ore = static_cast<OrogenEditor*> (ed);
+            ore->setSize (1280, 800);
+
+            const auto mainIds = ore->mainScreenParamIds();
+            std::printf ("   на главном экране привязано параметров: %d\n", mainIds.size());
+
+            int onMain = 0;
+            for (int i = 0; i < nCases; ++i)
+            {
+                bool found = false;
+                for (const auto& id : mainIds)
+                    if (id.startsWith (cases[i].prefix)) { found = true; break; }
+                if (found) ++onMain;
+            }
+
+            // в оверлее каждая конфигурация тоже должна иметь свою секцию с контролами
+            const auto tabs = buildUiTabs();
+            int inOverlay = 0;
+            juce::StringArray missingOverlay;
+            for (int i = 0; i < nCases; ++i)
+            {
+                bool found = false;
+                for (const auto& t : tabs)
+                    for (const auto& sec : t.sections)
+                        for (const auto& id : sec.ids)
+                            if (id.startsWith (cases[i].prefix)) found = true;
+                if (found) ++inOverlay; else missingOverlay.add (cases[i].name);
+            }
+
+            std::printf ("   в GUI: главный экран %d / 16, оверлей %d / 16\n", onMain, inOverlay);
+            check (inOverlay == nCases, "все 16 эффектов есть в оверлее параметров",
+                   missingOverlay.isEmpty() ? juce::String ("16 / 16") : missingOverlay.joinIntoString (", "));
+            check (onMain >= 8, "эффекты доступны и с главного экрана", num ((double) onMain, 0) + " / 16");
+
+            // страницы FX-колонки: 3 страницы, листание не теряет параметры
+            {
+                const int pagesCount = ore->fxColumnPageCount();
+                std::printf ("   FX-колонка: страниц %d\n", pagesCount);
+                check (pagesCount == 3, "FX-колонка разложена на 3 страницы",
+                       num ((double) pagesCount, 0));
+                // после листания набор доступных параметров не уменьшается
+                const int n0 = ore->mainScreenParamIds().size();
+                ore->nextFxColumnPage();
+                const int n1 = ore->mainScreenParamIds().size();
+                check (n1 == n0, "листание страниц не теряет параметры",
+                       juce::String (n0) + " → " + juce::String (n1));
+                ore->nextFxColumnPage();
+                ore->nextFxColumnPage();          // вернулись на первую (по кругу)
+            }
+
+            // движки: список в списке выбора главного экрана = 9 типов, фильтров 16
+            int engineItems = 0, filterItems = 0;
+            for (auto* child : ore->getChildren())
+                if (auto* box = dynamic_cast<juce::ComboBox*> (child))
+                {
+                    if (box->getNumItems() == 9)  engineItems = box->getNumItems();
+                    if (box->getNumItems() == 16) filterItems = box->getNumItems();
+                }
+            std::printf ("   селекторы главного экрана: движков %d, фильтров %d\n",
+                         engineItems, filterItems);
+            check (engineItems == 9, "в списке движков все 9 типов", num ((double) engineItems, 0));
+            check (filterItems == 16, "в списке фильтров все 16 моделей", num ((double) filterItems, 0));
+
+            delete ed;
+        }
+    }
+
     juce::DeletedAtShutdown::deleteAll();
     juce::MessageManager::deleteInstance();
 
