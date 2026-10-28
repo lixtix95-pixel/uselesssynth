@@ -37,6 +37,17 @@ public:
     juce::StringArray mainScreenParamIds() const;   // что привязано к карточкам главного экрана
     int fxColumnPageCount() const;                  // страниц в FX-колонке (для теста)
     void nextFxColumnPage();
+
+    // --- главный экран: интерактивные зоны (чипы FX, дорожки мод-редактора) ---
+    // Тот же путь, что и у мыши: mouseDown/mouseDrag/mouseUp вызывают эти методы,
+    // поэтому тест дёргает ровно ту логику, что и пользователь.
+    enum class MainHit { none, fxChip, modNode, envAttack, envDecay, envSustain, lfoLane };
+    MainHit hitMain (juce::Point<float> designPos, int& index) const;
+    bool clickMain (juce::Point<float> designPos);      // клик: переключение чипа FX
+    MainHit beginMainDrag (juce::Point<float> designPos);   // нажатие мыши
+    bool dragMain  (juce::Point<float> designPos);      // перетаскивание узла/чипа
+    void releaseMain();
+    int  mainScreenHitCount() const;                    // сколько целей на экране (для теста)
     bool keyPressed (const juce::KeyPress&) override;
 
     static constexpr float kDesignW = 1280.0f;  // система координат макета
@@ -85,6 +96,16 @@ private:
     void paintBottom (juce::Graphics&);
     void paintVectorPad (juce::Graphics&);
 
+    // геометрия интерактивных зон в координатах макета
+    juce::Rectangle<float> chipRect (int i) const;
+    juce::Rectangle<float> modLane (int lane) const;    // 0 матрица · 1 LFO · 2 конверт
+    void envNodePoints (juce::Point<float>& aEnd, juce::Point<float>& dEnd,
+                        juce::Point<float>& sEnd, float& ySus) const;
+    bool nudgeParam (const juce::String& id, float deltaNorm);
+    void mouseDown (const juce::MouseEvent&) override;
+    void mouseDrag (const juce::MouseEvent&) override;
+    void mouseUp   (const juce::MouseEvent&) override;
+
     OrogenProcessor& proc;
     std::unique_ptr<OrLookAndFeel> lnf;
 
@@ -95,6 +116,10 @@ private:
     juce::Slider masterSlider;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> masterAtt;
     juce::TextButton loadButton { "LOAD" }, saveButton { "SAVE" };
+
+    // Банк программ: в шапке был только нарисованный текст имени, теперь это
+    // настоящий селектор из getNumPrograms() пунктов (host-программы OROGEN).
+    juce::ComboBox programBox;
 
     // выбор движка и фильтра выбранного слота (sA_type … sH_type / sA_filter …)
     juce::ComboBox engineBox, filterBox;
@@ -109,6 +134,14 @@ private:
     juce::OwnedArray<juce::AudioProcessorValueTreeState::ButtonAttachment> switchAtts;
     std::unique_ptr<VectorPad> vectorPad;
     std::unique_ptr<ParamsPage> paramsPage;
+
+    // состояние перетаскивания на главном экране
+    MainHit dragTarget = MainHit::none;
+    int dragIndex = -1;
+    juce::Point<float> dragLast;
+    bool dragMoved = false;
+    // последняя ненулевая величина каждого чипа FX (для включения по клику)
+    std::array<float, 5> chipLast { 0.45f, 0.50f, 0.40f, 0.35f, 0.50f };
 
     std::array<float, 8> slotLevels { };
     float masterLevel = 0.0f;

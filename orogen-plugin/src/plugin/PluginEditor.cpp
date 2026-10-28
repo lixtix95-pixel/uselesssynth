@@ -852,6 +852,25 @@ OrogenEditor::OrogenEditor (OrogenProcessor& p)
     loadButton.onClick = [this] { loadPresetFromFile(); };
     saveButton.onClick = [this] { savePresetToFile(); };
 
+    // программы: тот же банк, что у хоста (getNumPrograms/getProgramName)
+    addAndMakeVisible (programBox);
+    programBox.setTooltip ("PROGRAM");
+    programBox.setTextWhenNothingSelected ("PROGRAM");
+    {
+        const auto names = proc.presetNames();
+        for (int i = 0; i < names.size(); ++i) programBox.addItem (names[i].toUpperCase(), i + 1);
+        programBox.setSelectedItemIndex (proc.getCurrentProgram(), juce::dontSendNotification);
+    }
+    programBox.onChange = [this]
+    {
+        const int idx = programBox.getSelectedItemIndex();
+        if (idx >= 0 && idx != proc.getCurrentProgram())
+        {
+            proc.setCurrentProgram (idx);
+            repaint();
+        }
+    };
+
     buildRail();
     buildCentre();
     buildBottom();
@@ -1208,6 +1227,7 @@ int OrogenEditor::paramsSectionCount() const
 void OrogenEditor::resized()
 {
     masterSlider.setBounds (R (420.0f, 26.0f, 540.0f, 14.0f));
+    programBox.setBounds (R (58.0f, 30.0f, 250.0f, 16.0f));
     loadButton.setBounds (R (1104.0f, 22.0f, 56.0f, 20.0f));
     saveButton.setBounds (R (1166.0f, 22.0f, 56.0f, 20.0f));
 
@@ -1288,11 +1308,6 @@ void OrogenEditor::paintTopBar (juce::Graphics& g)
     g.setFont (orFont (11.0f, true));
     g.drawText (spaced ("OROGEN"), juce::Rectangle<int> (58, 17, 160, 16),
                 juce::Justification::centredLeft, false);
-
-    g.setColour (Palette::textFaint);
-    g.setFont (orFont (7.5f));
-    g.drawText (proc.getProgramName (proc.getCurrentProgram()).toUpperCase(),
-                juce::Rectangle<int> (58, 32, 260, 12), juce::Justification::centredLeft, false);
 
     draw::caption (g, "master", { 420, 13, 120, 10 }, Palette::textFaint, 6.5f);
 
@@ -1747,6 +1762,237 @@ void OrogenEditor::paintVectorPad (juce::Graphics& g)
 }
 
 // ---------------------------------------------------------------------------
+
+//==============================================================================
+// Интерактивные зоны главного экрана
+//
+// До этой правки чипы FX и дорожки мод-редактора рисовались по настоящим
+// параметрам, но не принимали ввод: значение можно было менять только в
+// оверлее. Теперь любой узел, нарисованный на главном экране, тянется мышью,
+// а чип эффекта включается и выключается кликом.
+//==============================================================================
+
+namespace
+{
+    // «рабочие» величины смеси для включения чипа кликом
+    constexpr float kChipOnValue[5] = { 0.45f, 0.50f, 0.40f, 0.35f, 0.50f };
+    // сколько пикселей макета соответствует полному ходу параметра
+    constexpr float kPxPerFullRange = 260.0f;
+    constexpr float kNodeGrabPx = 13.0f;
+}
+
+juce::Rectangle<float> OrogenEditor::chipRect (int i) const
+{
+    return { 254.0f + 146.0f * (float) i, 598.0f, 120.0f, 34.0f };
+}
+
+juce::Rectangle<float> OrogenEditor::modLane (int lane) const
+{
+    const juce::Rectangle<float> area (248.0f, 290.0f, 736.0f, 178.0f);
+    const float laneH = area.getHeight() / 3.0f;
+    return { area.getX() + 14.0f, area.getY() + laneH * (float) lane + 8.0f,
+             area.getWidth() - 28.0f, laneH - 18.0f };
+}
+
+void OrogenEditor::envNodePoints (juce::Point<float>& aEnd, juce::Point<float>& dEnd,
+                                  juce::Point<float>& sEnd, float& ySus) const
+{
+    const auto lane = modLane (2);
+    const float a = pv (slotId ("attack"));
+    const float d = pv (slotId ("decay"));
+    const float s = pv (slotId ("sustain"));
+    const float r = pv (slotId ("release"));
+
+    const float total = juce::jmax (0.05f, a + d + juce::jmax (0.15f, (a + d) * 0.35f) + r);
+    const float top = lane.getY() + 2.0f;
+    const float bot = lane.getBottom();
+    ySus = bot - (bot - top) * juce::jlimit (0.0f, 1.0f, s);
+
+    const float xA = lane.getX() + lane.getWidth() * (a / total);
+    const float xD = xA + lane.getWidth() * (d / total);
+    const float xS = xD + lane.getWidth() * (juce::jmax (0.15f, (a + d) * 0.35f) / total);
+
+    aEnd = { xA, top };
+    dEnd = { xD, ySus };
+    sEnd = { xS, ySus };
+}
+
+OrogenEditor::MainHit OrogenEditor::hitMain (juce::Point<float> p, int& index) const
+{
+    index = -1;
+
+    for (int i = 0; i < 5; ++i)
+        if (chipRect (i).contains (p)) { index = i; return MainHit::fxChip; }
+
+    // дорожка мод-матрицы: узел каждого из 8 маршрутов
+    {
+        const auto lane = modLane (0);
+        const float stepW = lane.getWidth() / 8.0f;
+        for (int i = 0; i < 8; ++i)
+        {
+            const float amt = pv ("mod" + juce::String (i + 1) + "_amt");
+            const float y = lane.getCentreY() - juce::jlimit (-1.0f, 1.0f, amt) * lane.getHeight() * 0.46f;
+            const juce::Point<float> node (lane.getX() + stepW * ((float) i + 0.5f), y);
+            if (node.getDistanceFrom (p) <= kNodeGrabPx) { index = i; return MainHit::modNode; }
+        }
+        // попадание в саму полосу (но не в узел) — тоже тянем ближайший маршрут
+        if (lane.contains (p))
+        {
+            index = juce::jlimit (0, 7, (int) ((p.x - lane.getX()) / stepW));
+            return MainHit::modNode;
+        }
+    }
+
+    // дорожка LFO 1: горизонталь — частота, вертикаль — глубина
+    if (modLane (1).contains (p)) return MainHit::lfoLane;
+
+    // дорожка конверта: три узла (attack · decay · sustain/release)
+    {
+        juce::Point<float> aEnd, dEnd, sEnd; float ySus = 0.0f;
+        envNodePoints (aEnd, dEnd, sEnd, ySus);
+        if (aEnd.getDistanceFrom (p) <= kNodeGrabPx)               return MainHit::envAttack;
+        if (dEnd.getDistanceFrom (p) <= kNodeGrabPx)               return MainHit::envDecay;
+        if (sEnd.getDistanceFrom (p) <= kNodeGrabPx)               return MainHit::envSustain;
+        if (modLane (2).contains (p))                              return MainHit::envSustain;
+    }
+
+    return MainHit::none;
+}
+
+bool OrogenEditor::nudgeParam (const juce::String& id, float deltaNorm)
+{
+    if (auto* prm = proc.apvts.getParameter (id))
+    {
+        const float n = juce::jlimit (0.0f, 1.0f, prm->getValue() + deltaNorm);
+        prm->setValueNotifyingHost (n);
+        return true;
+    }
+    return false;
+}
+
+int OrogenEditor::mainScreenHitCount() const
+{
+    // 5 чипов FX + 8 узлов матрицы + полоса LFO + 3 узла конверта
+    return 5 + 8 + 1 + 3;
+}
+
+bool OrogenEditor::clickMain (juce::Point<float> designPos)
+{
+    int index = -1;
+    const auto hit = hitMain (designPos, index);
+
+    if (hit == MainHit::fxChip && index >= 0 && index < 5)
+    {
+        static const char* ids[5] = { "fx_drive", "fx_chorusMix", "fx_delayMix",
+                                      "fx_reverbMix", "fx_spectreMix" };
+        if (auto* prm = proc.apvts.getParameter (ids[index]))
+        {
+            const float now = prm->getValue();
+            if (now > 0.001f)
+            {
+                chipLast[(size_t) index] = now;      // запомнили, чтобы вернуть как было
+                prm->setValueNotifyingHost (0.0f);
+            }
+            else
+            {
+                // возвращаем прежнюю величину, если она была, иначе рабочую
+                float target = chipLast[(size_t) index];
+                if (target <= 0.001f) target = kChipOnValue[index];
+                prm->setValueNotifyingHost (juce::jlimit (0.0f, 1.0f, target));
+            }
+            repaint();
+            return true;
+        }
+    }
+    return false;
+}
+
+bool OrogenEditor::dragMain (juce::Point<float> designPos)
+{
+    if (dragTarget == MainHit::none) return false;
+
+    const juce::Point<float> d = designPos - dragLast;
+    dragLast = designPos;
+    if (d.getDistanceFromOrigin() > 0.0f) dragMoved = true;
+
+    switch (dragTarget)
+    {
+        case MainHit::fxChip:
+        {
+            static const char* ids[5] = { "fx_drive", "fx_chorusMix", "fx_delayMix",
+                                          "fx_reverbMix", "fx_spectreMix" };
+            if (dragIndex >= 0 && dragIndex < 5) nudgeParam (ids[dragIndex], d.x / kPxPerFullRange);
+            break;
+        }
+
+        case MainHit::modNode:
+            // вертикаль: полный ход дорожки = весь диапазон −1…+1
+            nudgeParam ("mod" + juce::String (dragIndex + 1) + "_amt",
+                        -d.y / juce::jmax (1.0f, modLane (0).getHeight()));
+            break;
+
+        case MainHit::lfoLane:
+            nudgeParam ("lfo1_rate",   d.x / kPxPerFullRange * 1.6f);
+            nudgeParam ("lfo1_amount", -d.y / juce::jmax (1.0f, modLane (1).getHeight()));
+            break;
+
+        case MainHit::envAttack:  nudgeParam (slotId ("attack"),  d.x / kPxPerFullRange); break;
+        case MainHit::envDecay:   nudgeParam (slotId ("decay"),   d.x / kPxPerFullRange); break;
+        case MainHit::envSustain:
+            nudgeParam (slotId ("release"),  d.x / kPxPerFullRange);
+            nudgeParam (slotId ("sustain"), -d.y / juce::jmax (1.0f, modLane (2).getHeight()));
+            break;
+
+        case MainHit::none:
+        default:
+            return false;
+    }
+
+    repaint();
+    return true;
+}
+
+void OrogenEditor::releaseMain()
+{
+    dragTarget = MainHit::none;
+    dragIndex = -1;
+    dragMoved = false;
+}
+
+OrogenEditor::MainHit OrogenEditor::beginMainDrag (juce::Point<float> designPos)
+{
+    int index = -1;
+    const auto hit = hitMain (designPos, index);
+
+    dragTarget = hit;
+    dragIndex = index;
+    dragLast = designPos;
+    dragMoved = false;
+    return hit;
+}
+
+void OrogenEditor::mouseDown (const juce::MouseEvent& e)
+{
+    beginMainDrag ({ e.position.x / juce::jmax (0.01f, kx()),
+                     e.position.y / juce::jmax (0.01f, ky()) });
+}
+
+void OrogenEditor::mouseDrag (const juce::MouseEvent& e)
+{
+    if (dragTarget == MainHit::none) return;
+    const juce::Point<float> designPos { e.position.x / juce::jmax (0.01f, kx()),
+                                         e.position.y / juce::jmax (0.01f, ky()) };
+    dragMain (designPos);
+}
+
+void OrogenEditor::mouseUp (const juce::MouseEvent& e)
+{
+    const juce::Point<float> designPos { e.position.x / juce::jmax (0.01f, kx()),
+                                         e.position.y / juce::jmax (0.01f, ky()) };
+    if (dragTarget == MainHit::fxChip && ! dragMoved) clickMain (designPos);
+    releaseMain();
+}
+
 void OrogenEditor::loadPresetFromFile()
 {
     auto chooser = std::make_shared<juce::FileChooser> (

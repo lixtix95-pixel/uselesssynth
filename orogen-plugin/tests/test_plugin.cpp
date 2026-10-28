@@ -1528,6 +1528,232 @@ int main()
                        juce::String (slotInOverlay) + " / " + juce::String (slotTotal));
             }
         }
+
+        // ---- 10. Главный экран: интерактивные зоны (мышь ведёт к параметрам) ----
+        {
+            OrogenProcessor p;
+            std::unique_ptr<juce::AudioProcessorEditor> ed (p.createEditor());
+            check (ed != nullptr, "редактор создаётся для блока 10");
+            if (ed != nullptr)
+            {
+                auto* ore = static_cast<OrogenEditor*> (ed.get());
+                ore->setSize (1280, 800);
+
+                auto norm = [&p] (const juce::String& id)
+                {
+                    if (auto* prm = p.apvts.getParameter (id)) return prm->getValue();
+                    return -1.0f;
+                };
+
+                // 10.1 чипы FX: клик включает эффект, повторный — выключает
+                {
+                    static const char* ids[5] = { "fx_drive", "fx_chorusMix", "fx_delayMix",
+                                                  "fx_reverbMix", "fx_spectreMix" };
+                    int ok = 0;
+                    juce::StringArray bad;
+                    for (int i = 0; i < 5; ++i)
+                    {
+                        const juce::Point<float> chip (254.0f + 146.0f * (float) i + 60.0f, 615.0f);
+                        // приводим смесь к нулю: тест проверяет именно жест, а не патч
+                        if (auto* prm = p.apvts.getParameter (ids[i])) prm->setValueNotifyingHost (0.0f);
+                        const float before = norm (ids[i]);
+                        ore->clickMain (chip);
+                        const float on = norm (ids[i]);
+                        ore->clickMain (chip);
+                        const float off = norm (ids[i]);
+                        std::printf ("   чип %-16s: %.3f -> %.3f -> %.3f\n",
+                                     ids[i], (double) before, (double) on, (double) off);
+                        if (on > before + 0.01f && off < 0.01f) ++ok; else bad.add (ids[i]);
+                    }
+                    std::printf ("   чипы FX: %d / 5 включаются кликом\n", ok);
+                    check (ok == 5, "клик по чипу FX включает и выключает эффект",
+                           bad.isEmpty() ? juce::String ("5 / 5") : bad.joinIntoString (", "));
+                }
+
+                // 10.2 узлы мод-матрицы: тянем вверх — количество растёт
+                {
+                    int ok = 0;
+                    juce::StringArray bad;
+                    juce::StringArray rows;
+                    for (int i = 0; i < 8; ++i)
+                    {
+                        const juce::String id = "mod" + juce::String (i + 1) + "_amt";
+                        // старт — из середины полосы маршрута, выше узла
+                        const float x = 262.0f + (736.0f - 28.0f) / 8.0f * ((float) i + 0.5f);
+                        ore->beginMainDrag ({ x, 320.0f });
+                        ore->dragMain ({ x, 312.0f });
+                        ore->releaseMain();
+                        const float up = norm (id);
+                        ore->beginMainDrag ({ x, 320.0f });
+                        ore->dragMain ({ x, 328.0f });
+                        ore->releaseMain();
+                        const float down = norm (id);
+                        rows.add (id + " " + num ((double) up, 3) + "/" + num ((double) down, 3));
+                        if (up > 0.5f && down < up) ++ok; else bad.add (id);
+                    }
+                    std::printf ("   мод-матрица: %d / 8 узлов тянутся (%s)\n", ok,
+                                 rows.joinIntoString (", ").toRawUTF8());
+                    check (ok == 8, "узлы мод-матрицы на главном экране меняют количество",
+                           bad.isEmpty() ? juce::String ("8 / 8") : bad.joinIntoString (", "));
+                }
+
+                // поиск узла конверта по текущей геометрии (нужен и в 10.3, и в 10.5):
+                // положения узлов зависят от самих значений A/D/S, поэтому ищем заново
+                auto findNode = [ore] (OrogenEditor::MainHit want) -> juce::Point<float>
+                {
+                    for (float x = 262.0f; x < 960.0f; x += 1.0f)
+                        for (float y = 410.0f; y < 462.0f; y += 1.0f)
+                        {
+                            int idx = -1;
+                            if (ore->hitMain ({ x, y }, idx) == want) return { x, y };
+                        }
+                    return { -1.0f, -1.0f };
+                };
+
+                // 10.3 конверт: узлы attack / decay / sustain / release
+                {
+                    auto dragNode = [ore] (juce::Point<float> from, juce::Point<float> to)
+                    {
+                        ore->beginMainDrag (from);
+                        ore->dragMain (to);
+                        ore->releaseMain();
+                    };
+
+                    const float a0 = norm ("sA_attack"), d0 = norm ("sA_decay");
+                    const float s0 = norm ("sA_sustain"), r0 = norm ("sA_release");
+
+                    // каждый раз ищем узел заново: после правки attack геометрия сдвигается
+                    auto atk = findNode (OrogenEditor::MainHit::envAttack);
+                    if (atk.x > 0) dragNode (atk, atk + juce::Point<float> (24.0f, 0.0f));
+                    const float a1 = norm ("sA_attack");
+
+                    auto dec = findNode (OrogenEditor::MainHit::envDecay);
+                    if (dec.x > 0) dragNode (dec, dec + juce::Point<float> (24.0f, 0.0f));
+                    const float d1 = norm ("sA_decay");
+
+                    auto sus = findNode (OrogenEditor::MainHit::envSustain);
+                    if (sus.x > 0) dragNode (sus, sus + juce::Point<float> (0.0f, 8.0f));   // вниз — тише
+                    const float s1 = norm ("sA_sustain");
+
+                    sus = findNode (OrogenEditor::MainHit::envSustain);
+                    if (sus.x > 0) dragNode (sus, sus + juce::Point<float> (24.0f, 0.0f));
+                    const float r1 = norm ("sA_release");
+
+                    std::printf ("   конверт: attack %.3f->%.3f, decay %.3f->%.3f, "
+                                 "sustain %.3f->%.3f, release %.3f->%.3f\n",
+                                 (double) a0, (double) a1, (double) d0, (double) d1,
+                                 (double) s0, (double) s1, (double) r0, (double) r1);
+                    check (a1 > a0 && d1 > d0 && s1 < s0 && r1 > r0,
+                           "узлы конверта на главном экране правят A/D/S/R",
+                           juce::String (a1 > a0 ? "A+" : "A-") + juce::String (d1 > d0 ? " D+" : " D-")
+                           + juce::String (s1 < s0 ? " S-" : " S+") + juce::String (r1 > r0 ? " R+" : " R-"));
+                }
+
+                // 10.4 дорожка LFO: горизонталь — частота, вертикаль — глубина
+                {
+                    const float r0 = norm ("lfo1_rate"), am0 = norm ("lfo1_amount");
+                    ore->beginMainDrag ({ 600.0f, 372.0f });
+                    ore->dragMain ({ 640.0f, 364.0f });
+                    ore->releaseMain();
+                    const float r1 = norm ("lfo1_rate"), am1 = norm ("lfo1_amount");
+                    std::printf ("   LFO 1: частота %.3f->%.3f, глубина %.3f->%.3f\n",
+                                 (double) r0, (double) r1, (double) am0, (double) am1);
+                    check (r1 > r0 && am1 > am0, "дорожка LFO 1 правит частоту и глубину",
+                           num ((double) r1, 3) + " / " + num ((double) am1, 3));
+                }
+
+                // 10.5 сводка: сколько целей на главном экране и все ли отвечают
+                {
+                    int targets = 0, alive = 0;
+                    juce::StringArray dead;
+
+                    auto probe = [&] (juce::Point<float> pt)
+                    {
+                        int idx = -1;
+                        const auto hit = ore->hitMain (pt, idx);
+                        if (hit != OrogenEditor::MainHit::none) { ++alive; }
+                        else dead.add (juce::String ((int) pt.x) + ":" + juce::String ((int) pt.y));
+                        juce::ignoreUnused (idx);
+                    };
+
+                    for (int i = 0; i < 5; ++i)      { ++targets; probe ({ 254.0f + 146.0f * (float) i + 60.0f, 615.0f }); }
+                    for (int i = 0; i < 8; ++i)
+                    {
+                        ++targets;
+                        const float x = 262.0f + 88.5f * ((float) i + 0.5f);
+                        probe ({ x, 320.0f });
+                    }
+                    ++targets; probe ({ 600.0f, 372.0f });      // LFO
+                    for (auto want : { OrogenEditor::MainHit::envAttack,
+                                       OrogenEditor::MainHit::envDecay,
+                                       OrogenEditor::MainHit::envSustain })
+                    {
+                        ++targets;
+                        const auto pt = findNode (want);
+                        if (pt.x > 0) probe (pt); else dead.add ("узел конверта не найден");
+                    }
+
+                    std::printf ("   целей на главном экране: %d (объявлено %d), отозвались %d\n",
+                                 targets, ore->mainScreenHitCount(), alive);
+                    check (alive == targets && ore->mainScreenHitCount() >= targets,
+                           "все интерактивные зоны главного экрана отвечают",
+                           juce::String (alive) + " / " + juce::String (targets));
+                }
+
+                // 10.6 банк программ в шапке: селектор со всеми программами хоста
+                {
+                    juce::ComboBox* prog = nullptr;
+                    for (auto* child : ore->getChildren())
+                        if (auto* box = dynamic_cast<juce::ComboBox*> (child))
+                            if (box->getTooltip() == "PROGRAM") prog = box;
+
+                    check (prog != nullptr, "в шапке есть селектор программ");
+                    if (prog != nullptr)
+                    {
+                        const int nPrograms = p.getNumPrograms();
+                        std::printf ("   программ в банке: %d, пунктов в селекторе: %d\n",
+                                     nPrograms, prog->getNumItems());
+                        check (prog->getNumItems() == nPrograms,
+                               "селектор содержит все программы банка",
+                               juce::String (prog->getNumItems()) + " / " + juce::String (nPrograms));
+
+                        // каждая программа должна отличаться от первой хотя бы одним параметром
+                        auto snapshot = [&p]
+                        {
+                            juce::Array<float> v;
+                            static const char* ids[] = { "gl_master", "gl_gain", "gl_morph",
+                                                         "sA_level", "sA_cutoff", "sA_p0",
+                                                         "sA_type", "sA_filter", "fx_reverbMix" };
+                            for (const auto* id : ids)
+                                v.add (p.apvts.getParameter (id)->getValue());
+                            return v;
+                        };
+
+                        prog->setSelectedItemIndex (0, juce::sendNotificationSync);
+                        const auto base = snapshot();
+                        int distinct = 0;
+                        juce::StringArray rows;
+                        for (int i = 1; i < nPrograms; ++i)
+                        {
+                            prog->setSelectedItemIndex (i, juce::sendNotificationSync);
+                            const auto cur = snapshot();
+                            int diff = 0;
+                            for (int k = 0; k < base.size(); ++k)
+                                if (std::abs (cur[k] - base[k]) > 1.0e-4f) ++diff;
+                            rows.add (p.getProgramName (i).toUpperCase() + " " + juce::String (diff));
+                            if (diff > 0 && p.getCurrentProgram() == i) ++distinct;
+                        }
+                        prog->setSelectedItemIndex (0, juce::sendNotificationSync);
+
+                        std::printf ("   программ отличаются от первой: %d / %d (%s)\n",
+                                     distinct, nPrograms - 1, rows.joinIntoString (", ").toRawUTF8());
+                        check (distinct == nPrograms - 1,
+                               "выбор программы в шапке меняет патч",
+                               juce::String (distinct) + " / " + juce::String (nPrograms - 1));
+                    }
+                }
+            }
+        }
     }
 
     juce::DeletedAtShutdown::deleteAll();
