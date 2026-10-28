@@ -291,6 +291,30 @@ public:
         return *c;
     }
 
+    void setAnimPhase (float p) { animPhase = p; }
+
+    // Перерисовать только полосы между карточками: там живут «кометы».
+    // Полный repaint колонки стоил больше, чем вся остальная анимация.
+    void repaintCables()
+    {
+        for (int i = 0; i + 1 < cards.size(); ++i)
+        {
+            if (! cards[i]->isVisible() || ! cards[i + 1]->isVisible()) continue;
+            const auto a = cards[i]->getBounds();
+            const auto b = cards[i + 1]->getBounds();
+            repaint (juce::Rectangle<int> (a.getCentreX() - 34, a.getBottom() - 6, 68,
+                                           juce::jmax (8, b.getY() - a.getBottom() + 12)));
+        }
+    }
+
+    int cableAreaPx() const
+    {
+        int area = 0;
+        for (int i = 0; i + 1 < cards.size(); ++i)
+            if (cards[i]->isVisible() && cards[i + 1]->isVisible()) area += 68 * 14;
+        return area;
+    }
+
     int pageCountPublic() const { return pageCount(); }
     int pagePublic() const { return page; }
     void nextPage() { setPage (page + 1); }
@@ -335,6 +359,33 @@ public:
             cable.startNewSubPath (cx - 26.0f, y1);
             cable.cubicTo (cx - 26.0f, y1 + 18.0f, cx + 26.0f, y2 - 18.0f, cx + 26.0f, y2);
             draw::glowStroke (g, cable, 1.1f, Palette::lineHi, 0.10f);
+
+            // бегущая «комета» по кабелю: короткий яркий отрезок с затуханием
+            // к хвосту. Позиция — из общей фазы, у соседних кабелей сдвиг,
+            // поэтому по колонке идёт волна сверху вниз.
+            {
+                const float len = cable.getLength();
+                const float t0 = std::fmod (animPhase * 0.55f + 0.22f * (float) i, 1.0f);
+                const float tail = 0.16f;
+                juce::Path comet;
+                bool started = false;
+                for (int k = 0; k <= 8; ++k)
+                {
+                    const float t = t0 - tail * (float) k / 8.0f;
+                    if (t < 0.0f) break;
+                    const auto pt = cable.getPointAlongPath (len * t);
+                    if (! started) { comet.startNewSubPath (pt); started = true; }
+                    else            comet.lineTo (pt);
+                }
+                if (started)
+                    draw::glowStroke (g, comet, 1.4f, Palette::signal.withAlpha (0.55f), 0.16f);
+
+                const auto head = cable.getPointAlongPath (len * t0);
+                g.setColour (Palette::signal.withAlpha (0.85f));
+                g.fillEllipse (head.x - 1.8f, head.y - 1.8f, 3.6f, 3.6f);
+                g.setColour (Palette::signal.withAlpha (0.12f));
+                g.fillEllipse (head.x - 4.0f, head.y - 4.0f, 8.0f, 8.0f);
+            }
 
             g.setColour (Palette::lineMid);
             g.fillEllipse (cx - 28.0f, y1 - 2.0f, 4.0f, 4.0f);
@@ -384,6 +435,7 @@ public:
 
     int pageOf (int index) const { return index / kPerPage; }
 
+    float animPhase = 0.0f;
     OrogenProcessor& proc;
     juce::String title;
     juce::OwnedArray<ParamCard> cards;
@@ -404,19 +456,24 @@ public:
     }
 
     void setActive (bool a) { if (active != a) { active = a; repaint(); } }
+    void setAnimPhase (float p) { animPhase = p; }
 
     void paintButton (juce::Graphics& g, bool highlighted, bool) override
     {
         const auto r = getLocalBounds().toFloat().reduced (0.5f);
         draw::panel (g, r, 2.5f, active ? Palette::panelAlt : juce::Colours::transparentBlack,
                      active ? Palette::lineHi : (highlighted ? Palette::lineMid : Palette::line));
+        const float pulse = active
+            ? 0.62f + 0.38f * (0.5f + 0.5f * std::sin (animPhase * juce::MathConstants<float>::twoPi * 0.5f))
+            : 1.0f;
         draw::sectionGlyph (g, glyphKind, r.reduced (12.0f, 9.0f),
-                            active ? Palette::signal : Palette::textDim);
+                            active ? Palette::signal.withMultipliedAlpha (pulse) : Palette::textDim);
     }
 
 private:
     int glyphKind;
     bool active = false;
+    float animPhase = 0.0f;
 };
 
 //============================================================================
@@ -426,6 +483,9 @@ class OrogenEditor::VectorPad : public juce::Component
 {
 public:
     explicit VectorPad (OrogenProcessor& p) : proc (p) {}
+
+    void setAnimPhase (float p) { animPhase = p; }
+
 
     void paint (juce::Graphics& g) override
     {
@@ -456,8 +516,11 @@ public:
         g.setColour (Palette::grid);
         g.strokePath (cross, juce::PathStrokeType (1.0f));
 
-        g.setColour (Palette::signal.withAlpha (0.18f));
-        g.fillEllipse (juce::Rectangle<float> (16.0f, 16.0f).withCentre (p));
+        // гало дышит: радиус 16…22 px, альфа 0.10…0.20
+        const float breath = 0.5f + 0.5f * std::sin (animPhase * juce::MathConstants<float>::twoPi * 0.55f);
+        g.setColour (Palette::signal.withAlpha (0.10f + 0.10f * breath));
+        g.fillEllipse (juce::Rectangle<float> (18.0f + 4.0f * breath,
+                                               18.0f + 4.0f * breath).withCentre (p));
         g.setColour (Palette::signal);
         g.fillEllipse (juce::Rectangle<float> (7.0f, 7.0f).withCentre (p));
 
@@ -467,6 +530,8 @@ public:
 
     void mouseDown (const juce::MouseEvent& e) override { apply (e.position); }
     void mouseDrag (const juce::MouseEvent& e) override { apply (e.position); }
+
+    float animPhase = 0.0f;
 
 private:
     void apply (juce::Point<float> pos)
@@ -932,7 +997,7 @@ OrogenEditor::OrogenEditor (OrogenProcessor& p)
     selectSlot (0);
     setSection (1);              // по умолчанию открыта мод-матрица (как на макете)
     setSize ((int) kDesignW, (int) kDesignH);
-    startTimerHz (24);
+    startTimerHz (20);        // анимации: 20 кадров/с, измерено в блоке 11
 }
 
 OrogenEditor::~OrogenEditor()
@@ -1341,14 +1406,117 @@ void OrogenEditor::resized()
 }
 
 // ---------------------------------------------------------------------------
+
+//==============================================================================
+// Анимации
+//
+// Всё, что «дышит» на экране, считается от одной фазы — времени с момента
+// создания редактора. Фазу можно выставить руками (setAnimationPhase), поэтому
+// любой кадр воспроизводим: тест рендерит редактор при фазе 0 и 0.5 и сравнивает
+// пиксели, а render_ui собирает из кадров GIF.
+//==============================================================================
+
+float OrogenEditor::animationPhase() const
+{
+    const double period = 2.0;                       // секунд на цикл
+    const double p = std::fmod (animSeconds, period) / period;
+    return (float) (p < 0.0 ? p + 1.0 : p);
+}
+
+void OrogenEditor::setAnimationPhase (double seconds)
+{
+    animSeconds = seconds;
+    // фаза живёт в редакторе, но рисуют её и дочерние компоненты — раздаём всем,
+    // иначе кадр снаружи (тест, render_ui) будет статичным
+    // при выключенных анимациях детям отдаётся нулевая фаза: кадр замирает
+    const float v = animOn ? (float) seconds : 0.0f;
+    for (auto* c : columns) c->setAnimPhase (v);
+    if (vectorPad != nullptr) vectorPad->setAnimPhase (v);
+    for (auto* b : sectionButtons) b->setAnimPhase (v);
+    repaint();
+}
+
+void OrogenEditor::repaintAnimated()
+{
+    // Полный repaint() на 24 кадрах/с стоил 8.8 мс (≈21 % ядра). Двигается же
+    // меньше десятой доли процента площади, поэтому перерисовываем только те
+    // зоны, где анимация действительно есть.
+    repaint (R (988.0f, 24.0f, 100.0f, 16.0f));                    // LED маршрутов
+    repaint (R (16.0f, 66.0f + 70.0f * (float) selectedSlot, 216.0f, 62.0f));  // выбранный слот
+    repaint (R (248.0f, 348.0f, 736.0f, 62.0f));                   // дорожка LFO с playhead
+    repaint (R (248.0f, 570.0f, 736.0f, 70.0f));                   // чипы FX + их страницы
+
+    for (auto* c : columns) if (c->isVisible()) c->repaintCables();  // кометы в кабелях
+    if (vectorPad != nullptr) vectorPad->repaint();                // дыхание точки
+    for (auto* b : sectionButtons) b->repaint();                   // пульс активной секции
+}
+
+int OrogenEditor::animatedAreaPercent() const
+{
+    // та же геометрия, что в repaintAnimated(), в процентах от 1280×800
+    const double area = 100.0 * 16.0 + 216.0 * 62.0 + 736.0 * 62.0 + 736.0 * 70.0;
+    double total = area;
+    for (auto* c : columns) if (c->isVisible()) total += (double) c->cableAreaPx();
+    if (vectorPad != nullptr) total += (double) vectorPad->getWidth() * (double) vectorPad->getHeight();
+    for (auto* b : sectionButtons) total += (double) b->getWidth() * (double) b->getHeight();
+    return juce::jlimit (0, 100, juce::roundToInt (100.0 * total / (1280.0 * 800.0)));
+}
+
+void OrogenEditor::setAnimationsEnabled (bool on)
+{
+    animOn = on;
+    const float v = on ? (float) animSeconds : 0.0f;
+    for (auto* c : columns) c->setAnimPhase (v);
+    if (vectorPad != nullptr) vectorPad->setAnimPhase (v);
+    for (auto* b : sectionButtons) b->setAnimPhase (v);
+    repaint();
+}
+
+float OrogenEditor::animPhaseFor (double speed, double offset) const
+{
+    const double p = animSeconds * speed + offset;
+    const double f = p - std::floor (p);
+    return (float) f;
+}
+
 void OrogenEditor::timerCallback()
 {
+    // время считаем по часам, а не по числу тиков: при просадках кадров
+    // анимация замедляется, но не «скачет»
+    const double now = juce::Time::getMillisecondCounterHiRes();
+    const double dt = lastTimerMs > 0.0 ? juce::jlimit (0.0, 0.25, (now - lastTimerMs) / 1000.0) : 0.0;
+    lastTimerMs = now;
+
+    bool changed = false;
+
+    if (animOn && dt > 0.0)
+    {
+        animSeconds += dt;
+        for (auto* c : columns) c->setAnimPhase ((float) animSeconds);
+        if (vectorPad != nullptr) vectorPad->setAnimPhase ((float) animSeconds);
+        for (auto* b : sectionButtons) b->setAnimPhase ((float) animSeconds);
+        repaintAnimated();                  // только живые зоны, не весь экран
+    }
+
     float db[8] = { -120.0f, -120.0f, -120.0f, -120.0f, -120.0f, -120.0f, -120.0f, -120.0f };
     proc.engine().slotLevelsDb (db);
 
-    bool changed = false;
     for (int i = 0; i < 8; ++i)
-        if (std::abs (db[i] - slotLevels[(size_t) i]) > 0.35f) { slotLevels[(size_t) i] = db[i]; changed = true; }
+    {
+        // метры: спад не мгновенный, а с постоянной времени ~120 мс
+        const float target = db[i];
+        float& sm = slotLevelsSmooth[(size_t) i];
+        sm += (target - sm) * (dt > 0.0 ? (float) juce::jmin (1.0, dt / 0.12) : 0.2f);
+        if (std::abs (sm - slotLevels[(size_t) i]) > 0.2f) { slotLevels[(size_t) i] = sm; changed = true; }
+    }
+
+    // программа могла смениться извне (хост, MIDI program change) — держим
+    // селектор в шапке синхронным с банком
+    if (programBox.getSelectedItemIndex() != proc.getCurrentProgram())
+    {
+        programBox.setSelectedItemIndex (proc.getCurrentProgram(), juce::dontSendNotification);
+        changed = true;
+    }
 
     if (changed) repaint();
 }
@@ -1386,11 +1554,17 @@ void OrogenEditor::paintTopBar (juce::Graphics& g)
 
     draw::caption (g, "master", { 420, 13, 120, 10 }, Palette::textFaint, 6.5f);
 
-    // индикаторы первых четырёх маршрутов мод-матрицы
+    // индикаторы первых четырёх маршрутов мод-матрицы: активный дышит,
+    // у каждого маршрута своя задержка — видно, что они независимы
     for (int r = 0; r < 4; ++r)
     {
         const float amt = pv ("mod" + juce::String (r + 1) + "_amt");
-        draw::led (g, { 1000.0f + 24.0f * (float) r, 33.0f }, 3.0f, std::abs (amt) > 0.001f);
+        const bool on = std::abs (amt) > 0.001f;
+        const float pulse = animOn
+            ? 0.45f + 0.55f * (0.5f + 0.5f * std::sin ((animPhaseFor (0.5, 0.18 * r)) * juce::MathConstants<float>::twoPi))
+            : 1.0f;
+        draw::led (g, { 1000.0f + 24.0f * (float) r, 33.0f }, 3.0f, on,
+                   Palette::signal.withAlpha (on ? pulse : 1.0f));
     }
 }
 
@@ -1455,9 +1629,18 @@ void OrogenEditor::paintRail (juce::Graphics& g)
         const bool on  = pv (slotPrefix (i) + "on") > 0.5f;
         const int type = pi (slotPrefix (i) + "type");
 
-        draw::panel (g, { 16.0f, y, 216.0f, 62.0f }, 3.0f,
-                     sel ? Palette::panelAlt : Palette::panel,
-                     sel ? Palette::lineHi : Palette::line);
+        if (sel)
+        {
+            // выбранный слот «дышит» рамкой: 0.55…1.0 от яркости линии
+            const float pulse = animOn ? 0.55f + 0.45f * (0.5f + 0.5f * std::sin (
+                                    animPhaseFor (0.5) * juce::MathConstants<float>::twoPi)) : 1.0f;
+            draw::panel (g, { 16.0f, y, 216.0f, 62.0f }, 3.0f, Palette::panelAlt,
+                         Palette::lineHi.withMultipliedAlpha (pulse));
+        }
+        else
+        {
+            draw::panel (g, { 16.0f, y, 216.0f, 62.0f }, 3.0f, Palette::panel, Palette::line);
+        }
 
         // уровень слота (реальные метры из EngineBank, дБ → 0…1)
         const float lvl = juce::jlimit (0.0f, 1.0f, (slotLevels[(size_t) i] + 54.0f) / 54.0f);
@@ -1647,6 +1830,27 @@ void OrogenEditor::paintModEditor (juce::Graphics& g)
             g.fillEllipse (x - 2.0f, lane.getCentreY() - 2.0f, 4.0f, 4.0f);
         }
 
+        // playhead: точка, бегущая по кривой с частотой, взятой из параметра
+        // lfo1_rate. Это визуализация частоты (та же шкала, что у cycles выше),
+        // а не «декоративная точка»: остановишь LFO — остановится и она.
+        if (animOn)
+        {
+            const float t = animPhaseFor (0.25 + 1.75 * (double) rate);
+            const float ph = t * juce::MathConstants<float>::twoPi * (float) cycles;
+            float v = 0.0f;
+            if (shape == 0)      v = std::sin (ph);
+            else if (shape == 1) v = 2.0f * std::abs (2.0f * (float) (ph / juce::MathConstants<float>::twoPi
+                                                                    - std::floor (ph / juce::MathConstants<float>::twoPi + 0.5f))) - 1.0f;
+            else                 v = ((int) (ph * 3.0f) % 5) / 2.0f - 1.0f;
+
+            const float px = lane.getX() + t * lane.getWidth();
+            const float py = lane.getCentreY() - v * (0.15f + 0.85f * amount) * lane.getHeight() * 0.46f;
+            g.setColour (Palette::signal.withAlpha (0.16f));
+            g.fillEllipse (px - 5.0f, py - 5.0f, 10.0f, 10.0f);
+            g.setColour (Palette::signal);
+            g.fillEllipse (px - 2.0f, py - 2.0f, 4.0f, 4.0f);
+        }
+
         draw::caption (g, "lfo 1", { (int) lane.getRight() - 110, (int) lane.getY() - 4, 108, 10 },
                        Palette::textFaint, 6.0f, juce::Justification::centredRight);
     }
@@ -1736,6 +1940,10 @@ void OrogenEditor::paintChips (juce::Graphics& g)
         const auto r = chipRect (i);
         const float mix = juce::jlimit (0.0f, 1.0f, pv (kChips[idx].id));
         const bool on = mix > 0.005f;
+        // включённый чип подсвечивается волной: задержка по индексу
+        const float glow = (animOn && on)
+            ? 0.72f + 0.28f * (0.5f + 0.5f * std::sin ((animPhaseFor (0.4, 0.12 * i)) * juce::MathConstants<float>::twoPi))
+            : 1.0f;
 
         draw::panel (g, r, 3.0f, on ? Palette::panelAlt : Palette::panel,
                      on ? Palette::lineMid : Palette::line);
@@ -1743,7 +1951,7 @@ void OrogenEditor::paintChips (juce::Graphics& g)
         draw::fxGlyph (g, kChips[idx].glyph, { r.getX() + 9.0f, r.getCentreY() - 8.0f, 16.0f, 16.0f },
                        on ? Palette::text : Palette::textFaint);
 
-        g.setColour (on ? Palette::textDim : Palette::textFaint);
+        g.setColour (on ? Palette::textDim.withMultipliedAlpha (glow) : Palette::textFaint);
         g.setFont (orFont (6.8f));
         g.drawText (spaced (kChips[idx].name),
                     juce::Rectangle<int> ((int) r.getX() + 30, (int) r.getY() + 6, 80, 10),
@@ -1753,7 +1961,7 @@ void OrogenEditor::paintChips (juce::Graphics& g)
         juce::Rectangle<float> bar (r.getX() + 30.0f, r.getY() + 20.0f, 78.0f, 3.0f);
         g.setColour (Palette::lineMid);
         g.fillRoundedRectangle (bar, 1.5f);
-        g.setColour (Palette::signal.withAlpha (0.9f));
+        g.setColour (Palette::signal.withAlpha (0.9f * glow));
         g.fillRoundedRectangle (bar.withWidth (juce::jmax (0.0f, bar.getWidth() * mix)), 1.5f);
 
         // пунктирный «кабель» между чипами
@@ -1973,6 +2181,8 @@ void OrogenEditor::showBankMenu()
     menu.addItem (2, "Load bank...");
     menu.addSeparator();
     menu.addItem (3, "Add current patch as program...");
+    menu.addSeparator();
+    menu.addItem (7, animOn ? "Animations: on" : "Animations: off", true, false);
 
     menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (programBox),
                         [this] (int result)
@@ -2008,6 +2218,10 @@ void OrogenEditor::showBankMenu()
         {
             static int n = 1;
             addProgramFromCurrent ("USER " + juce::String (n++));
+        }
+        else if (result == 7)
+        {
+            setAnimationsEnabled (! animOn);
         }
     });
 }

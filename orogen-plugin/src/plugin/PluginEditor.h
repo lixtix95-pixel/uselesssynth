@@ -55,6 +55,17 @@ public:
     int  chipCount() const;                             // всего чипов (эффекты с ручкой доли)
     juce::String chipParamId (int index) const;         // параметр чипа по порядку
 
+    // --- анимации ---
+    // Фаза — честное время с момента создания редактора, в секундах. Тест и
+    // инструмент render_ui могут выставить её вручную, поэтому кадр
+    // воспроизводим: одна и та же фаза даёт один и тот же пиксель.
+    float animationPhase() const;                       // 0…1 (период 2 с)
+    void  setAnimationPhase (double seconds);
+    bool  animationsEnabled() const { return animOn; }
+    void  setAnimationsEnabled (bool on);
+    void  repaintAnimated();          // перерисовать только «живые» зоны
+    int   animatedAreaPercent() const;// сколько площади экрана реально двигается
+
     // --- банк программ (был только в API процессора) ---
     bool saveBankTo (const juce::File& f);              // весь банк в JSON
     bool loadBankFrom (const juce::File& f);            // банк из JSON + обновление списка
@@ -164,6 +175,12 @@ private:
     std::array<float, 10> chipLast { 0.45f, 0.50f, 0.40f, 0.35f, 0.45f,
                                      0.50f, 0.45f, 0.40f, 0.45f, 0.50f };
     int chipPage = 0;
+
+    double animSeconds = 0.0;         // время анимации, с
+    double lastTimerMs = 0.0;
+    bool   animOn = true;
+    std::array<float, 8> slotLevelsSmooth { };
+    float animPhaseFor (double speed, double offset = 0.0) const;   // 0…1
 
     std::array<float, 8> slotLevels { };
     float masterLevel = 0.0f;

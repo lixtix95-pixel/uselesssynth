@@ -1905,6 +1905,126 @@ int main()
                     quick.deleteFile();
                 }
 
+                // ---- 11. Анимации: фаза воспроизводима, кадры различаются ----
+                {
+                    auto snapshot = [ore] (double phase)
+                    {
+                        ore->setAnimationPhase (phase);
+                        juce::Image img (juce::Image::ARGB, 1280, 800, true);
+                        juce::Graphics g (img);
+                        ore->paintEntireComponent (g, true);
+                        return img;
+                    };
+
+                    auto diffPixels = [] (const juce::Image& a, const juce::Image& b)
+                    {
+                        int n = 0;
+                        juce::Image::BitmapData da (a, juce::Image::BitmapData::readOnly);
+                        juce::Image::BitmapData db (b, juce::Image::BitmapData::readOnly);
+                        for (int y = 0; y < a.getHeight(); ++y)
+                            for (int x = 0; x < a.getWidth(); ++x)
+                                if (da.getPixelColour (x, y) != db.getPixelColour (x, y)) ++n;
+                        return n;
+                    };
+
+                    // 11.1 фаза: 0…1 и повторяемость кадра
+                    ore->setAnimationPhase (0.35);
+                    const float ph1 = ore->animationPhase();
+                    const auto frameA1 = snapshot (0.35);
+                    const auto frameA2 = snapshot (0.35);
+                    std::printf ("   фаза после установки 0.35 с: %.3f, кадр воспроизводим: %s\n",
+                                 (double) ph1, diffPixels (frameA1, frameA2) == 0 ? "да" : "нет");
+                    check (diffPixels (frameA1, frameA2) == 0,
+                           "кадр при одной и той же фазе совпадает побитово", "0 пикселей");
+                    check (ph1 > 0.15f && ph1 < 0.20f, "фаза считается как доля периода 2 с",
+                           num ((double) ph1, 3));
+
+                    // 11.2 разные фазы → разные пиксели (анимация реально рисуется)
+                    const auto frameB = snapshot (1.35);
+                    const int changedPx = diffPixels (frameA1, frameB);
+                    std::printf ("   0.35 с против 1.35 с: различается %d пикселей (%.3f%%)\n",
+                                 changedPx, 100.0 * (double) changedPx / (1280.0 * 800.0));
+                    check (changedPx > 300, "анимация меняет изображение",
+                           juce::String (changedPx) + " пикселей");
+
+                    // 11.3 выключенные анимации → кадр замирает
+                    ore->setAnimationsEnabled (false);
+                    const auto still1 = snapshot (0.35);
+                    const auto still2 = snapshot (1.35);
+                    const int stillDiff = diffPixels (still1, still2);
+                    std::printf ("   анимации выключены: разница кадров %d пикселей\n", stillDiff);
+                    check (stillDiff == 0, "при выключенных анимациях кадры идентичны",
+                           juce::String (stillDiff));
+                    ore->setAnimationsEnabled (true);
+
+                    // 11.4 анимация не трогает параметры
+                    {
+                        static const char* ids[] = { "sA_cutoff", "sA_p0", "gl_master",
+                                                     "fx_reverbMix", "mod1_amt" };
+                        juce::Array<float> before;
+                        for (const auto* id : ids) before.add (p.apvts.getParameter (id)->getValue());
+                        for (int i = 0; i < 40; ++i) ore->setAnimationPhase (i * 0.05);
+                        int touched = 0;
+                        for (int i = 0; i < before.size(); ++i)
+                            if (std::abs (p.apvts.getParameter (ids[i])->getValue() - before[i]) > 1.0e-6f)
+                                ++touched;
+                        std::printf ("   параметров изменено анимацией: %d из %d\n", touched, before.size());
+                        check (touched == 0, "анимация не меняет ни одного параметра", "0");
+                    }
+
+                    // 11.5 бюджет времени: 24 кадра в секунду не должны съедать ядро
+                    {
+                        juce::Image img (juce::Image::ARGB, 1280, 800, true);
+                        const int frames = 20;
+                        const double t0 = juce::Time::getMillisecondCounterHiRes();
+                        for (int i = 0; i < frames; ++i)
+                        {
+                            ore->setAnimationPhase (i * 0.1);
+                            juce::Graphics g (img);
+                            ore->paintEntireComponent (g, true);
+                        }
+                        const double perFrame = (juce::Time::getMillisecondCounterHiRes() - t0) / frames;
+                        std::printf ("   отрисовка кадра 1280×800: %.2f мс, при 20 кадрах/с — %.0f%% ядра\n",
+                                     perFrame, perFrame * 20.0 / 10.0);
+                        check (perFrame < 16.6, "полный кадр укладывается в бюджет 20 кадров/с",
+                               num (perFrame, 2) + " мс");
+
+                        // но полный кадр — не то, что считается на каждый тик:
+                        // перерисовываются только «живые» зоны
+                        const int animated = ore->animatedAreaPercent();
+                        std::printf ("   зон под анимацией: %d%% площади экрана\n", animated);
+                        check (animated > 0 && animated < 60,
+                               "перерисовывается только часть экрана",
+                               juce::String (animated) + "%");
+
+                        // 11.6 реальная цена тика: рисуем только «живые» зоны
+                        {
+                            juce::Image img (juce::Image::ARGB, 1280, 800, true);
+                            const int frames2 = 20;
+                            const double t1 = juce::Time::getMillisecondCounterHiRes();
+                            for (int i = 0; i < frames2; ++i)
+                            {
+                                juce::Graphics g (img);
+                                // объединение, а не пересечение: четыре отдельных
+                                // reduceClipRegion дали бы пустую область
+                                juce::RectangleList<int> dirty;
+                                dirty.add (248, 348, 736, 62);
+                                dirty.add (248, 570, 736, 70);
+                                dirty.add (16, 66, 216, 62);
+                                dirty.add (988, 24, 100, 16);
+                                g.reduceClipRegion (dirty);
+                                ore->setAnimationPhase (i * 0.1);
+                                ore->paintEntireComponent (g, true);
+                            }
+                            const double perTick = (juce::Time::getMillisecondCounterHiRes() - t1) / frames2;
+                            std::printf ("   цена тика (только живые зоны): %.2f мс, при 20 кадрах/с — %.0f%% ядра\n",
+                                         perTick, perTick * 20.0 / 10.0);
+                            check (perTick < perFrame, "тик дешевле полного кадра",
+                                   num (perTick, 2) + " < " + num (perFrame, 2) + " мс");
+                        }
+                    }
+                }
+
             }
         }
     }

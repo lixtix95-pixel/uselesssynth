@@ -34,6 +34,8 @@ int main (int argc, char** argv)
     const int page = argc > 2 ? std::atoi (argv[2]) : 0;
     const int w = argc > 3 ? std::atoi (argv[3]) : 1280;
     const int h = argc > 4 ? std::atoi (argv[4]) : 800;
+    // фаза анимации в секундах: один и тот же кадр воспроизводим побитово
+    const double phase = argc > 5 ? std::atof (argv[5]) : 0.0;
 
     OrogenProcessor proc;
     proc.setPlayConfigDetails (0, 2, 48000.0, 512);
@@ -52,11 +54,12 @@ int main (int argc, char** argv)
                   : (page >= 100) ? juce::jlimit (100, 104, page)
                                   : juce::jlimit (0, 11, page);
     static_cast<OrogenEditor*> (editor.get())->showPage (idx);
+    static_cast<OrogenEditor*> (editor.get())->setAnimationPhase (phase);
 
     // заставляем редактор пересчитать раскладку и отрисовать себя в картинку
     editor->resized();
-    std::printf ("страница после переключения: %d\n",
-                 static_cast<OrogenEditor*> (editor.get())->visiblePage());
+    std::printf ("страница после переключения: %d, фаза %.3f\n",
+                 static_cast<OrogenEditor*> (editor.get())->visiblePage(), phase);
 
     juce::Image image (juce::Image::ARGB, w, h, true);
     {
