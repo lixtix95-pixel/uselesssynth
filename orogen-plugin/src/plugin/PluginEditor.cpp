@@ -166,6 +166,11 @@ public:
         return *this;
     }
 
+    // Компактная раскладка: два списка друг под другом слева, ручка справа.
+    // Нужна карточкам мод-маршрута (источник + приёмник + количество): в
+    // обычной раскладке третий контрол не влезал в карточку 184×72 и обрезался.
+    ParamCard& compact (bool on = true) { compactLayout = on; return *this; }
+
     void paint (juce::Graphics& g) override
     {
         const auto b = getLocalBounds().toFloat();
@@ -190,6 +195,17 @@ public:
     {
         auto r = getLocalBounds().reduced (10, 0);
         r.removeFromTop (24);
+
+        if (compactLayout && knobs.size() == 1 && ! boxes.isEmpty())
+        {
+            auto row = getLocalBounds().reduced (10, 0);
+            row.removeFromTop (18);
+            auto knobArea = row.removeFromRight (40);
+            knobs[0]->setBounds (knobArea.getX(), row.getY() - 2, 34, 34);
+            for (auto* box : boxes)
+                box->setBounds (row.removeFromTop (16).withTrimmedRight (4));
+            return;
+        }
 
         for (auto* box : boxes)
             box->setBounds (r.removeFromTop (18));
@@ -221,6 +237,7 @@ private:
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment>> comboAtts;
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>> knobAtts;
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment>> toggleAtts;
+    bool compactLayout = false;
 };
 
 //============================================================================
@@ -861,6 +878,7 @@ OrogenEditor::OrogenEditor (OrogenProcessor& p)
         for (int i = 0; i < names.size(); ++i) programBox.addItem (names[i].toUpperCase(), i + 1);
         programBox.setSelectedItemIndex (proc.getCurrentProgram(), juce::dontSendNotification);
     }
+    programBox.addMouseListener (this, true);       // правый клик — меню банка
     programBox.onChange = [this]
     {
         const int idx = programBox.getSelectedItemIndex();
@@ -1032,15 +1050,19 @@ void OrogenEditor::buildColumns()
         c.addCard ("COMB TONE", 8).knob ("fx_combFeedback").knob ("fx_combHighpass")
                                  .knob ("fx_combTune");
     }
-    // --- MOD MATRIX ---
+    // --- MOD MATRIX: все 8 маршрутов, у каждого источник, приёмник и количество.
+    // Раньше карточек было четыре и без приёмника: маршруты 5…8 в ядре работали,
+    // но с главного экрана до них было не добраться.
     {
         auto& c = *columns[1];
-        for (int r = 1; r <= 4; ++r)
+        for (int r = 1; r <= 8; ++r)
         {
             const auto pre = "mod" + juce::String (r) + "_";
             c.addCard ("ROUTE " + juce::String (r), 4)
                 .combo (pre + "src", itemsOf (pre + "src"))
-                .knob (pre + "amt");
+                .combo (pre + "dst", itemsOf (pre + "dst"))
+                .knob (pre + "amt")
+                .compact();
         }
     }
     // --- ARP ---
@@ -1194,6 +1216,25 @@ int OrogenEditor::paramsTabCount() const
 int OrogenEditor::fxColumnPageCount() const
 {
     return columns.isEmpty() ? 0 : columns[0]->pageCountPublic();
+}
+
+int OrogenEditor::columnPageCount (int column) const
+{
+    if (column < 0 || column >= columns.size()) return 0;
+    return columns[column]->pageCountPublic();
+}
+
+void OrogenEditor::nextColumnPage (int column)
+{
+    if (column < 0 || column >= columns.size()) return;
+    columns[column]->nextPage();
+    repaint();
+}
+
+juce::StringArray OrogenEditor::allColumnIds (int column) const
+{
+    if (column < 0 || column >= columns.size()) return {};
+    return columns[column]->allIds();
 }
 
 void OrogenEditor::nextFxColumnPage()
@@ -1764,6 +1805,98 @@ void OrogenEditor::paintVectorPad (juce::Graphics& g)
 // ---------------------------------------------------------------------------
 
 //==============================================================================
+// Банк программ в интерфейсе
+//
+// Банк (все программы одним JSON) жил только в API процессора: из GUI можно
+// было загрузить/сохранить один патч файлом, а набор — нет. Теперь правый клик
+// по селектору программ открывает меню банка, и те же операции доступны
+// методами ниже (ими пользуется тест, поэтому проверяется настоящий путь).
+//==============================================================================
+
+void OrogenEditor::refreshProgramList()
+{
+    programBox.clear (juce::dontSendNotification);
+    const auto names = proc.presetNames();
+    for (int i = 0; i < names.size(); ++i)
+        programBox.addItem (names[i].toUpperCase(), i + 1);
+    programBox.setSelectedItemIndex (juce::jlimit (0, juce::jmax (0, names.size() - 1),
+                                                   proc.getCurrentProgram()),
+                                     juce::dontSendNotification);
+    repaint();
+}
+
+int OrogenEditor::programItemCount() const
+{
+    return programBox.getNumItems();
+}
+
+bool OrogenEditor::saveBankTo (const juce::File& f)
+{
+    return proc.saveBankFile (f);
+}
+
+bool OrogenEditor::loadBankFrom (const juce::File& f)
+{
+    const bool ok = proc.loadBankFile (f);
+    if (ok) refreshProgramList();
+    return ok;
+}
+
+int OrogenEditor::addProgramFromCurrent (const juce::String& name)
+{
+    const int idx = proc.addProgram (name);
+    refreshProgramList();
+    return idx;
+}
+
+void OrogenEditor::showBankMenu()
+{
+    juce::PopupMenu menu;
+    menu.addSectionHeader ("BANK");
+    menu.addItem (1, "Save bank...");
+    menu.addItem (2, "Load bank...");
+    menu.addSeparator();
+    menu.addItem (3, "Add current patch as program...");
+
+    menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (programBox),
+                        [this] (int result)
+    {
+        if (result == 1)
+        {
+            auto chooser = std::make_shared<juce::FileChooser> ("Save bank",
+                                                               juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
+                                                                   .getChildFile ("OROGEN-bank.json"),
+                                                               "*.json");
+            chooser->launchAsync (juce::FileBrowserComponent::saveMode
+                                    | juce::FileBrowserComponent::canSelectFiles,
+                                  [this, chooser] (const juce::FileChooser& fc)
+            {
+                const auto f = fc.getResult();
+                if (f != juce::File()) saveBankTo (f.withFileExtension ("json"));
+            });
+        }
+        else if (result == 2)
+        {
+            auto chooser = std::make_shared<juce::FileChooser> ("Load bank",
+                                                               juce::File::getSpecialLocation (juce::File::userDocumentsDirectory),
+                                                               "*.json");
+            chooser->launchAsync (juce::FileBrowserComponent::openMode
+                                    | juce::FileBrowserComponent::canSelectFiles,
+                                  [this, chooser] (const juce::FileChooser& fc)
+            {
+                const auto f = fc.getResult();
+                if (f.existsAsFile()) loadBankFrom (f);
+            });
+        }
+        else if (result == 3)
+        {
+            static int n = 1;
+            addProgramFromCurrent ("USER " + juce::String (n++));
+        }
+    });
+}
+
+//==============================================================================
 // Интерактивные зоны главного экрана
 //
 // До этой правки чипы FX и дорожки мод-редактора рисовались по настоящим
@@ -1973,6 +2106,13 @@ OrogenEditor::MainHit OrogenEditor::beginMainDrag (juce::Point<float> designPos)
 
 void OrogenEditor::mouseDown (const juce::MouseEvent& e)
 {
+    if (e.eventComponent != this)
+    {
+        // события дочерних контролов не должны попадать в разбор главного экрана
+        if (e.eventComponent == &programBox && e.mods.isPopupMenu()) showBankMenu();
+        return;
+    }
+
     beginMainDrag ({ e.position.x / juce::jmax (0.01f, kx()),
                      e.position.y / juce::jmax (0.01f, ky()) });
 }

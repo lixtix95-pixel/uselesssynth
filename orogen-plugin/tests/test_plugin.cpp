@@ -1752,6 +1752,72 @@ int main()
                                juce::String (distinct) + " / " + juce::String (nPrograms - 1));
                     }
                 }
+
+                // 10.7 мод-матрица на главном экране: все 8 маршрутов с приёмником
+                {
+                    ore->showPage (9);                    // секция MOD MATRIX
+                    const int pagesInMatrix = ore->columnPageCount (1);
+                    const auto ids = ore->allColumnIds (1);
+                    int found = 0;
+                    juce::StringArray missing;
+                    for (int r = 1; r <= 8; ++r)
+                        for (const auto* field : { "src", "dst", "amt" })
+                        {
+                            const juce::String id = "mod" + juce::String (r) + "_" + field;
+                            if (ids.contains (id)) ++found; else missing.add (id);
+                        }
+                    std::printf ("   мод-матрица: страниц %d, параметров маршрутов %d / 24\n",
+                                 pagesInMatrix, found);
+                    check (found == 24, "все 8 маршрутов мод-матрицы с приёмником на главном экране",
+                           missing.isEmpty() ? juce::String ("24 / 24") : missing.joinIntoString (", "));
+                    check (pagesInMatrix >= 2, "маршруты 5…8 на второй странице колонки",
+                           num ((double) pagesInMatrix, 0));
+                }
+
+                // 10.8 банк программ через GUI: добавить, сохранить, загрузить
+                {
+                    const int before = p.getNumPrograms();
+                    const int added = ore->addProgramFromCurrent ("GUI TEST");
+                    const int afterAdd = p.getNumPrograms();
+                    std::printf ("   банк: программ %d -> %d (индекс %d), в селекторе %d\n",
+                                 before, afterAdd, added, ore->programItemCount());
+                    check (afterAdd == before + 1 && added == afterAdd - 1,
+                           "добавление программы из GUI", juce::String (before) + " -> "
+                                                          + juce::String (afterAdd));
+                    check (ore->programItemCount() == afterAdd,
+                           "список в шапке обновился", juce::String (ore->programItemCount()));
+
+                    const auto file = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                          .getChildFile ("orogen-bank-gui-test.json");
+                    file.deleteFile();
+                    const bool saved = ore->saveBankTo (file);
+                    const auto size = file.getSize();
+                    std::printf ("   банк сохранён: %s, %lld байт\n", saved ? "да" : "нет",
+                                 (long long) size);
+                    check (saved && size > 1000, "сохранение банка из GUI",
+                           juce::String ((long long) size) + " байт");
+
+                    // меняем параметр и загружаем банк обратно
+                    auto* prm = p.apvts.getParameter ("sA_cutoff");
+                    const float savedMaster = prm->getValue();
+                    prm->setValueNotifyingHost (juce::jlimit (0.0f, 1.0f, savedMaster > 0.5f ? 0.05f : 0.95f));
+                    const float changed = prm->getValue();
+
+                    const bool loaded = ore->loadBankFrom (file);
+                    const float restored = prm->getValue();
+                    std::printf ("   банк загружен: %s, sA_cutoff %.3f -> %.3f -> %.3f, программ %d, в селекторе %d\n",
+                                 loaded ? "да" : "нет", (double) savedMaster, (double) changed,
+                                 (double) restored, p.getNumPrograms(), ore->programItemCount());
+                    check (loaded && std::abs (restored - changed) > 1.0e-4f
+                             && std::abs (restored - savedMaster) < 0.02f,
+                           "загрузка банка из GUI возвращает параметры",
+                           num ((double) restored, 3));
+                    check (ore->programItemCount() == p.getNumPrograms(),
+                           "после загрузки банка список программ совпадает",
+                           juce::String (ore->programItemCount()) + " / "
+                               + juce::String (p.getNumPrograms()));
+                    file.deleteFile();
+                }
             }
         }
     }

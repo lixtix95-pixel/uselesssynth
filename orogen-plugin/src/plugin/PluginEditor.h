@@ -37,6 +37,9 @@ public:
     juce::StringArray mainScreenParamIds() const;   // что привязано к карточкам главного экрана
     int fxColumnPageCount() const;                  // страниц в FX-колонке (для теста)
     void nextFxColumnPage();
+    int  columnPageCount (int column) const;        // страниц в любой из 4 колонок
+    void nextColumnPage (int column);               // листнуть колонку по кругу
+    juce::StringArray allColumnIds (int column) const;   // все параметры колонки, со всех страниц
 
     // --- главный экран: интерактивные зоны (чипы FX, дорожки мод-редактора) ---
     // Тот же путь, что и у мыши: mouseDown/mouseDrag/mouseUp вызывают эти методы,
@@ -48,6 +51,13 @@ public:
     bool dragMain  (juce::Point<float> designPos);      // перетаскивание узла/чипа
     void releaseMain();
     int  mainScreenHitCount() const;                    // сколько целей на экране (для теста)
+
+    // --- банк программ (был только в API процессора) ---
+    bool saveBankTo (const juce::File& f);              // весь банк в JSON
+    bool loadBankFrom (const juce::File& f);            // банк из JSON + обновление списка
+    int  addProgramFromCurrent (const juce::String& name);   // текущий патч в конец банка
+    void refreshProgramList();                          // перечитать банк в шапке
+    int  programItemCount() const;                      // пунктов в селекторе (для теста)
     bool keyPressed (const juce::KeyPress&) override;
 
     static constexpr float kDesignW = 1280.0f;  // система координат макета
@@ -71,6 +81,7 @@ private:
     void selectSlot (int slot);
     void setSection (int index);
     void toggleParamsPage (bool shouldShow);
+    void showBankMenu();
     void loadPresetFromFile();
     void savePresetToFile();
 
