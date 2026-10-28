@@ -1870,6 +1870,41 @@ int main()
                                + juce::String (p.getNumPrograms()));
                     file.deleteFile();
                 }
+
+                // 10.9 быстрый банк (пункт меню LOAD/SAVE, без диалога)
+                {
+                    // банк — это список программ, поэтому проверяем через программу:
+                    // сохраняем текущий патч как программу, затем возим банк туда-обратно
+                    const auto quick = ore->quickBankFile();
+                    quick.deleteFile();
+
+                    if (auto* pm = p.apvts.getParameter ("sB_cutoff"))
+                        pm->setValueNotifyingHost (0.8f);
+                    const int idx = ore->addProgramFromCurrent ("QUICK TEST");
+
+                    const bool saved = ore->saveBankQuick();
+                    const auto size = quick.getSize();
+
+                    // портим патч и загружаем банк «одним пунктом меню»
+                    if (auto* pm = p.apvts.getParameter ("sB_cutoff"))
+                        pm->setValueNotifyingHost (0.1f);
+                    const float broken = p.apvts.getParameter ("sB_cutoff")->getValue();
+
+                    const bool loaded = ore->loadBankQuick();
+                    const int found = p.presetNames().indexOf ("QUICK TEST");
+                    if (found >= 0) p.setCurrentProgram (found);
+                    const float back = p.apvts.getParameter ("sB_cutoff")->getValue();
+
+                    std::printf ("   быстрый банк: %s, %lld байт, программа #%d, sB_cutoff %.3f -> %.3f\n",
+                                 quick.getFullPathName().toRawUTF8(), (long long) size, found,
+                                 (double) broken, (double) back);
+                    check (saved && loaded && size > 1000 && found == idx
+                             && std::abs (back - 0.8f) < 0.02f,
+                           "быстрое сохранение и загрузка банка",
+                           num ((double) back, 3));
+                    quick.deleteFile();
+                }
+
             }
         }
     }

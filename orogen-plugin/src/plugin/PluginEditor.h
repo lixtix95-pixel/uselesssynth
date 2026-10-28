@@ -61,6 +61,11 @@ public:
     int  addProgramFromCurrent (const juce::String& name);   // текущий патч в конец банка
     void refreshProgramList();                          // перечитать банк в шапке
     int  programItemCount() const;                      // пунктов в селекторе (для теста)
+    // Быстрый банк: фиксированный файл в каталоге приложения, без диалога —
+    // чтобы сохранить/загрузить весь набор можно было одним пунктом меню.
+    juce::File quickBankFile() const;
+    bool saveBankQuick();
+    bool loadBankQuick();
     bool keyPressed (const juce::KeyPress&) override;
 
     static constexpr float kDesignW = 1280.0f;  // система координат макета
@@ -85,6 +90,7 @@ private:
     void setSection (int index);
     void toggleParamsPage (bool shouldShow);
     void showBankMenu();
+    void showIoMenu (bool saving);      // меню кнопок LOAD / SAVE
     void loadPresetFromFile();
     void savePresetToFile();
 

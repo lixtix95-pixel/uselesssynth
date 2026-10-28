@@ -911,6 +911,8 @@ OrogenEditor::OrogenEditor (OrogenProcessor& p)
         programBox.setSelectedItemIndex (proc.getCurrentProgram(), juce::dontSendNotification);
     }
     programBox.addMouseListener (this, true);       // правый клик — меню банка
+    loadButton.addMouseListener (this, true);       // правый клик — меню LOAD
+    saveButton.addMouseListener (this, true);       // правый клик — меню SAVE
     programBox.onChange = [this]
     {
         const int idx = programBox.getSelectedItemIndex();
@@ -1884,6 +1886,85 @@ int OrogenEditor::addProgramFromCurrent (const juce::String& name)
     return idx;
 }
 
+juce::File OrogenEditor::quickBankFile() const
+{
+    return juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
+               .getChildFile ("OROGEN").getChildFile ("bank.json");
+}
+
+bool OrogenEditor::saveBankQuick()
+{
+    const auto f = quickBankFile();
+    f.getParentDirectory().createDirectory();
+    return proc.saveBankFile (f);
+}
+
+bool OrogenEditor::loadBankQuick()
+{
+    const auto f = quickBankFile();
+    if (! f.existsAsFile()) return false;
+    return loadBankFrom (f);
+}
+
+void OrogenEditor::showIoMenu (bool saving)
+{
+    juce::PopupMenu menu;
+    menu.addSectionHeader (saving ? "SAVE" : "LOAD");
+    if (saving)
+    {
+        menu.addItem (1, "Save patch...");
+        menu.addItem (2, "Save bank...");
+        menu.addItem (3, "Save bank (quick)");
+    }
+    else
+    {
+        menu.addItem (4, "Load patch...");
+        menu.addItem (5, "Load bank...");
+        menu.addItem (6, "Load bank (quick)");
+    }
+
+    menu.showMenuAsync (juce::PopupMenu::Options()
+                            .withTargetComponent (saving ? &saveButton : &loadButton),
+                        [this] (int result)
+    {
+        switch (result)
+        {
+            case 1: savePresetToFile(); break;
+            case 2:
+            {
+                auto chooser = std::make_shared<juce::FileChooser> ("Save bank",
+                    juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
+                        .getChildFile ("OROGEN-bank.json"), "*.json");
+                chooser->launchAsync (juce::FileBrowserComponent::saveMode
+                                        | juce::FileBrowserComponent::canSelectFiles,
+                                      [this, chooser] (const juce::FileChooser& fc)
+                {
+                    const auto f = fc.getResult();
+                    if (f != juce::File()) saveBankTo (f.withFileExtension ("json"));
+                });
+                break;
+            }
+            case 3: saveBankQuick(); break;
+            case 4: loadPresetFromFile(); break;
+            case 5:
+            {
+                auto chooser = std::make_shared<juce::FileChooser> ("Load bank",
+                    juce::File::getSpecialLocation (juce::File::userDocumentsDirectory), "*.json");
+                chooser->launchAsync (juce::FileBrowserComponent::openMode
+                                        | juce::FileBrowserComponent::canSelectFiles,
+                                      [this, chooser] (const juce::FileChooser& fc)
+                {
+                    const auto f = fc.getResult();
+                    if (f.existsAsFile()) loadBankFrom (f);
+                });
+                break;
+            }
+            case 6: loadBankQuick(); break;
+            default: break;
+        }
+    });
+}
+
 void OrogenEditor::showBankMenu()
 {
     juce::PopupMenu menu;
@@ -2177,6 +2258,8 @@ void OrogenEditor::mouseDown (const juce::MouseEvent& e)
     {
         // события дочерних контролов не должны попадать в разбор главного экрана
         if (e.eventComponent == &programBox && e.mods.isPopupMenu()) showBankMenu();
+        else if (e.eventComponent == &loadButton && e.mods.isPopupMenu()) showIoMenu (false);
+        else if (e.eventComponent == &saveButton && e.mods.isPopupMenu()) showIoMenu (true);
         return;
     }
 
