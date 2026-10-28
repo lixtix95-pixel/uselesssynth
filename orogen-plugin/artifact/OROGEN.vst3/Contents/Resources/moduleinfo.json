@@ -1,0 +1,48 @@
+{
+  "Name": "OROGEN",
+  "Version": "0.1.0",
+  "Factory Info": {
+    "Vendor": "OROGEN",
+    "URL": "",
+    "E-Mail": "",
+    "Flags": {
+      "Unicode": true,
+      "Classes Discardable": false,
+      "Component Non Discardable": false,
+    },
+  },
+  "Classes": [
+    {
+      "CID": "ABCDEF019182FAEB4F726F674F72676E",
+      "Category": "Audio Module Class",
+      "Name": "OROGEN",
+      "Vendor": "OROGEN",
+      "Version": "0.1.0",
+      "SDKVersion": "VST 3.8.0",
+      "Sub Categories": [
+        "Instrument",
+        "Synth",
+      ],
+      "Class Flags": 2,
+      "Cardinality": 2147483647,
+      "Snapshots": [
+      ],
+    },
+    {
+      "CID": "ABCDEF011234ABCD4F726F674F72676E",
+      "Category": "Component Controller Class",
+      "Name": "OROGEN",
+      "Vendor": "OROGEN",
+      "Version": "0.1.0",
+      "SDKVersion": "VST 3.8.0",
+      "Sub Categories": [
+        "Instrument",
+        "Synth",
+      ],
+      "Class Flags": 2,
+      "Cardinality": 2147483647,
+      "Snapshots": [
+      ],
+    },
+  ],
+}

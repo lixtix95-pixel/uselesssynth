@@ -1,0 +1,25 @@
+# --- артефакты сборки (воспроизводятся: make / build_vst3.bat) --------------
+build/
+build-vst3/
+build-vs2022/
+orogen-plugin/build*/
+orogen-dsp/build/
+**/*.o
+**/*.so
+**/*.d
+**/*.pdb
+**/*.ilk
+**/*.obj
+
+# --- демо-рендеры (воспроизводятся: cd orogen-dsp && make demo) -------------
+orogen-dsp/audio/
+*.wav
+
+# --- служебное --------------------------------------------------------------
+.DS_Store
+__pycache__/
+*.pyc
+.cache/
+.vscode/
+.idea/
+.sudo_as_admin_successful

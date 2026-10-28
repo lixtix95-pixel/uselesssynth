@@ -1,0 +1,42 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 22, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "vs2022",
+      "displayName": "Visual Studio 2022 (x64)",
+      "description": "JUCE 8.0.15 подтягивается через FetchContent (нужен git в PATH)",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build-vs2022",
+      "cacheVariables": {
+        "OROGEN_JUCE_VERSION": "8.0.15",
+        "OROGEN_BUILD_STANDS": "OFF"
+      }
+    },
+    {
+      "name": "vs2022-local-juce",
+      "displayName": "Visual Studio 2022 (x64, локальный JUCE)",
+      "description": "Если JUCE уже склонирован: cmake --preset vs2022-local-juce -DOROGEN_JUCE_PATH=C:/JUCE",
+      "inherits": "vs2022",
+      "cacheVariables": {
+        "OROGEN_JUCE_PATH": "C:/JUCE"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "vs2022-release",
+      "configurePreset": "vs2022",
+      "configuration": "Release",
+      "targets": [ "OROGEN_VST3" ],
+      "jobs": 0
+    },
+    {
+      "name": "vs2022-debug",
+      "configurePreset": "vs2022",
+      "configuration": "Debug",
+      "targets": [ "OROGEN_VST3" ]
+    }
+  ]
+}
