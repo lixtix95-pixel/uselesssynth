@@ -2023,6 +2023,127 @@ int main()
                                    num (perTick, 2) + " < " + num (perFrame, 2) + " мс");
                         }
                     }
+
+                    // ---- 12. Движки: переключение В GUI обязано менять звук ----
+                    {
+                        // отдельная пара процессор+редактор: в GUI жмём селектор,
+                        // из процессора читаем параметр и рендерим звук
+                        OrogenProcessor q;
+                        std::unique_ptr<juce::AudioProcessorEditor> ed2 (q.createEditor());
+                        check (ed2 != nullptr, "редактор создаётся для проверки движков");
+                        if (ed2 != nullptr)
+                        {
+                            auto* ore2 = static_cast<OrogenEditor*> (ed2.get());
+                            ore2->setSize (1280, 800);
+
+                            juce::ComboBox* eng = nullptr;
+                            for (auto* child : ore2->getChildren())
+                                if (auto* box = dynamic_cast<juce::ComboBox*> (child))
+                                    if (box->getTooltip().startsWith ("Engine type")) eng = box;
+
+                            check (eng != nullptr, "в центре есть селектор движка");
+                            if (eng != nullptr)
+                            {
+                                std::printf ("   селектор движка: %d пунктов\n", eng->getNumItems());
+                                check (eng->getNumItems() == 9, "в селекторе все 9 движков",
+                                       juce::String (eng->getNumItems()) + " / 9");
+
+                                // звук каждого движка, выбранного мышью в селекторе
+                                juce::Array<juce::AudioBuffer<float>> audio;
+                                juce::Array<double> rms;
+                                for (int t = 0; t < 9; ++t)
+                                {
+                                    q.setPlayConfigDetails (0, 2, sr, 512);
+                                    q.prepareToPlay (sr, 512);
+                                    q.setCurrentProgram (0);
+                                    soloSlot (q, 0, t);
+                                    eng->setSelectedItemIndex (t, juce::sendNotificationSync);
+                                    const int typeFromParam = (int) std::lround (
+                                        q.apvts.getParameter ("sA_type")->convertFrom0to1 (
+                                            q.apvts.getParameter ("sA_type")->getValue()));
+                                    juce::MessageManager::getInstance()->runDispatchLoopUntil (80);
+                                    auto buf = renderBlocks (q, 20000, sr);
+                                    audio.add (buf);
+                                    rms.add (rmsOf (buf));
+                                    if (typeFromParam != t)
+                                        std::printf ("   [внимание] селектор %d, параметр %d\n", t, typeFromParam);
+                                }
+
+                                // все 36 пар должны отличаться (как в блоке 7, но через GUI)
+                                int pairs = 0, distinct = 0;
+                                double minDelta = 1.0;
+                                for (int i = 0; i < 9; ++i)
+                                    for (int k = i + 1; k < 9; ++k)
+                                    {
+                                        ++pairs;
+                                        const double d = deltaTo (audio[i], audio[k]);
+                                        minDelta = std::min (minDelta, d);
+                                        if (d > 0.0015) ++distinct;
+                                    }
+                                std::printf ("   через GUI: пар различимо %d / %d, минимальная Δ %.4f\n",
+                                             distinct, pairs, minDelta);
+                                for (int i = 0; i < 9; ++i)
+                                    std::printf ("     %-9s RMS %.4f\n",
+                                                 q.getProgramName (0).isEmpty() ? "" : "",
+                                                 (double) rms[i]);
+                                check (distinct == pairs,
+                                       "переключение движка в селекторе слышно",
+                                       juce::String (distinct) + " / " + juce::String (pairs));
+
+                                // селектор привязан к выбранному слоту: слот B → sB_type
+                                const auto vA = q.apvts.getParameter ("sA_type");
+                                const int typeABefore = (int) std::lround (vA->convertFrom0to1 (vA->getValue()));
+
+                                ore2->showPage (1);            // выбрать слот B
+                                q.apvts.getParameter ("sB_type")->setValueNotifyingHost (
+                                    q.apvts.getParameter ("sB_type")->convertTo0to1 (4.0f));
+                                juce::MessageManager::getInstance()->runDispatchLoopUntil (60);
+                                const int boxOnB = eng->getSelectedItemIndex();
+                                eng->setSelectedItemIndex (6, juce::sendNotificationSync);
+                                const auto vB = q.apvts.getParameter ("sB_type");
+                                const int typeB = (int) std::lround (vB->convertFrom0to1 (vB->getValue()));
+                                const int typeA = (int) std::lround (vA->convertFrom0to1 (vA->getValue()));
+                                std::printf ("   слот B: селектор показывает %d, после выбора sB_type=%d, "
+                                             "sA_type не тронут (%d -> %d)\n",
+                                             boxOnB, typeB, typeABefore, typeA);
+                                check (boxOnB == 4 && typeB == 6 && typeA == typeABefore,
+                                       "селектор переключает движок именно выбранного слота",
+                                       juce::String (typeB));
+
+                                // и сам интерфейс обязан перерисоваться: имя, иконка в рейле,
+                                // форма волны на дисплее
+                                auto shot = [ore2]
+                                {
+                                    juce::Image img (juce::Image::ARGB, 1280, 800, true);
+                                    juce::Graphics g (img);
+                                    ore2->setAnimationPhase (0.0);
+                                    ore2->paintEntireComponent (g, true);
+                                    return img;
+                                };
+
+                                ore2->showPage (0);                   // слот A
+                                q.apvts.getParameter ("sA_type")->setValueNotifyingHost (
+                                    q.apvts.getParameter ("sA_type")->convertTo0to1 (0.0f));
+                                juce::MessageManager::getInstance()->runDispatchLoopUntil (60);
+                                const auto uiWave = shot();
+                                q.apvts.getParameter ("sA_type")->setValueNotifyingHost (
+                                    q.apvts.getParameter ("sA_type")->convertTo0to1 (4.0f));
+                                juce::MessageManager::getInstance()->runDispatchLoopUntil (60);
+                                const auto uiGran = shot();
+
+                                int uiDiff = 0;
+                                juce::Image::BitmapData d1 (uiWave, juce::Image::BitmapData::readOnly);
+                                juce::Image::BitmapData d2 (uiGran, juce::Image::BitmapData::readOnly);
+                                for (int y = 0; y < 800; ++y)
+                                    for (int x = 0; x < 1280; ++x)
+                                        if (d1.getPixelColour (x, y) != d2.getPixelColour (x, y)) ++uiDiff;
+                                std::printf ("   интерфейс при смене движка Wavetable -> Granular: %d пикселей\n",
+                                             uiDiff);
+                                check (uiDiff > 2000, "смена движка видна в интерфейсе",
+                                       juce::String (uiDiff) + " пикселей");
+                            }
+                        }
+                    }
                 }
 
             }

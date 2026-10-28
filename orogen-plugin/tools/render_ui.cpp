@@ -36,11 +36,12 @@ int main (int argc, char** argv)
     const int h = argc > 4 ? std::atoi (argv[4]) : 800;
     // фаза анимации в секундах: один и тот же кадр воспроизводим побитово
     const double phase = argc > 5 ? std::atof (argv[5]) : 0.0;
+    const int program = argc > 6 ? std::atoi (argv[6]) : 1;
 
     OrogenProcessor proc;
     proc.setPlayConfigDetails (0, 2, 48000.0, 512);
     proc.prepareToPlay (48000.0, 512);
-    proc.setCurrentProgram (1);                         // Terra Pad
+    proc.setCurrentProgram (program);                   // 1 = Terra Pad
 
     std::unique_ptr<juce::AudioProcessorEditor> editor (proc.createEditor());
     if (editor == nullptr) { std::printf ("нет редактора\n"); return 1; }

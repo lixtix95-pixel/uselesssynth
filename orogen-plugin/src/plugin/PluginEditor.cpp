@@ -1206,6 +1206,8 @@ void OrogenEditor::selectSlot (int slot)
 
     engineAtt.reset();
     filterAtt.reset();
+    rebuildPreview (true);          // смена слота — сразу новое превью
+
     engineAtt = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (
         proc.apvts, slotId ("type"), engineBox);
     filterAtt = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (
@@ -1436,6 +1438,129 @@ void OrogenEditor::setAnimationPhase (double seconds)
     repaint();
 }
 
+void OrogenEditor::rebuildPreview (bool force)
+{
+    // Подпись из всего, что меняет форму: слот, движок, контент, макросы, тюн.
+    const auto pre = slotPrefix (selectedSlot);
+    const juce::String sig = pre
+        + "|" + juce::String (pi (pre + "type"))
+        + "|" + juce::String (pi (pre + "table"))
+        + "|" + juce::String (pv (pre + "p0"), 3) + "|" + juce::String (pv (pre + "p1"), 3)
+        + "|" + juce::String (pv (pre + "p2"), 3) + "|" + juce::String (pv (pre + "p3"), 3)
+        + "|" + juce::String (pv (pre + "tune"), 2);
+
+    // Та же подпись — тот же звук: перерисовывать нечего. Раньше force=true
+    // (смена слота) гонял движок повторно, и у грануляра второе окно попадало
+    // в паузу между зёрнами — дисплей пустел.
+    // Та же подпись — не пересобираем вообще (даже если превью пустое: иначе
+    // «тихий» движок заставлял бы пересоздавать инструмент на каждом тике).
+    const double sincePrev = juce::Time::getMillisecondCounterHiRes() - prevStampMs;
+    if (sig == prevSig) return;
+    if (! force && sincePrev < 60.0) return;   // не рендерим на каждый пиксель драга
+    prevSig = sig;
+    prevStampMs = juce::Time::getMillisecondCounterHiRes();
+
+    // Патч: только выбранный слот, чистая форма без фильтра и эффектов
+    Patch patch;
+    patch.mode = PatchMode::Stack;
+    for (int i = 0; i < kNumSlots; ++i) patch.slots[(size_t) i].on = (i == selectedSlot);
+
+    SlotPatch& sl = patch.slots[(size_t) selectedSlot];
+    sl.type   = (EngineType) juce::jlimit (0, 8, pi (pre + "type"));
+    sl.params.table = pi (pre + "table");
+    sl.params.p[0] = pv (pre + "p0");
+    sl.params.p[1] = pv (pre + "p1");
+    sl.params.p[2] = pv (pre + "p2");
+    sl.params.p[3] = pv (pre + "p3");
+    sl.params.tuneSemis = pv (pre + "tune");
+    sl.params.level = 1.0f;
+    sl.cutoff = 1.0f;                       // фильтр в превью не участвует
+    sl.res = 0.0f;
+    sl.loNote = 0;
+    sl.hiNote = 127;
+
+    // Одна попытка: прогрев, полсекунды звука, из них — самое громкое окно.
+    // Грануляр при малой плотности выдаёт зёрна пачками (в замере бывают паузы
+    // по 200 мс), фиксированное окно попадало в тишину — берём громкое.
+    auto attempt = [&patch] (std::unique_ptr<Instrument>& ins)
+    {
+        if (ins == nullptr)
+        {
+            ins = std::make_unique<Instrument>();
+            ins->prepare (48000.0, 1);
+        }
+        ins->stagePatch (patch);
+        ins->setFx (FxChain::Settings());            // сухой сигнал
+        ins->noteOff (60);
+        ins->noteOn (60, 1.0f);
+
+        constexpr int kWarmup = 4096;
+        for (int i = 0; i < kWarmup; ++i) { float l = 0.0f, r = 0.0f; ins->render (l, r); }
+
+        constexpr int kScan = 24000;                 // 0.5 с
+        constexpr int kCapture = 4096;
+        std::vector<float> scan ((size_t) kScan, 0.0f);
+        for (int i = 0; i < kScan; ++i)
+        {
+            float l = 0.0f, r = 0.0f;
+            ins->render (l, r);
+            scan[(size_t) i] = l;
+        }
+
+        size_t bestStart = 0;
+        double bestEnergy = -1.0;
+        for (int st = 0; st + kCapture <= kScan; st += 512)
+        {
+            double e = 0.0;
+            for (int i = 0; i < kCapture; ++i) e += (double) scan[(size_t) (st + i)] * scan[(size_t) (st + i)];
+            if (e > bestEnergy) { bestEnergy = e; bestStart = (size_t) st; }
+        }
+
+        std::vector<float> w (scan.begin() + (long) bestStart,
+                              scan.begin() + (long) bestStart + kCapture);
+        double mean = 0.0;
+        for (const auto v : w) mean += v;
+        mean /= (double) w.size();
+        for (auto& v : w) v -= (float) mean;
+
+        float pk = 0.0f;
+        for (const auto v : w) pk = juce::jmax (pk, std::abs (v));
+        if (pk > 1.0e-6f) for (auto& v : w) v /= pk;
+        return std::pair<std::vector<float>, float> { std::move (w), pk };
+    };
+
+    auto result = attempt (prevIns);
+    if (result.second <= 1.0e-5f)
+        result = attempt (prevIns);      // вторая попытка на том же инструменте:
+                                         // пересоздание тянуло пересбор банка (секунды)
+
+    prevWave = (result.second > 1.0e-5f) ? std::move (result.first) : std::vector<float>();
+
+    // Готовая форма для рисования: по колонке на пиксель при ширине 736,
+    // вертикальный отрезок min…max. Один Path стоит 0.2 мс вместо 8 мс на
+    // 736 отдельных drawVerticalLine — кадр снова укладывается в бюджет.
+    prevPath.clear();
+    if (! prevWave.empty())
+    {
+        constexpr int kCols = 512;
+        const size_t count = prevWave.size();
+        for (int c = 0; c < kCols; ++c)
+        {
+            const size_t i0 = (size_t) ((double) c / kCols * (double) count);
+            size_t i1 = (size_t) ((double) (c + 1) / kCols * (double) count);
+            if (i1 <= i0) i1 = i0 + 1;
+            if (i1 > count) i1 = count;
+
+            float mn = 0.0f, mx = 0.0f;
+            for (size_t i = i0; i < i1; ++i) { mn = juce::jmin (mn, prevWave[i]); mx = juce::jmax (mx, prevWave[i]); }
+
+            const float x = ((float) c + 0.5f) / (float) kCols;
+            prevPath.startNewSubPath (x, juce::jlimit (-1.2f, 1.2f, mx));
+            prevPath.lineTo (x, juce::jlimit (-1.2f, 1.2f, mn));
+        }
+    }
+}
+
 void OrogenEditor::repaintAnimated()
 {
     // Полный repaint() на 24 кадрах/с стоил 8.8 мс (≈21 % ядра). Двигается же
@@ -1509,6 +1634,9 @@ void OrogenEditor::timerCallback()
         sm += (target - sm) * (dt > 0.0 ? (float) juce::jmin (1.0, dt / 0.12) : 0.2f);
         if (std::abs (sm - slotLevels[(size_t) i]) > 0.2f) { slotLevels[(size_t) i] = sm; changed = true; }
     }
+
+    // превью движка для дисплея: пересобирается только когда меняется подпись
+    rebuildPreview (false);
 
     // программа могла смениться извне (хост, MIDI program change) — держим
     // селектор в шапке синхронным с банком
@@ -1686,45 +1814,22 @@ void OrogenEditor::paintDisplay (juce::Graphics& g)
 
     const int type = pi (slotId ("type"));
     const int table = juce::jlimit (0, 7, pi (slotId ("table")));
-    const auto& bank = waveStore().get();
-    juce::String tableName = "-";
 
-    if (table < (int) bank.tables.size())
+    // --- форма волны ЭТОГО движка: рендерится из DSP (rebuildPreview) ---
+    const auto& wave = previewWave();
+    if (! wave.empty())
     {
-        const auto& wt = bank.tables[(size_t) table];
-        tableName = juce::String (wt.name.c_str()).toUpperCase();
-
-        const int frames = juce::jmax (1, wt.frames);
-        const float pos = juce::jlimit (0.0f, 1.0f,
-                                       0.70f * pv (slotId ("p0")) + 0.30f * pv (slotId ("p1")));
-        const int frame = juce::jlimit (0, frames - 1,
-                                        juce::roundToInt (pos * (float) (frames - 1)));
-
-        if (! wt.levels.empty() && ! wt.lens.empty() && wt.lens[0] > 8)
+        // Осциллограф: кэшированный Path (512 колонок min…max) масштабируется
+        // под область дисплея. Отрисовка — один stroke вместо 736 линий.
+        if (! previewPath().isEmpty())
         {
-            const int len = wt.lens[0];
-            const float* data = wt.levels[0].data() + (size_t) frame * (size_t) len;
-
-            const int N = 640;
-            juce::Path wave, body;
-            for (int i = 0; i <= N; ++i)
-            {
-                const float t = (float) i / (float) N;
-                const int idx = juce::jlimit (0, len - 1, (int) (t * (float) (len - 1)));
-                const float v = juce::jlimit (-1.4f, 1.4f, data[(size_t) idx]);
-
-                const float x = inner.getX() + t * inner.getWidth();
-                const float y = inner.getCentreY() - v * inner.getHeight() * 0.42f;
-
-                if (i == 0) { wave.startNewSubPath (x, y); body.startNewSubPath (x, inner.getCentreY()); body.lineTo (x, y); }
-                else        { wave.lineTo (x, y); body.lineTo (x, y); }
-            }
-            body.lineTo (inner.getRight(), inner.getCentreY());
-            body.closeSubPath();
-
-            g.setColour (Palette::signal.withAlpha (0.045f));
-            g.fillPath (body);
-            draw::glowStroke (g, wave, 1.7f, Palette::signal, 0.30f);
+            const auto tr = juce::AffineTransform::scale (inner.getWidth(),
+                                                          inner.getHeight() * 0.42f)
+                                .translated (inner.getX(), inner.getCentreY());
+            auto scaled = previewPath();
+            scaled.applyTransform (tr);
+            g.setColour (Palette::signal.withAlpha (0.85f));
+            g.strokePath (scaled, juce::PathStrokeType (0.9f));
         }
     }
 
@@ -1733,8 +1838,22 @@ void OrogenEditor::paintDisplay (juce::Graphics& g)
     draw::caption (g, "filter", { (int) area.getX() + 190, (int) area.getY() + 18, 100, 10 },
                    Palette::textFaint, 6.0f);
 
-    draw::caption (g, tableName + "  " + juce::String (juce::roundToInt (pv (slotId ("table")))) + "/8",
-                   { (int) inner.getX(), (int) inner.getBottom() - 14, 300, 12 },
+    // подпись: движок + контент (для вейвтейбла — имя таблицы)
+    juce::String sub = juce::String (engineName (type)).toUpperCase();
+    sub += "  ";
+    if (type == (int) EngineType::Wavetable)
+    {
+        const auto& bank = waveStore().get();
+        if (table < (int) bank.tables.size())
+            sub += juce::String (bank.tables[(size_t) table].name.c_str()).toUpperCase()
+                 + "  " + juce::String (table + 1) + "/" + juce::String ((int) bank.tables.size());
+    }
+    else
+    {
+        sub += "TABLE " + juce::String (table + 1) + "/8";
+    }
+
+    draw::caption (g, sub, { (int) inner.getX(), (int) inner.getBottom() - 14, 400, 12 },
                    Palette::textFaint, 6.5f);
 
     g.setColour (Palette::textFaint);

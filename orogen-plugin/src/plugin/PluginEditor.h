@@ -64,6 +64,12 @@ public:
     bool  animationsEnabled() const { return animOn; }
     void  setAnimationsEnabled (bool on);
     void  repaintAnimated();          // перерисовать только «живые» зоны
+    // Превью формы волны выбранного слота: рендерится настоящим движком,
+    // поэтому на дисплее видно, чем Granular отличается от Wavetable.
+    void  rebuildPreview (bool force = false);
+    const std::vector<float>& previewWave() const { return prevWave; }
+    const juce::Path& previewPath() const { return prevPath; }   // кэш формы в 0…1
+    static constexpr int kPreviewSamples = 1024;
     int   animatedAreaPercent() const;// сколько площади экрана реально двигается
 
     // --- банк программ (был только в API процессора) ---
@@ -175,6 +181,13 @@ private:
     std::array<float, 10> chipLast { 0.45f, 0.50f, 0.40f, 0.35f, 0.45f,
                                      0.50f, 0.45f, 0.40f, 0.45f, 0.50f };
     int chipPage = 0;
+
+    // превью движка для дисплея
+    std::unique_ptr<Instrument> prevIns;
+    std::vector<float> prevWave;
+    juce::Path prevPath;              // та же форма, но готовая к рисованию
+    juce::String prevSig;
+    double prevStampMs = 0.0;
 
     double animSeconds = 0.0;         // время анимации, с
     double lastTimerMs = 0.0;
