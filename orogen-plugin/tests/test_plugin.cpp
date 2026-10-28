@@ -131,6 +131,15 @@ static double renderRms (OrogenProcessor& p, int total, double sr)
 // Считает контролы в оверлее, привязанные к параметрам (Slider/ComboBox/ToggleButton)
 // на активной вкладке. Нужен, чтобы доказать: карта не просто список id, а
 // реально построенный UI.
+// Эффективная видимость: важно не только собственное флаговое значение, но и
+// все родители (скрытая вкладка оверлея не должна добавлять свои контролы).
+static bool effectivelyVisible (juce::Component& c, juce::Component* stopAt)
+{
+    for (juce::Component* p = &c; p != nullptr && p != stopAt; p = p->getParentComponent())
+        if (! p->isVisible()) return false;
+    return true;
+}
+
 static int countBoundControls (juce::Component& root, const orogen::UiTab& tab)
 {
     int found = 0;
@@ -138,7 +147,7 @@ static int countBoundControls (juce::Component& root, const orogen::UiTab& tab)
     {
         for (auto* child : c.getChildren())
         {
-            if (! child->isVisible()) continue;      // другие вкладки оверлея скрыты
+            if (! effectivelyVisible (*child, &root)) continue;   // скрытые вкладки/секции
             if (dynamic_cast<juce::Slider*> (child) != nullptr
                 || dynamic_cast<juce::ComboBox*> (child) != nullptr
                 || dynamic_cast<juce::ToggleButton*> (child) != nullptr)
@@ -860,15 +869,70 @@ int main()
             check (mainBoxes >= 2, "на главном экране есть выбор движка и фильтра",
                    num ((double) mainBoxes, 0) + " ComboBox");
 
+            // Оверлей теперь постраничный: каждая секция вкладки — отдельная
+            // страница (плюс ALL). Считаем контролы по всем парам «вкладка ×
+            // секция» и проверяем, что вместе они дают все параметры.
             int seen = 0;
+            int pages = 0;
+            int sectionsTotal = 0;
+            juce::StringArray pageTitles;
             for (int t = 0; t < (int) tabs.size(); ++t)
             {
-                ore->showPage (100 + t);
-                if (auto* overlay = ore->paramsOverlay())
-                    seen += countBoundControls (*overlay, tabs[(size_t) t]);
+                ore->showPage (100 + t);           // вкладка, все секции
+                const int nSec = ore->paramsSectionCount();
+                sectionsTotal += nSec;
+                check ((int) tabs[(size_t) t].sections.size() == nSec,
+                       (juce::String ("секции вкладки ") + tabs[(size_t) t].title).toRawUTF8(),
+                       juce::String (nSec));
+
+                for (int sIdx = 0; sIdx < nSec; ++sIdx)
+                {
+                    ore->showPage (200 + t * 100 + (sIdx + 1));
+                    ++pages;
+                    if (auto* overlay = ore->paramsOverlay())
+                    {
+                        const int c = countBoundControls (*overlay, tabs[(size_t) t]);
+                        const int expected = (int) tabs[(size_t) t].sections[(size_t) sIdx].ids.size();
+                        std::printf ("   %-10s map:%-14s view:%-14s %d / %d\n",
+                                     tabs[(size_t) t].title.toRawUTF8(),
+                                     tabs[(size_t) t].sections[(size_t) sIdx].title.toRawUTF8(),
+                                     ore->paramsSectionName (sIdx).toRawUTF8(), c, expected);
+                        seen += c;
+                    }
+                }
             }
-            check (seen == apvtsIds.size(), "на все параметры есть контрол в оверлее",
+            std::printf ("   страниц секций: %d (секций в API-карте: %d)\n", pages, sectionsTotal);
+            check (pages == 33, "страниц ровно столько, сколько секций в карте",
+                   num ((double) pages, 0));
+            check (seen == apvtsIds.size(), "на все параметры есть контрол в постраничном оверлее",
                    juce::String (seen) + " / " + juce::String (apvtsIds.size()));
+
+            // навигация клавишами: ↑/↓ листают секции, PageDown-подобный сброс — ALL
+            {
+                ore->showPage (200 + 1 * 100 + 1);           // FX → первая секция
+                const auto first = ore->paramsSectionName (0);
+                juce::Component* ov = ore->paramsOverlay();
+                const auto key = [ov] (int code)
+                {
+                    if (ov == nullptr) return;
+                    ov->keyPressed (juce::KeyPress (code));
+                };
+                key (juce::KeyPress::downKey);
+                const auto second = ore->paramsSectionName (1);
+                key (juce::KeyPress::upKey);
+                key (juce::KeyPress::upKey);
+                std::printf ("   клавиши: %s → %s → ALL\n", first.toRawUTF8(), second.toRawUTF8());
+                check (! first.isEmpty() && first != second, "↓ переключает на следующую секцию", second);
+            }
+
+            // и обратно: страница ALL показывает все параметры вкладки целиком
+            ore->showPage (100);
+            int seenAll = 0;
+            if (auto* overlay = ore->paramsOverlay())
+                seenAll = countBoundControls (*overlay, tabs[0]);
+            // вкладка SLOT: 8 слотов × 21 параметр
+            check (seenAll == 168, "страница ALL вкладки SLOT показывает все 168",
+                   num ((double) seenAll, 0));
 
             // снимок оверлея — заодно проверяем, что он отрисовывается
             juce::Image img (juce::Image::ARGB, 1280, 800, true);

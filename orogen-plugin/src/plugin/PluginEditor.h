@@ -29,7 +29,11 @@ public:
     void resized() override;
     int visiblePage() const;
     juce::Component* paramsOverlay();           // для стендов/тестов: оверлей параметров
-    void showPage (int index);                 // 0…7 — слот, 8…11 — секция колонки
+    void showPage (int index);                 // 0…7 — слот, 8…11 — секция колонки,
+                                               // 100+t — вкладка оверлея, 200+t*100+s — секция
+    int paramsTabCount() const;
+    int paramsSectionCount() const;
+    juce::String paramsSectionName (int index) const;
     bool keyPressed (const juce::KeyPress&) override;
 
     static constexpr float kDesignW = 1280.0f;  // система координат макета

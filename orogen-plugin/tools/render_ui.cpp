@@ -46,7 +46,11 @@ int main (int argc, char** argv)
     editor->setSize (w, h);
 
     // переключить страницу — через клавишу, как это делает пользователь
-    const int idx = (page >= 100) ? juce::jlimit (100, 104, page) : juce::jlimit (0, 11, page);
+    // 0…11 — слоты/секции колонки, 100…104 — вкладки оверлея,
+    // 200+t*100+s — конкретная секция оверлея (страницы по секциям)
+    const int idx = (page >= 200) ? page
+                  : (page >= 100) ? juce::jlimit (100, 104, page)
+                                  : juce::jlimit (0, 11, page);
     static_cast<OrogenEditor*> (editor.get())->showPage (idx);
 
     // заставляем редактор пересчитать раскладку и отрисовать себя в картинку

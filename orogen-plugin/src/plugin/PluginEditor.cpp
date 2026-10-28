@@ -386,6 +386,10 @@ public:
             tabButtons.add (b);
         }
 
+        addAndMakeVisible (allSectionsButton);
+        allSectionsButton.onClick = [this] { setSection (-1); };
+        sectionButtons.add (&allSectionsButton);
+
         // содержимое каждой вкладки строится один раз; переключение — видимостью
         for (const auto& tab : tabs)
         {
@@ -405,6 +409,8 @@ public:
         currentTab = juce::jlimit (0, (int) tabs.size() - 1, index);
         for (int i = 0; i < contents.size(); ++i) contents[i]->setVisible (i == currentTab);
         for (int i = 0; i < tabButtons.size(); ++i) tabButtons[i]->setActive (i == currentTab);
+        rebuildSectionButtons();
+        setSection (currentSection);        // держим выбранную секцию в новых границах
         viewport.setViewedComponent (contents[currentTab], false);
         viewport.setViewPosition (0, 0);
         resized();
@@ -412,6 +418,26 @@ public:
     }
 
     int getTab() const { return currentTab; }
+    int tabCount() const { return (int) tabs.size(); }
+
+    // -1 — все секции вкладки, иначе номер секции (0…n-1)
+    void setSection (int index)
+    {
+        auto* c = contents[currentTab];
+        if (c == nullptr) return;
+        const int n = c->sectionCount();
+        currentSection = (index < 0 || n == 0) ? -1 : juce::jlimit (0, n - 1, index);
+        c->setSectionFilter (currentSection < 0 ? juce::String() : c->sectionName (currentSection));
+        for (int i = 0; i < sectionButtons.size(); ++i)
+            sectionButtons[i]->setActive (currentSection < 0 ? i == 0 : i == currentSection + 1);
+        viewport.setViewPosition (0, 0);
+        resized();
+        repaint();
+    }
+
+    int getSection() const { return currentSection; }
+    auto* currentContent() const { return contents[currentTab]; }
+    int sectionCount() const { return contents[currentTab] != nullptr ? contents[currentTab]->sectionCount() : 0; }
 
     void resized() override
     {
@@ -429,7 +455,19 @@ public:
             x += w + 6;
         }
 
-        r.removeFromTop (8);
+        // второй ряд — секции текущей вкладки (ALL + по одной на секцию)
+        auto secRow = r.removeFromTop (24);
+        {
+            int sx = 0;
+            for (auto* b : sectionButtons)
+            {
+                const int w = juce::jmax (56, b->getButtonText().length() * 8 + 22);
+                b->setBounds (secRow.getX() + sx, secRow.getY(), w, 22);
+                sx += w + 5;
+            }
+        }
+
+        r.removeFromTop (6);
         viewport.setBounds (r);
 
         if (auto* c = contents[currentTab])
@@ -444,11 +482,19 @@ public:
         g.fillAll (Palette::bg);
         g.setColour (Palette::panel);
         g.fillRect (getLocalBounds().removeFromTop (46));
+        g.setColour (Palette::panel);
+        g.fillRect (0, 47, getWidth(), 34);
         g.setColour (Palette::line);
         g.fillRect (0, 46, getWidth(), 1);
+        g.fillRect (0, 81, getWidth(), 1);
 
         // заголовок слева от вкладок, чтобы не наезжать на первую кнопку
         draw::caption (g, "parameters", { 18, 6, 150, 10 }, Palette::textFaint, 6.0f);
+        // подпись страницы — справа от кнопок секций, чтобы не наезжать на них
+        draw::caption (g, currentSection < 0 ? juce::String ("all sections")
+                                            : juce::String ("section ") + juce::String (currentSection + 1)
+                                                  + " / " + juce::String (sectionCount()),
+                       { getWidth() - 300, 54, 280, 10 }, Palette::textFaint, 6.0f);
         g.setColour (Palette::text);
         g.setFont (orFont (10.5f, true));
         g.drawText (spaced (tabs[(size_t) currentTab].title),
@@ -456,7 +502,7 @@ public:
 
         g.setColour (Palette::textDim);
         g.setFont (orFont (8.0f));
-        g.drawText (juce::String (uiParamCount (tabs)) + " параметров · ← → · ESC",
+        g.drawText (juce::String (uiParamCount (tabs)) + " параметров · ← → · ↑ ↓ · ESC",
                     juce::Rectangle<int> (getWidth() - 300, 28, 210, 14),
                     juce::Justification::centredRight, false);
     }
@@ -465,6 +511,8 @@ public:
     {
         if (k == juce::KeyPress::leftKey)  { setTab (currentTab - 1); return true; }
         if (k == juce::KeyPress::rightKey) { setTab (currentTab + 1); return true; }
+        if (k == juce::KeyPress::upKey)    { setSection (currentSection - 1); return true; }
+        if (k == juce::KeyPress::downKey)  { setSection (currentSection + 1); return true; }
         if (k.getTextCharacter() >= '1' && k.getTextCharacter() <= '5')
         {
             setTab ((int) (k.getTextCharacter() - '1'));
@@ -504,6 +552,15 @@ private:
     class TabContent : public juce::Component
     {
     public:
+        struct Entry
+        {
+            juce::String section, name;
+            juce::Component* ctl = nullptr;
+            juce::Rectangle<int> captionRect, headerRect;
+        };
+
+        static int colsFor (int width) { return juce::jlimit (2, 5, width / 260); }
+
         explicit TabContent (OrogenProcessor& p) : proc (p) {}
 
         void build (const UiTab& tab)
@@ -556,6 +613,40 @@ private:
             }
         }
 
+        // Показ одной секции (sectionFilter пустой — все секции вкладки).
+        // Так 294 параметра не лежат одним списком, а разложены по страницам,
+        // как секции на макете.
+        void setSectionFilter (const juce::String& name)
+        {
+            sectionFilter = name;
+            for (auto& e : entries)
+                if (e.ctl != nullptr)
+                    e.ctl->setVisible (sectionFilter.isEmpty() || e.section == sectionFilter);
+            resized();
+            repaint();
+        }
+
+        const juce::String& getSectionFilter() const { return sectionFilter; }
+
+        int sectionCount() const
+        {
+            juce::StringArray names;
+            for (const auto& e : entries) names.addIfNotAlreadyThere (e.section);
+            return names.size();
+        }
+
+        juce::String sectionName (int index) const
+        {
+            juce::StringArray names;
+            for (const auto& e : entries) names.addIfNotAlreadyThere (e.section);
+            return names[index];
+        }
+
+        bool isVisibleEntry (const Entry& e) const
+        {
+            return sectionFilter.isEmpty() || e.section == sectionFilter;
+        }
+
         int neededHeight (int width) const
         {
             const int cols = colsFor (width);
@@ -563,6 +654,7 @@ private:
             juce::String cur;
             for (const auto& e : entries)
             {
+                if (! isVisibleEntry (e)) continue;
                 if (e.section != cur)
                 {
                     if (col != 0) { y += 46; col = 0; }
@@ -579,6 +671,7 @@ private:
             juce::String cur;
             for (const auto& e : entries)
             {
+                if (! isVisibleEntry (e)) continue;
                 if (e.section != cur)
                 {
                     cur = e.section;
@@ -603,6 +696,7 @@ private:
 
             for (auto& e : entries)
             {
+                if (! isVisibleEntry (e)) continue;
                 if (e.section != cur)
                 {
                     if (col != 0) { y += 46; col = 0; }
@@ -620,30 +714,41 @@ private:
             }
         }
 
-    private:
-        static int colsFor (int width) { return juce::jlimit (2, 5, width / 260); }
-
-        struct Entry
-        {
-            juce::String section, name;
-            juce::Component* ctl = nullptr;
-            juce::Rectangle<int> captionRect, headerRect;
-        };
-
         OrogenProcessor& proc;
+        juce::String sectionFilter;          // пусто = показывать все секции
         std::vector<Entry> entries;
         std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment>> comboAtts;
         std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>> sliderAtts;
         std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment>> buttonAtts;
     };
 
+    void rebuildSectionButtons()
+    {
+        while (sectionButtons.size() > 1)
+            sectionButtons.removeLast();            // сами компоненты удалит owned-массив
+        sectionOwned.clear();
+        auto* c = contents[currentTab];
+        if (c == nullptr) return;
+        for (int i = 0; i < c->sectionCount(); ++i)
+        {
+            auto* b = new TabButton (c->sectionName (i), [this, i] { setSection (i); });
+            *sectionOwned.add (b);
+            addAndMakeVisible (b);
+            sectionButtons.add (b);
+        }
+    }
+
     OrogenProcessor& proc;
     std::vector<UiTab> tabs;
     int currentTab = 0;
+    int currentSection = -1;
 
     juce::Viewport viewport;
     juce::OwnedArray<TabContent> contents;
     juce::OwnedArray<TabButton> tabButtons;
+    juce::OwnedArray<TabButton> sectionOwned;      // кнопки секций (кроме ALL)
+    juce::Array<TabButton*> sectionButtons;         // ALL + секции текущей вкладки
+    TabButton allSectionsButton { "ALL", [this] { setSection (-1); } };
     juce::TextButton closeButton { "CLOSE" };
 };
 
@@ -939,9 +1044,40 @@ void OrogenEditor::showPage (int index)
     if (index >= 100 && index <= 104)
     {
         toggleParamsPage (true);
-        if (paramsPage != nullptr) paramsPage->setTab (index - 100);
+        if (paramsPage != nullptr) { paramsPage->setTab (index - 100); paramsPage->setSection (-1); }
         return;
     }
+    // 200 + tab*100 + section — конкретная секция оверлея (1 = первая, 0 = все).
+    // Шаг 100, а не 10: во вкладке FX тринадцать секций, шаг 10 их перепутал бы.
+    if (index >= 200)
+    {
+        const int tab = (index - 200) / 100;
+        const int sec = (index - 200) % 100;
+        toggleParamsPage (true);
+        if (paramsPage != nullptr)
+        {
+            paramsPage->setTab (tab);
+            paramsPage->setSection (sec - 1);
+        }
+        return;
+    }
+}
+
+int OrogenEditor::paramsTabCount() const
+{
+    return paramsPage != nullptr ? paramsPage->tabCount() : 0;
+}
+
+juce::String OrogenEditor::paramsSectionName (int index) const
+{
+    if (paramsPage == nullptr) return {};
+    auto* c = paramsPage->currentContent();
+    return c != nullptr ? c->sectionName (index) : juce::String();
+}
+
+int OrogenEditor::paramsSectionCount() const
+{
+    return paramsPage != nullptr ? paramsPage->sectionCount() : 0;
 }
 
 // ---------------------------------------------------------------------------
