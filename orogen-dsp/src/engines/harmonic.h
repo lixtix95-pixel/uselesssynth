@@ -180,7 +180,12 @@ public:
                 float& pk = ph[(size_t) (k - 1)];
                 pk += pinc[(size_t) (k - 1)];
                 if (pk >= 1.0f) pk -= 1.0f;
-                out += amps[(size_t) (k - 1)] * fastSin (pk);
+                // P4 (движение) обязан действовать и здесь: раньше модуляция
+                // амплитуд жила только в быстром пути, поэтому при spread > 0.02
+                // ручка P4 была мертва (Δ ровно 0.000000).
+                float a = amps[(size_t) (k - 1)];
+                if (motion > 1.0e-4f) a *= 1.0f - motion * 0.35f * (0.5f + 0.5f * fastSin (mPhase * (float) k));
+                out += a * fastSin (pk);
             }
             phase += inc;
             if (phase >= 1.0f) phase -= 1.0f;

@@ -93,6 +93,14 @@ public:
         const float posT  = clamp (p.p[0], 0.0f, 1.0f);
         const float warpT = clamp (p.p[1], 0.0f, 1.0f);
         const float foldT = clamp (p.p[2], 0.0f, 1.0f);
+        const float tiltT = clamp (p.p[3], 0.0f, 1.0f);
+
+        // P4 — наклон спектра. Нейтрален в точке своего значения по умолчанию
+        // (0.3): ниже — темнее, выше — ярче. Иначе добавление ручки изменило бы
+        // звук уже сохранённых патчей.
+        tiltAmount = (tiltT < kTiltNeutral) ? (tiltT - kTiltNeutral) * 2.3f
+                                           : (tiltT - kTiltNeutral) * 1.6f;
+        tiltCoef = 1.0f - std::exp (-6.2831853f * 3000.0f / (float) sampleRate);
 
         if (needSnap)
         {
@@ -190,6 +198,11 @@ public:
             out = decimC.decimate()                                // 2× -> 1× (острый фильтр)
                 * gain * (fold > 1.0e-4f ? foldTrim : 1.0f);
         }
+        // спектральный наклон (P4): 0 = нейтрально, <0 темнее, >0 ярче
+        tiltState += tiltCoef * (out - tiltState);
+        if (tiltAmount < -1.0e-4f)      out += tiltAmount * (tiltState - out);
+        else if (tiltAmount > 1.0e-4f)  out += tiltAmount * (out - tiltState);
+
         // DC-блокер: нелинейности (fold, drive) дают постоянную составляющую,
         // которая «съедает» headroom и уводит фильтр голоса в смещение.
         const float y = out - dcX + 0.999f * dcY;
@@ -255,6 +268,8 @@ private:
     float  warpDepth = 0.0f, foldDrive = 1.0f, foldTrim = 1.0f, gain = 0.4f;
 
     SmoothedValue posSm, warpSm, foldSm;
+    static constexpr float kTiltNeutral = 0.3f;   // значение p[3] по умолчанию
+    float tiltAmount = 0.0f, tiltCoef = 0.3f, tiltState = 0.0f;
     float dcX = 0.0f, dcY = 0.0f;          // состояние DC-блокера
     // промежуточные ступени — 127 отсчётов, финальная — 255 (см. halfband.h)
     HalfbandDecimator2x<127> decimA, decimB;

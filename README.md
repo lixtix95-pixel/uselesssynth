@@ -9,7 +9,7 @@ DSP-ядро на C++ без зависимостей + обёртка VST3 на
 | `orogen-plugin/` | VST3-обёртка: 294 параметра APVTS, 7 пресетов, интерфейс по макету 1280×800 + оверлей всех 294 параметров (`docs/ui_main.png`, `docs/ui_params_*.png`, спецификация — `gui-spec.md`). `artifact/OROGEN.vst3` — собранный плагин (8.5 МБ, Release, stripped, с интерфейсом по макету) |
 | `orogen/` | веб-разбор движков (`index.html`, `ENGINES.md`) |
 | `terrain-deep-dive.md` | разбор оригинала: спецификации, архитектура, план |
-| `OROGEN-vst3-vs2022.zip` | **готовый кит для сборки VST3 в Visual Studio 2022**: исходники + `build_vst3.bat` / `build_vst3.ps1` / `CMakePresets.json` + инструкция `README-BUILD-WINDOWS.md`. 1114 КБ, 103 файла, sha256 `7839c803…` (ревизия 11: проверены все 16 эффектов и 9 движков в звуке и в GUI; FX-колонка на 3 страницах) |
+| `OROGEN-vst3-vs2022.zip` | **готовый кит для сборки VST3 в Visual Studio 2022**: исходники + `build_vst3.bat` / `build_vst3.ps1` / `CMakePresets.json` + инструкция `README-BUILD-WINDOWS.md`. 1160 КБ, 104 файла, sha256 `4c9ce103…` (ревизия 12: блок 9 `test_plugin` — макросы P1…P4 всех 9 движков 36/36, 16 моделей фильтра 16/16, мод-матрица, LFO, ARP, слои и диапазон клавиш в звуке и в GUI; 107 проверок, провалов 0) |
 
 Документы: `orogen-dsp/FX.md` (эффекты и замеры), `orogen-dsp/INSTRUMENT.md`,
 `orogen-dsp/FILTERS.md` (16 моделей фильтра и их АЧХ),

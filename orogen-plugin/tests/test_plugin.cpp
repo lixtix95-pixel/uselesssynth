@@ -1253,6 +1253,283 @@ int main()
         }
     }
 
+
+    // ---------------------------------------------------------------- 9
+    std::printf ("\n--- 9. Параметры движков, 16 фильтров, мод-матрица, LFO, ARP ---\n");
+    {
+        const char* eng[9] = { "Wavetable", "FM", "Harmonic", "Sample",
+                               "Granular", "Modal", "Resynth", "Organics", "Chop" };
+
+        auto deltaTo = [] (const juce::AudioBuffer<float>& a, const juce::AudioBuffer<float>& b)
+        {
+            double acc = 0.0;
+            for (int ch = 0; ch < 2; ++ch)
+                for (int i = 0; i < a.getNumSamples(); ++i)
+                {
+                    const double d = a.getReadPointer (ch)[i] - b.getReadPointer (ch)[i];
+                    acc += d * d;
+                }
+            return std::sqrt (acc / (double) (a.getNumSamples() * 2));
+        };
+
+        // 9.1 каждый из четырёх макропараметров движка (P1…P4) слышен
+        int deadParams = 0, checked = 0;
+        for (int t = 0; t < 9; ++t)
+        {
+            OrogenProcessor p;
+            auto base = renderWithSetup (p, 20000, sr, [t] (OrogenProcessor& pr) { soloSlot (pr, 0, t); });
+            juce::String dead;
+            for (int k = 0; k < 4; ++k)
+            {
+                OrogenProcessor q;
+                const auto variant = renderWithSetup (q, 20000, sr, [t, k] (OrogenProcessor& pr)
+                {
+                    soloSlot (pr, 0, t);
+                    setP (pr, "sA_p" + juce::String (k), 0.92f);
+                });
+                const double d = deltaTo (base, variant);
+                ++checked;
+                if (d <= 0.0015) { ++deadParams; dead << " P" << (k + 1) << "(" << num (d, 4) << ")"; }
+            }
+            std::printf ("   %-9s P1..P4:%s\n", eng[t], dead.isEmpty() ? " все слышны" : dead.toRawUTF8());
+        }
+        check (deadParams == 0, "все макропараметры всех 9 движков влияют на звук",
+               juce::String (checked - deadParams) + " / " + juce::String (checked));
+
+        // 9.2 модели фильтра: каждая отличается от LP12
+        {
+            OrogenProcessor p;
+            auto lp12 = renderWithSetup (p, 20000, sr, [] (OrogenProcessor& pr)
+            {
+                soloSlot (pr, 0, 0);
+                setP (pr, "sA_filter", 0.0f);      // LP12
+                setP (pr, "sA_cutoff", 0.45f);
+                setP (pr, "sA_res", 0.35f);
+            });
+            int same = 0;
+            juce::String sameNames;
+            for (int f = 1; f < 16; ++f)
+            {
+                OrogenProcessor q;
+                auto v = renderWithSetup (q, 20000, sr, [f] (OrogenProcessor& pr)
+                {
+                    soloSlot (pr, 0, 0);
+                    setP (pr, "sA_filter", (float) f);
+                    setP (pr, "sA_cutoff", 0.45f);
+                    setP (pr, "sA_res", 0.35f);
+                });
+                const double d = deltaTo (lp12, v);
+                if (d <= 0.0015) { ++same; sameNames << " " << f; }
+            }
+            std::printf ("   модели фильтра: отличны от LP12 %d из 15\n", 15 - same);
+            check (same == 0, "все 16 моделей фильтра дают разный звук",
+                   same == 0 ? juce::String ("16 / 16") : sameNames);
+        }
+
+        // 9.3 мод-матрица: маршрут LFO1 -> Cutoff меняет звук
+        {
+            OrogenProcessor p;
+            auto off = renderWithSetup (p, 20000, sr, [] (OrogenProcessor& pr)
+            {
+                soloSlot (pr, 0, 0);
+                setP (pr, "sA_cutoff", 0.5f);
+                setP (pr, "mod1_src", 0.0f);       // LFO 1
+                setP (pr, "mod1_dst", 0.0f);       // Cutoff
+                setP (pr, "mod1_amt", 0.0f);
+            });
+            OrogenProcessor q;
+            auto on = renderWithSetup (q, 20000, sr, [] (OrogenProcessor& pr)
+            {
+                soloSlot (pr, 0, 0);
+                setP (pr, "sA_cutoff", 0.5f);
+                setP (pr, "mod1_src", 0.0f);
+                setP (pr, "mod1_dst", 0.0f);
+                setP (pr, "mod1_amt", 1.0f);
+            });
+            const double d = deltaTo (off, on);
+            std::printf ("   мод-маршрут LFO1 -> Cutoff: Δ %.4f\n", d);
+            check (d > 0.002, "мод-матрица влияет на звук", num (d, 4));
+        }
+
+        // 9.4 быстрый LFO (amount/dest) и его форма
+        {
+            OrogenProcessor p;
+            auto off = renderWithSetup (p, 20000, sr, [] (OrogenProcessor& pr)
+            {
+                soloSlot (pr, 0, 0);
+                setP (pr, "lfo1_amount", 0.0f);
+            });
+            OrogenProcessor q;
+            auto on = renderWithSetup (q, 20000, sr, [] (OrogenProcessor& pr)
+            {
+                soloSlot (pr, 0, 0);
+                setP (pr, "lfo1_amount", 1.0f);
+                setP (pr, "lfo1_rate", 3.0f);
+                setP (pr, "lfo1_dest", 0.0f);
+            });
+            const double d = deltaTo (off, on);
+            std::printf ("   LFO 1 (amount 1, 3 Гц): Δ %.4f\n", d);
+            check (d > 0.002, "LFO слышен", num (d, 4));
+        }
+
+        // 9.5 арпеджиатор: включает ноты — меняется огибающая
+        {
+            OrogenProcessor p;
+            auto off = renderWithSetup (p, 20000, sr, [] (OrogenProcessor& pr)
+            {
+                soloSlot (pr, 0, 0);
+                setP (pr, "arpOn", 0.0f);
+            });
+            OrogenProcessor q;
+            auto on = renderWithSetup (q, 20000, sr, [] (OrogenProcessor& pr)
+            {
+                soloSlot (pr, 0, 0);
+                setP (pr, "arpOn", 1.0f);
+                setP (pr, "arpMode", 0.0f);
+                setP (pr, "arpDiv", 1.0f);
+                setP (pr, "arpOctaves", 1.0f);
+                setP (pr, "arpGate", 0.6f);
+            });
+            const double d = deltaTo (off, on);
+            std::printf ("   ARP on/off: Δ %.4f (RMS %.4f / %.4f)\n", d, rmsOf (off), rmsOf (on));
+            check (d > 0.002, "арпеджиатор слышен", num (d, 4));
+        }
+
+        // 9.6 наложение слоёв: второй слот добавляет сигнал
+        {
+            OrogenProcessor p;
+            auto one = renderWithSetup (p, 20000, sr, [] (OrogenProcessor& pr)
+            {
+                for (int s = 0; s < 8; ++s)
+                    setP (pr, "s" + juce::String::charToString ((juce::juce_wchar) ('A' + s)) + "_on",
+                          s == 0 ? 1.0f : 0.0f);
+            });
+            OrogenProcessor q;
+            auto two = renderWithSetup (q, 20000, sr, [] (OrogenProcessor& pr)
+            {
+                for (int s = 0; s < 8; ++s)
+                    setP (pr, "s" + juce::String::charToString ((juce::juce_wchar) ('A' + s)) + "_on",
+                          s <= 1 ? 1.0f : 0.0f);
+                setP (pr, "sB_type", 5.0f);        // Modal во втором слоте
+            });
+            const double d = deltaTo (one, two);
+            std::printf ("   слой B поверх A: Δ %.4f (RMS %.4f -> %.4f)\n", d, rmsOf (one), rmsOf (two));
+            check (d > 0.002, "слои складываются", num (d, 4));
+        }
+
+        // 9.7 диапазон клавиш слота: нота вне зоны не звучит
+        {
+            OrogenProcessor p;
+            auto inRange = renderWithSetup (p, 20000, sr, [] (OrogenProcessor& pr)
+            {
+                soloSlot (pr, 0, 0);
+                setP (pr, "sA_lo", 0.0f);
+                setP (pr, "sA_hi", 127.0f);
+            });
+            OrogenProcessor q;
+            auto outRange = renderWithSetup (q, 20000, sr, [] (OrogenProcessor& pr)
+            {
+                soloSlot (pr, 0, 0);
+                setP (pr, "sA_lo", 100.0f);
+                setP (pr, "sA_hi", 110.0f);
+            });
+            std::printf ("   диапазон клавиш: RMS %.4f (в зоне) / %.4f (вне зоны)\n",
+                         rmsOf (inRange), rmsOf (outRange));
+            check (rmsOf (inRange) > 0.01 && rmsOf (outRange) < 0.01,
+                   "слот молчит вне своего диапазона клавиш", num (rmsOf (outRange), 4));
+        }
+
+        // 9.8 всё из блока 9 доступно в интерфейсе: макросы слота, фильтр,
+        //     диапазон клавиш, мод-матрица, LFO и арпеджиатор
+        {
+            struct Group { const char* name; juce::StringArray ids; };
+            juce::Array<Group> groups;
+            auto g = [&groups] (const char* name, juce::StringArray ids)
+            {
+                Group gr; gr.name = name; gr.ids = std::move (ids); groups.add (gr);
+            };
+
+            juce::StringArray macros;
+            for (int k = 0; k < 4; ++k) macros.add ("sA_p" + juce::String (k));
+            g ("макросы слота P1..P4", macros);
+            g ("фильтр слота", juce::StringArray { "sA_filter", "sA_cutoff", "sA_res" });
+            g ("диапазон клавиш", juce::StringArray { "sA_lo", "sA_hi" });
+            g ("мод-матрица", juce::StringArray { "mod1_src", "mod1_dst", "mod1_amt" });
+            g ("LFO 1", juce::StringArray { "lfo1_amount", "lfo1_rate", "lfo1_dest" });
+            g ("арпеджиатор", juce::StringArray { "arpOn", "arpMode", "arpDiv", "arpOctaves", "arpGate" });
+
+            OrogenProcessor p;
+            std::unique_ptr<juce::AudioProcessorEditor> ed (p.createEditor());
+            check (ed != nullptr, "редактор создаётся для проверки GUI блока 9");
+            if (ed != nullptr)
+            {
+                auto* ore = static_cast<OrogenEditor*> (ed.get());
+                ore->setSize (1280, 800);
+                const auto mainIds = ore->mainScreenParamIds();
+                const auto tabs = buildUiTabs();
+
+                auto onMain = [&mainIds] (const juce::String& id)
+                {
+                    for (const auto& m : mainIds) if (m == id) return true;
+                    return false;
+                };
+                auto inOverlay = [&tabs] (const juce::String& id)
+                {
+                    for (const auto& t : tabs)
+                        for (const auto& sec : t.sections)
+                            for (const auto& x : sec.ids) if (x == id) return true;
+                    return false;
+                };
+
+                int totalIds = 0, overlayOk = 0, mainOk = 0;
+                juce::StringArray missOverlay, missMain;
+                for (const auto& gr : groups)
+                {
+                    int o = 0, mn = 0;
+                    for (const auto& id : gr.ids)
+                    {
+                        ++totalIds;
+                        if (inOverlay (id)) { ++overlayOk; ++o; } else missOverlay.add (id);
+                        if (onMain (id))    { ++mainOk;    ++mn; } else missMain.add (id);
+                    }
+                    std::printf ("   GUI «%s»: оверлей %d / %d, главный экран %d / %d\n",
+                                 gr.name, o, gr.ids.size(), mn, gr.ids.size());
+                }
+                std::printf ("   GUI блока 9 всего: оверлей %d / %d, главный экран %d / %d\n",
+                             overlayOk, totalIds, mainOk, totalIds);
+
+                check (overlayOk == totalIds, "все параметры блока 9 есть в оверлее параметров",
+                       missOverlay.isEmpty() ? juce::String (totalIds) + " / " + juce::String (totalIds)
+                                             : missOverlay.joinIntoString (", "));
+                // Главный экран по макету несёт шесть ручек выбранного слота
+                // (cutoff/p0/level + res/p1/detune); остальное — в оверлее PARAMS.
+                juce::StringArray mustMain { "sA_cutoff", "sA_res", "sA_p0", "sA_p1",
+                                             "sA_level", "sA_detune" };
+                juce::StringArray missMust;
+                for (const auto& id : mustMain) if (! onMain (id)) missMust.add (id);
+                check (missMust.isEmpty(), "шесть ручек выбранного слота на главном экране",
+                       missMust.isEmpty() ? juce::String (mustMain.size()) + " / "
+                                            + juce::String (mustMain.size())
+                                          : missMust.joinIntoString (", "));
+
+                // оверлей обязан содержать весь набор слота (21 параметр × 8 слотов)
+                int slotInOverlay = 0, slotTotal = 0;
+                for (int s = 0; s < 8; ++s)
+                    for (const auto& sp : { "level", "pan", "tune", "detune", "p0", "p1", "p2", "p3",
+                                            "table", "attack", "decay", "sustain", "release",
+                                            "cutoff", "res", "lo", "hi", "tail", "on", "type", "filter" })
+                    {
+                        ++slotTotal;
+                        const juce::String id = juce::String ("s") + juce::String::charToString ((juce::juce_wchar) ('A' + s)) + "_" + sp;
+                        if (inOverlay (id)) ++slotInOverlay;
+                    }
+                std::printf ("   оверлей: параметров слотов %d / %d\n", slotInOverlay, slotTotal);
+                check (slotInOverlay == slotTotal, "в оверлее весь набор параметров всех 8 слотов",
+                       juce::String (slotInOverlay) + " / " + juce::String (slotTotal));
+            }
+        }
+    }
+
     juce::DeletedAtShutdown::deleteAll();
     juce::MessageManager::deleteInstance();
 

@@ -320,16 +320,22 @@ private:
         const SlotPatch& s = p.slots[i];
         if (! s.on) return 0.0f;
 
+        // Диапазон клавиш действует во всех режимах: слой, ограниченный
+        // зоной, должен молчать вне неё и в Stack, и в Morph (раньше lo/hi
+        // учитывались только в Split — ручки в интерфейсе не работали).
+        const bool inRange = (note >= s.loNote && note <= s.hiNote);
+
         switch (p.mode)
         {
             case PatchMode::Stack:
-                return 1.0f;
+                return inRange ? 1.0f : 0.0f;
 
             case PatchMode::Split:
-                return (note >= s.loNote && note <= s.hiNote) ? 1.0f : 0.0f;
+                return inRange ? 1.0f : 0.0f;
 
             case PatchMode::Morph:
             {
+                if (! inRange) return 0.0f;
                 const float pos = clamp (morph, 0.0f, 1.0f) * (float) (kSlots - 1);
                 const float d = std::fabs (pos - (float) i);
                 return clamp (1.0f - d, 0.0f, 1.0f);
