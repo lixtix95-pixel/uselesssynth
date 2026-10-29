@@ -77,10 +77,48 @@ namespace
 // Bound — слайдер с привязкой к параметру (привязку можно перевесить: у
 // центральных ручек параметры зависят от выбранного слота A–H).
 //============================================================================
-struct OrogenEditor::Bound
+struct OrogenEditor::Bound : private juce::Timer
 {
     juce::Slider slider;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> att;
+    // hover-подсветка: плавно 0 → 1 за ~120 мс, чтобы кольцо не «прыгало»
+    double hoverTarget = 0.0, hoverValue = 0.0;
+
+    struct HoverListener : public juce::MouseListener
+    {
+        explicit HoverListener (Bound& b) : owner (b) {}
+        void mouseEnter (const juce::MouseEvent&) override
+        {
+            owner.hoverTarget = 1.0;
+            if (! owner.isTimerRunning()) owner.startTimerHz (30);
+        }
+        void mouseExit (const juce::MouseEvent&) override
+        {
+            owner.hoverTarget = 0.0;
+            if (! owner.isTimerRunning()) owner.startTimerHz (30);
+        }
+        Bound& owner;
+    };
+
+    HoverListener hoverL { *this };
+
+    void timerCallback() override
+    {
+        const double step = 0.25;
+        if (hoverValue < hoverTarget) hoverValue = juce::jmin (hoverTarget, hoverValue + step);
+        else if (hoverValue > hoverTarget) hoverValue = juce::jmax (hoverTarget, hoverValue - step);
+        slider.getProperties().set ("hover", hoverValue);
+        slider.repaint();
+        if (std::abs (hoverValue - hoverTarget) < 1.0e-6) stopTimer();
+    }
+
+    void animateHover (float target)
+    {
+        hoverTarget = target;
+        if (! isTimerRunning()) startTimerHz (30);
+    }
+
+    double hoverLevel() const { return hoverValue; }
 
     void setup (juce::Slider::SliderStyle style, bool big)
     {
@@ -89,6 +127,7 @@ struct OrogenEditor::Bound
         slider.getProperties().set ("big", big);
         slider.setScrollWheelEnabled (true);
         slider.setVelocityBasedMode (false);
+        slider.addMouseListener (&hoverL, false);
     }
 
     void bind (juce::AudioProcessorValueTreeState& apvts, const juce::String& id)
@@ -402,7 +441,8 @@ public:
         {
             const bool visible = ! pagesEnabled || pageOf (i) == page;
             cards[i]->setVisible (visible);
-            if (visible) cards[i]->setBounds (40, 24 + shown++ * 80, 184, 72);
+            if (visible)
+                cards[i]->setBounds (40, 24 + juce::roundToInt (pageShift) + shown++ * 80, 184, 72);
         }
     }
 
@@ -416,10 +456,34 @@ public:
     void setPage (int p)
     {
         const int n = pageCount();
-        page = n <= 1 ? 0 : ((p % n) + n) % n;
+        const int next = n <= 1 ? 0 : ((p % n) + n) % n;
+        if (next == page) { resized(); repaint(); return; }
+
+        // Плавный переход: новая страница въезжает по вертикали. Направление
+        // зависит от номера страницы, поэтому листание «вперёд» и «назад»
+        // читается одинаково на любой колонке.
+        transitionDir = (next > page) ? 1.0f : -1.0f;
+        page = next;
+        transition = 1.0f;              // 1 — только что начали, 0 — доехали
+        pageShift = transitionDir * kTransitionPx;
         resized();
         repaint();
     }
+
+    // Вызывается таймером редактора: доводит сдвиг до нуля.
+    void tickTransition (float dtSeconds)
+    {
+        if (transition <= 0.0f) return;
+        transition = juce::jmax (0.0f, transition - dtSeconds / kTransitionSec);
+        pageShift = transitionDir * kTransitionPx * transition * transition;   // ease-out
+        resized();
+        repaint();
+    }
+
+    bool isTransitioning() const { return transition > 0.0f; }
+    int  pageShiftPx() const { return juce::roundToInt (pageShift); }
+    static constexpr float kTransitionSec = 0.14f;   // длительность перехода
+    static constexpr float kTransitionPx = 26.0f;    // начальный сдвиг, px
 
     void paintHeader (juce::Graphics&) const {}   // индикатор страниц — PageButton
 
@@ -436,6 +500,7 @@ public:
     int pageOf (int index) const { return index / kPerPage; }
 
     float animPhase = 0.0f;
+    float transition = 0.0f, pageShift = 0.0f, transitionDir = 1.0f;
     OrogenProcessor& proc;
     juce::String title;
     juce::OwnedArray<ParamCard> cards;
@@ -1332,6 +1397,30 @@ void OrogenEditor::nextColumnPage (int column)
     repaint();
 }
 
+int OrogenEditor::columnPageShift (int column) const
+{
+    if (column < 0 || column >= columns.size()) return 0;
+    return columns[column]->pageShiftPx();
+}
+
+bool OrogenEditor::columnTransitioning (int column) const
+{
+    if (column < 0 || column >= columns.size()) return false;
+    return columns[column]->isTransitioning();
+}
+
+void OrogenEditor::hoverKnob (int index, bool on)
+{
+    if (index >= 0 && index < centreKnobs.size())
+        centreKnobs[index]->animateHover (on ? 1.0f : 0.0f);
+}
+
+double OrogenEditor::knobHover (int index) const
+{
+    if (index < 0 || index >= centreKnobs.size()) return 0.0;
+    return centreKnobs[index]->hoverLevel();
+}
+
 juce::StringArray OrogenEditor::allColumnIds (int column) const
 {
     if (column < 0 || column >= columns.size()) return {};
@@ -1449,7 +1538,9 @@ void OrogenEditor::rebuildPreview (bool force)
         + "|" + juce::String (pv (pre + "p2"), 3) + "|" + juce::String (pv (pre + "p3"), 3)
         + "|" + juce::String (pv (pre + "tune"), 2)
         + "|" + juce::String (pv (pre + "cutoff"), 3) + "|" + juce::String (pv (pre + "res"), 3)
-        + "|" + juce::String (pi (pre + "filter"));
+        + "|" + juce::String (pi (pre + "filter"))
+        + "|mode" + juce::String (pi ("gl_mode"))
+        + "|morph" + juce::String (pv ("gl_morph"), 3);
 
     // Та же подпись — тот же звук: перерисовывать нечего. Раньше force=true
     // (смена слота) гонял движок повторно, и у грануляра второе окно попадало
@@ -1458,14 +1549,26 @@ void OrogenEditor::rebuildPreview (bool force)
     // «тихий» движок заставлял бы пересоздавать инструмент на каждом тике).
     const double sincePrev = juce::Time::getMillisecondCounterHiRes() - prevStampMs;
     if (sig == prevSig) return;
-    if (! force && sincePrev < 60.0) return;   // не рендерим на каждый пиксель драга
+    // Троттлинг 40 мс < периода таймера (50 мс при 20 Гц), иначе часть тиков
+    // пропускала пересборку и дисплей отставал от параметра на кадр — из-за
+    // этого тест «смена движка видна» плавал (1783 пикселя вместо 20 000).
+    if (! force && sincePrev < 40.0) return;
     prevSig = sig;
     prevStampMs = juce::Time::getMillisecondCounterHiRes();
 
     // Патч: только выбранный слот, чистая форма без фильтра и эффектов
+    // Режим патча входит в превью: в Morph слышно смесь соседних слотов, в
+    // Split — только свою зону клавиш. Раньше превью всегда собиралось как
+    // Stack из одного слота, и для Morph-пресета картинка врала.
+    const int patchMode = juce::jlimit (0, 2, pi ("gl_mode"));
+    const float morphPos = pv ("gl_morph");
+
     Patch patch;
-    patch.mode = PatchMode::Stack;
-    for (int i = 0; i < kNumSlots; ++i) patch.slots[(size_t) i].on = (i == selectedSlot);
+    patch.mode = (PatchMode) patchMode;
+    patch.morph = morphPos;
+    patch.slots[(size_t) selectedSlot].on = true;
+    for (int i = 0; i < kNumSlots; ++i)
+        if (i != selectedSlot) patch.slots[(size_t) i].on = (patchMode != 0);   // Stack — только слот
 
     SlotPatch& sl = patch.slots[(size_t) selectedSlot];
     sl.type   = (EngineType) juce::jlimit (0, 8, pi (pre + "type"));
@@ -1626,6 +1729,7 @@ void OrogenEditor::timerCallback()
         for (auto* c : columns) c->setAnimPhase ((float) animSeconds);
         if (vectorPad != nullptr) vectorPad->setAnimPhase ((float) animSeconds);
         for (auto* b : sectionButtons) b->setAnimPhase ((float) animSeconds);
+        for (auto* c : columns) c->tickTransition ((float) dt);   // плавное листание
         repaintAnimated();                  // только живые зоны, не весь экран
     }
 
@@ -1865,7 +1969,17 @@ void OrogenEditor::paintDisplay (juce::Graphics& g)
         sub += "TABLE " + juce::String (table + 1) + "/8";
     }
 
-    draw::caption (g, sub, { (int) inner.getX(), (int) inner.getBottom() - 14, 400, 12 },
+    {
+        static const char* modeNames[3] = { "STACK", "MORPH", "SPLIT" };
+        static const char* modeIds[3]   = { "", "", "" };
+        juce::ignoreUnused (modeIds);
+        const int m = juce::jlimit (0, 2, pi ("gl_mode"));
+        sub += "  ";
+        sub += modeNames[m];
+        if (m == 1) sub += " " + juce::String (juce::roundToInt (pv ("gl_morph") * 100.0f)) + "%";
+    }
+
+    draw::caption (g, sub, { (int) inner.getX(), (int) inner.getBottom() - 14, 460, 12 },
                    Palette::textFaint, 6.5f);
 
     g.setColour (Palette::textFaint);

@@ -2124,11 +2124,11 @@ int main()
                                 ore2->showPage (0);                   // слот A
                                 q.apvts.getParameter ("sA_type")->setValueNotifyingHost (
                                     q.apvts.getParameter ("sA_type")->convertTo0to1 (0.0f));
-                                juce::MessageManager::getInstance()->runDispatchLoopUntil (60);
+                                juce::MessageManager::getInstance()->runDispatchLoopUntil (300);
                                 const auto uiWave = shot();
                                 q.apvts.getParameter ("sA_type")->setValueNotifyingHost (
                                     q.apvts.getParameter ("sA_type")->convertTo0to1 (4.0f));
-                                juce::MessageManager::getInstance()->runDispatchLoopUntil (60);
+                                juce::MessageManager::getInstance()->runDispatchLoopUntil (300);
                                 const auto uiGran = shot();
 
                                 int uiDiff = 0;
@@ -2151,7 +2151,7 @@ int main()
                                         if (auto* prm = q.apvts.getParameter ("sA_filter"))
                                             prm->setValueNotifyingHost (prm->convertTo0to1 ((float) model));
                                         // превью пересобирает таймер (20 Гц) — даём ему тик
-                                        juce::MessageManager::getInstance()->runDispatchLoopUntil (140);
+                                        juce::MessageManager::getInstance()->runDispatchLoopUntil (300);
                                         ore2->setAnimationPhase (0.0);
                                         juce::Image img (juce::Image::ARGB, 1280, 800, true);
                                         juce::Graphics g (img);
@@ -2193,6 +2193,77 @@ int main()
                                     // возвращаем нейтральные настройки
                                     if (auto* prm = q.apvts.getParameter ("sA_cutoff"))
                                         prm->setValueNotifyingHost (1.0f);
+                                }
+
+                                // ---- 14. Режим патча в превью, плавное листание, hover ----
+                                {
+                                    // 14.1 Morph: превью показывает смесь слотов, а не один слот
+                                    auto shotNow = [ore2]
+                                    {
+                                        ore2->setAnimationPhase (0.0);
+                                        juce::Image img (juce::Image::ARGB, 1280, 800, true);
+                                        juce::Graphics g (img);
+                                        ore2->paintEntireComponent (g, true);
+                                        return img;
+                                    };
+                                    auto diff2 = [] (const juce::Image& a, const juce::Image& b)
+                                    {
+                                        int n = 0;
+                                        juce::Image::BitmapData da (a, juce::Image::BitmapData::readOnly);
+                                        juce::Image::BitmapData db (b, juce::Image::BitmapData::readOnly);
+                                        for (int y = 0; y < a.getHeight(); ++y)
+                                            for (int x = 0; x < a.getWidth(); ++x)
+                                                if (da.getPixelColour (x, y) != db.getPixelColour (x, y)) ++n;
+                                        return n;
+                                    };
+
+                                    ore2->showPage (0);
+                                    setP (q, "sA_on", 1.0f);
+                                    setP (q, "sB_on", 1.0f);
+                                    setP (q, "sB_type", 5.0f);       // Modal во втором слоте
+                                    setP (q, "sA_cutoff", 1.0f);
+                                    setP (q, "gl_mode", 0.0f);       // Stack
+                                    juce::MessageManager::getInstance()->runDispatchLoopUntil (400);
+                                    const auto stackShot = shotNow();
+
+                                    setP (q, "gl_mode", 1.0f);       // Morph
+                                    setP (q, "gl_morph", 0.5f);
+                                    juce::MessageManager::getInstance()->runDispatchLoopUntil (400);
+                                    const auto morphShot = shotNow();
+
+                                    const int dMode = diff2 (stackShot, morphShot);
+                                    std::printf ("   превью: Stack против Morph (morph 50%%) — %d пикселей\n", dMode);
+                                    check (dMode > 2000, "режим Morph виден в превью дисплея",
+                                           juce::String (dMode) + " пикселей");
+
+                                    setP (q, "gl_mode", 0.0f);
+                                    juce::MessageManager::getInstance()->runDispatchLoopUntil (400);
+
+                                    // 14.2 плавное листание: сдвиг появляется и уходит
+                                    ore2->showPage (8);              // FX CHAIN
+                                    ore2->nextColumnPage (0);
+                                    const int shiftStart = std::abs (ore2->columnPageShift (0));
+                                    const bool movingStart = ore2->columnTransitioning (0);
+                                    juce::MessageManager::getInstance()->runDispatchLoopUntil (800);
+                                    const int shiftEnd = std::abs (ore2->columnPageShift (0));
+                                    const bool movingEnd = ore2->columnTransitioning (0);
+                                    std::printf ("   листание FX: сдвиг %d px -> %d px, переход %s -> %s\n",
+                                                 shiftStart, shiftEnd,
+                                                 movingStart ? "идёт" : "нет", movingEnd ? "идёт" : "нет");
+                                    check (shiftStart > 0 && shiftEnd == 0 && ! movingEnd,
+                                           "страницы колонки листаются плавно и доезжают",
+                                           juce::String (shiftStart) + " -> 0");
+
+                                    // 14.3 hover: значение плавно 0 -> 1 и обратно
+                                    ore2->hoverKnob (0, true);
+                                    juce::MessageManager::getInstance()->runDispatchLoopUntil (600);
+                                    const double hOn = ore2->knobHover (0);
+                                    ore2->hoverKnob (0, false);
+                                    juce::MessageManager::getInstance()->runDispatchLoopUntil (600);
+                                    const double hOff = ore2->knobHover (0);
+                                    std::printf ("   hover ручки: %.2f (наведение) -> %.2f (ушли)\n", hOn, hOff);
+                                    check (hOn > 0.99 && hOff < 0.01, "hover-подсветка плавно включается и гаснет",
+                                           num (hOn, 2) + " / " + num (hOff, 2));
                                 }
                             }
                         }

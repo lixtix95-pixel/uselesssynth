@@ -40,6 +40,10 @@ public:
     int  columnPageCount (int column) const;        // страниц в любой из 4 колонок
     void nextColumnPage (int column);               // листнуть колонку по кругу
     juce::StringArray allColumnIds (int column) const;   // все параметры колонки, со всех страниц
+    int  columnPageShift (int column) const;             // текущий сдвиг при плавном листании
+    bool columnTransitioning (int column) const;
+    void hoverKnob (int index, bool on);                 // hover-подсветка центральных ручек
+    double knobHover (int index) const;
 
     // --- главный экран: интерактивные зоны (чипы FX, дорожки мод-редактора) ---
     // Тот же путь, что и у мыши: mouseDown/mouseDrag/mouseUp вызывают эти методы,

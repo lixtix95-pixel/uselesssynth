@@ -369,7 +369,7 @@ void sectionGlyph (juce::Graphics& g, int kind, juce::Rectangle<float> r, juce::
 
 // --- кольцевая ручка --------------------------------------------------------
 void ring (juce::Graphics& g, juce::Rectangle<float> area, float value01,
-           float startAngle, float endAngle, bool big)
+           float startAngle, float endAngle, bool big, float hover)
 {
     value01 = juce::jlimit (0.0f, 1.0f, value01);
 
@@ -392,7 +392,11 @@ void ring (juce::Graphics& g, juce::Rectangle<float> area, float value01,
         ticks.startNewSubPath (c.x + std::sin (a) * r0, c.y - std::cos (a) * r0);
         ticks.lineTo (c.x + std::sin (a) * r1, c.y - std::cos (a) * r1);
     }
-    g.setColour (Palette::tickOff);
+    // hover: насечки светлее на 0…1 — видно, за какую ручку взялся курсор
+    g.setColour (hover > 0.001f
+                     ? Palette::tickOff.withMultipliedAlpha (1.0f)
+                           .interpolatedWith (Palette::textDim, juce::jlimit (0.0f, 0.55f, hover * 0.55f))
+                     : Palette::tickOff);
     g.strokePath (ticks, juce::PathStrokeType (big ? 1.6f : 1.2f));
 
     // подсвеченные насечки до текущего значения
@@ -477,7 +481,8 @@ void OrLookAndFeel::drawRotarySlider (juce::Graphics& g, int x, int y, int width
     juce::ignoreUnused (rotaryStartAngle, rotaryEndAngle);
     const auto area = juce::Rectangle<int> (x, y, width, height).toFloat();
     const bool big = s.getProperties().getWithDefault ("big", false);
-    draw::ring (g, area, sliderPos, -2.36f, 2.36f, big);
+    const float hover = (float) (double) s.getProperties().getWithDefault ("hover", 0.0);
+    draw::ring (g, area, sliderPos, -2.36f, 2.36f, big, hover);
 }
 
 void OrLookAndFeel::drawLinearSlider (juce::Graphics& g, int x, int y, int width, int height,

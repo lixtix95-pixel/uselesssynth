@@ -120,7 +120,8 @@ namespace draw
 
     // Кольцевая ручка по макету.
     void ring (juce::Graphics&, juce::Rectangle<float>, float value01,
-               float startAngle = -2.36f, float endAngle = 2.36f, bool big = true);
+               float startAngle = -2.36f, float endAngle = 2.36f, bool big = true,
+               float hover = 0.0f);
 }
 
 } // namespace orogen
