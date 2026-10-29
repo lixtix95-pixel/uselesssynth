@@ -37,6 +37,8 @@ int main (int argc, char** argv)
     // фаза анимации в секундах: один и тот же кадр воспроизводим побитово
     const double phase = argc > 5 ? std::atof (argv[5]) : 0.0;
     const int program = argc > 6 ? std::atoi (argv[6]) : 1;
+    const float cutoff = argc > 7 ? (float) std::atof (argv[7]) : -1.0f;   // <0 — как в пресете
+    const int filterModel = argc > 8 ? std::atoi (argv[8]) : -1;
 
     OrogenProcessor proc;
     proc.setPlayConfigDetails (0, 2, 48000.0, 512);
@@ -55,6 +57,13 @@ int main (int argc, char** argv)
                   : (page >= 100) ? juce::jlimit (100, 104, page)
                                   : juce::jlimit (0, 11, page);
     static_cast<OrogenEditor*> (editor.get())->showPage (idx);
+    if (cutoff >= 0.0f)
+        if (auto* prm = proc.apvts.getParameter ("sA_cutoff"))
+            prm->setValueNotifyingHost (prm->convertTo0to1 (cutoff));
+    if (filterModel >= 0)
+        if (auto* prm = proc.apvts.getParameter ("sA_filter"))
+            prm->setValueNotifyingHost (prm->convertTo0to1 ((float) filterModel));
+
     static_cast<OrogenEditor*> (editor.get())->setAnimationPhase (phase);
 
     // заставляем редактор пересчитать раскладку и отрисовать себя в картинку

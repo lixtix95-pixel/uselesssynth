@@ -1447,7 +1447,9 @@ void OrogenEditor::rebuildPreview (bool force)
         + "|" + juce::String (pi (pre + "table"))
         + "|" + juce::String (pv (pre + "p0"), 3) + "|" + juce::String (pv (pre + "p1"), 3)
         + "|" + juce::String (pv (pre + "p2"), 3) + "|" + juce::String (pv (pre + "p3"), 3)
-        + "|" + juce::String (pv (pre + "tune"), 2);
+        + "|" + juce::String (pv (pre + "tune"), 2)
+        + "|" + juce::String (pv (pre + "cutoff"), 3) + "|" + juce::String (pv (pre + "res"), 3)
+        + "|" + juce::String (pi (pre + "filter"));
 
     // Та же подпись — тот же звук: перерисовывать нечего. Раньше force=true
     // (смена слота) гонял движок повторно, и у грануляра второе окно попадало
@@ -1474,8 +1476,12 @@ void OrogenEditor::rebuildPreview (bool force)
     sl.params.p[3] = pv (pre + "p3");
     sl.params.tuneSemis = pv (pre + "tune");
     sl.params.level = 1.0f;
-    sl.cutoff = 1.0f;                       // фильтр в превью не участвует
-    sl.res = 0.0f;
+    // Фильтр слота входит в превью: на дисплее должно быть видно то, что
+    // слышно, а не «сырой» движок. 16 моделей при низкой отсечке дают
+    // заметно разные формы.
+    sl.cutoff = pv (pre + "cutoff");
+    sl.res = pv (pre + "res");
+    sl.filterType = juce::jlimit (0, 15, pi (pre + "filter"));
     sl.loNote = 0;
     sl.hiNote = 127;
 
@@ -1841,6 +1847,12 @@ void OrogenEditor::paintDisplay (juce::Graphics& g)
     // подпись: движок + контент (для вейвтейбла — имя таблицы)
     juce::String sub = juce::String (engineName (type)).toUpperCase();
     sub += "  ";
+    // модель фильтра — рядом с движком: видно, чем объясняется форма
+    {
+        const auto items = itemsOf (slotId ("filter"));
+        const int f = juce::jlimit (0, juce::jmax (0, items.size() - 1), pi (slotId ("filter")));
+        if (items.size() > f) sub += items[f] + "  ";
+    }
     if (type == (int) EngineType::Wavetable)
     {
         const auto& bank = waveStore().get();

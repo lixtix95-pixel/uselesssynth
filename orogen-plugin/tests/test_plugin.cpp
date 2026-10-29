@@ -2141,6 +2141,59 @@ int main()
                                              uiDiff);
                                 check (uiDiff > 2000, "смена движка видна в интерфейсе",
                                        juce::String (uiDiff) + " пикселей");
+
+                                // ---- 13. Фильтр слота виден в превью дисплея ----
+                                {
+                                    auto shotWith = [ore2, &q] (float cutoff, int model)
+                                    {
+                                        if (auto* prm = q.apvts.getParameter ("sA_cutoff"))
+                                            prm->setValueNotifyingHost (prm->convertTo0to1 (cutoff));
+                                        if (auto* prm = q.apvts.getParameter ("sA_filter"))
+                                            prm->setValueNotifyingHost (prm->convertTo0to1 ((float) model));
+                                        // превью пересобирает таймер (20 Гц) — даём ему тик
+                                        juce::MessageManager::getInstance()->runDispatchLoopUntil (140);
+                                        ore2->setAnimationPhase (0.0);
+                                        juce::Image img (juce::Image::ARGB, 1280, 800, true);
+                                        juce::Graphics g (img);
+                                        ore2->paintEntireComponent (g, true);
+                                        return img;
+                                    };
+
+                                    auto diff = [] (const juce::Image& a, const juce::Image& b)
+                                    {
+                                        int n = 0;
+                                        juce::Image::BitmapData da (a, juce::Image::BitmapData::readOnly);
+                                        juce::Image::BitmapData db (b, juce::Image::BitmapData::readOnly);
+                                        for (int y = 0; y < a.getHeight(); ++y)
+                                            for (int x = 0; x < a.getWidth(); ++x)
+                                                if (da.getPixelColour (x, y) != db.getPixelColour (x, y)) ++n;
+                                        return n;
+                                    };
+
+                                    // один и тот же движок, разные модели фильтра при низкой отсечке
+                                    const auto lp = shotWith (0.30f, 0);    // LP12
+                                    const auto hp = shotWith (0.30f, 3);    // HP24
+                                    const auto notch = shotWith (0.30f, 4); // Notch12
+                                    const int dLpHp = diff (lp, hp);
+                                    const int dLpNotch = diff (lp, notch);
+                                    std::printf ("   превью: LP12 против HP24 — %d пикселей, против Notch12 — %d\n",
+                                                 dLpHp, dLpNotch);
+                                    check (dLpHp > 2000 && dLpNotch > 2000,
+                                           "модель фильтра видна в превью дисплея",
+                                           juce::String (dLpHp) + " / " + juce::String (dLpNotch));
+
+                                    // отсечка: открытый фильтр и закрытый должны отличаться
+                                    const auto open = shotWith (0.95f, 0);
+                                    const auto shut = shotWith (0.15f, 0);
+                                    const int dCut = diff (open, shut);
+                                    std::printf ("   превью: cutoff 0.95 против 0.15 — %d пикселей\n", dCut);
+                                    check (dCut > 2000, "отсечка видна в превью дисплея",
+                                           juce::String (dCut) + " пикселей");
+
+                                    // возвращаем нейтральные настройки
+                                    if (auto* prm = q.apvts.getParameter ("sA_cutoff"))
+                                        prm->setValueNotifyingHost (1.0f);
+                                }
                             }
                         }
                     }
