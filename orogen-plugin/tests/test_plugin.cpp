@@ -8,14 +8,18 @@
 
 #include <cstdio>
 #include <csignal>
+#if ! defined (_WIN32)
 #include <execinfo.h>
+#endif
 
 static void crashTrace (int sig)
 {
+    std::fprintf (stderr, "signal %d\n", sig);
+#if ! defined (_WIN32)
     void* frames[24];
     const int n = backtrace (frames, 24);
-    std::fprintf (stderr, "signal %d, backtrace:\n", sig);
     backtrace_symbols_fd (frames, n, 2);
+#endif
     std::_Exit (3);
 }
 #include <cmath>
@@ -160,7 +164,356 @@ static int countBoundControls (juce::Component& root, const orogen::UiTab& tab)
     return found;
 }
 
-int main()
+// Регрессия GUI: реальные слоты/зоны Morph, не только разница пикселей за
+// счёт надписей. Отдельный режим --gui-only даёт короткий прогон при отладке.
+static void testGuiRegressions()
+{
+    std::printf ("\n--- 15. Проверка реальных слотов Morph и событий GUI ---\n");
+    OrogenProcessor p;
+    p.setCurrentProgram (4);             // Morph Eight: восемь разных слотов
+    std::unique_ptr<juce::AudioProcessorEditor> base (p.createEditor());
+    auto* editor = dynamic_cast<OrogenEditor*> (base.get());
+    check (editor != nullptr, "редактор для GUI-регрессий создан");
+    if (editor == nullptr) return;
+    editor->setSize (1280, 800);
+    editor->setAnimationsEnabled (false);
+    editor->showPage (0);
+
+    auto refresh = [&]
+    {
+        editor->rebuildPreview (true);
+        return editor->waitForPreview (15000);
+    };
+    auto diffWave = [] (const std::vector<float>& a, const std::vector<float>& b)
+    {
+        if (a.size() != b.size() || a.empty()) return a.empty() && b.empty() ? 0.0 : 1.0;
+        double sum = 0.0;
+        for (size_t i = 0; i < a.size(); ++i)
+        {
+            const double d = (double) a[i] - (double) b[i];
+            sum += d * d;
+        }
+        return std::sqrt (sum / (double) a.size());
+    };
+    auto capture = [&] (juce::Component& c)
+    {
+        juce::Image img (juce::Image::ARGB, c.getWidth(), c.getHeight(), true);
+        juce::Graphics g (img);
+        c.paintEntireComponent (g, true);
+        return img;
+    };
+    auto diffRegion = [] (const juce::Image& a, const juce::Image& b, juce::Rectangle<int> bounds)
+    {
+        int count = 0;
+        juce::Image::BitmapData da (a, juce::Image::BitmapData::readOnly);
+        juce::Image::BitmapData db (b, juce::Image::BitmapData::readOnly);
+        bounds = bounds.getIntersection (a.getBounds()).getIntersection (b.getBounds());
+        for (int y = bounds.getY(); y < bounds.getBottom(); ++y)
+            for (int x = bounds.getX(); x < bounds.getRight(); ++x)
+                if (da.getPixelColour (x, y) != db.getPixelColour (x, y)) ++count;
+        return count;
+    };
+
+    // Отдельные воспроизводимые движки A и B, вместо 50 % всего диапазона
+    // восьми слотов (0.5 было бы между D и E, а не между A и B).
+    for (int i = 0; i < 8; ++i)
+        setP (p, "s" + juce::String::charToString ((juce::juce_wchar) ('A' + i)) + "_on", i < 2 ? 1.0f : 0.0f);
+    for (const auto* id : { "lfo1_amount", "lfo2_amount", "mod1_amt", "mod2_amt", "mod3_amt", "mod4_amt",
+                            "mod5_amt", "mod6_amt", "mod7_amt", "mod8_amt" }) setP (p, id, 0.0f);
+    for (const char* pre : { "sA_", "sB_" })
+    {
+        const juce::String prefix (pre);
+        setP (p, prefix + "detune", 0.0f);
+        setP (p, prefix + "level", 0.8f);
+        setP (p, prefix + "pan", 0.0f);
+        setP (p, prefix + "lo", 0.0f);
+        setP (p, prefix + "hi", 127.0f);
+        setP (p, prefix + "cutoff", 0.9f);
+        setP (p, prefix + "attack", 0.005f);
+    }
+    setP (p, "sA_type", 5.0f);          // Modal
+    setP (p, "sB_type", 1.0f);          // FM
+    setP (p, "gl_mode", 1.0f);
+    setP (p, "gl_morph", 0.071f);       // A/B: 0.071 × 7 ≈ 0.5
+    const bool readyAB = refresh();
+    const double actualRenderMs = editor->lastPreviewRenderMs();
+    const auto ab = editor->previewWave();
+    const auto imageAB = capture (*editor);
+
+    // Выбран по-прежнему A; меняется только реальный движок B.
+    setP (p, "sB_type", 5.0f);
+    const bool readyB = refresh();
+    const auto changedB = editor->previewWave();
+    const auto imageChangedB = capture (*editor);
+    const double deltaB = diffWave (ab, changedB);
+    const int pixelsB = diffRegion (imageAB, imageChangedB, { 260, 112, 712, 138 });
+    std::printf ("   движок B при выбранном A: ΔRMS %.5f, внутри графика %d пикселей\n", deltaB, pixelsB);
+    check (readyAB && readyB && ! ab.empty() && ! changedB.empty() && deltaB > 0.02 && pixelsB > 500,
+           "Morph использует фактический движок соседнего слота", num (deltaB, 4) + ", " + juce::String (pixelsB) + " px");
+    std::printf ("   фоновый рендер работающей пары A/B: %.2f мс\n", actualRenderMs);
+
+    // Путь в реальном редакторе: после автоматизации таймер сам сдаёт новый
+    // снимок воркеру и забирает результат; не вызываем rebuildPreview вручную.
+    setP (p, "sB_p0", 0.91f);
+    const auto beforeTimer = editor->previewWave();
+    double timerDelta = 0.0;
+    const double timerStart = juce::Time::getMillisecondCounterHiRes();
+    while (juce::Time::getMillisecondCounterHiRes() - timerStart < 2000.0)
+    {
+        juce::MessageManager::getInstance()->runDispatchLoopUntil (50);
+        timerDelta = diffWave (beforeTimer, editor->previewWave());
+        if (timerDelta > 0.02 && ! editor->isPreviewPending()) break;
+    }
+    check (timerDelta > 0.02 && ! editor->isPreviewPending(),
+           "таймер сам обновляет превью при автоматизации соседнего слота", num (timerDelta, 4));
+
+    setP (p, "sB_on", 0.0f);
+    const bool readyA = refresh();
+    const auto onlyA = editor->previewWave();
+    const double deltaMute = diffWave (changedB, onlyA);
+    check (readyA && ! onlyA.empty() && deltaMute > 0.02,
+           "выключение B изменяет микс Morph", num (deltaMute, 4));
+
+    setP (p, "sA_on", 0.0f);
+    const bool readyNone = refresh();
+    check (readyNone && editor->previewWave().empty() && editor->previewPath().isEmpty(),
+           "выключенные слоты Morph не создают фиктивный сигнал");
+
+    // При B = 1/7 в позиции B; канал R тоже входит в монопревью.
+    setP (p, "sB_on", 1.0f);
+    setP (p, "gl_morph", 1.0f / 7.0f);
+    setP (p, "sB_pan", 1.0f);
+    const bool readyRight = refresh();
+    check (readyRight && ! editor->previewWave().empty(), "крайняя правая панорама не исчезает из превью");
+
+    setP (p, "sB_hi", 59.0f);          // C4 = MIDI 60 вне зоны
+    const bool readyOut = refresh();
+    const bool outSilent = editor->previewWave().empty();
+    setP (p, "sB_hi", 60.0f);
+    const bool readyIn = refresh();
+    check (readyOut && outSilent && readyIn && ! editor->previewWave().empty(),
+           "Morph учитывает фактическую зону ноты C4");
+
+    setP (p, "sB_hi", 127.0f);
+    setP (p, "sB_cutoff", 0.95f);
+    const bool readyFilter1 = refresh();
+    const auto bOpen = editor->previewWave();
+
+    // Независимый прямой рендер Voice с тем же снимком параметров. Сравнение
+    // самих 4096 нормированных отсчётов, а не подписей / кадра интерфейса.
+    Patch refPatch;
+    FxChain::Settings unusedFx;
+    p.collectPatch (refPatch, unusedFx);
+    EngineBank referenceBank;
+    referenceBank.build (48000.0);
+    Voice referenceVoice;
+    referenceVoice.init (referenceBank, 48000.0);
+    referenceVoice.stageSlots (refPatch, referenceBank);
+    referenceVoice.applyPendingEngines();
+    referenceVoice.start (refPatch, 60, 1.0f, 60.0f, 1);
+    std::vector<float> refSamples (24000, 0.0f);
+    for (auto& value : refSamples)
+    {
+        float l = 0.0f, r = 0.0f;
+        if (! referenceVoice.render (refPatch, l, r)) break;
+        value = 0.5f * (l + r);
+    }
+    size_t refStart = 0;
+    double refEnergy = -1.0;
+    for (size_t start = 0; start + 4096 <= refSamples.size(); start += 512)
+    {
+        double energy = 0.0;
+        for (size_t i = 0; i < 4096; ++i) energy += (double) refSamples[start + i] * refSamples[start + i];
+        if (energy > refEnergy) { refEnergy = energy; refStart = start; }
+    }
+    std::vector<float> refWave (refSamples.begin() + (std::ptrdiff_t) refStart,
+                                refSamples.begin() + (std::ptrdiff_t) (refStart + 4096));
+    double refMean = 0.0;
+    for (const auto value : refWave) refMean += value;
+    refMean /= (double) refWave.size();
+    float refPeak = 0.0f;
+    for (auto& value : refWave) { value -= (float) refMean; refPeak = std::max (refPeak, std::abs (value)); }
+    if (refPeak > 1.0e-5f) for (auto& value : refWave) value /= refPeak;
+    else refWave.clear();
+    const double refError = diffWave (bOpen, refWave);
+    std::printf ("   прямой DSP vs превью: ΔRMS %.8f (4096 отсчётов)\n", refError);
+    // Воркер переиспользует голос: состояние фильтра/движка после предыдущей
+    // ноты не обязано совпадать побитово со свежеинициализированным Voice.
+    check (readyFilter1 && ! bOpen.empty() && refError < 0.001,
+           "превью близко к независимому рендеру DSP-голоса", num (refError, 8));
+
+    setP (p, "sB_cutoff", 0.15f);
+    const bool readyFilter2 = refresh();
+    const double filterDiff = diffWave (bOpen, editor->previewWave());
+    check (readyFilter1 && readyFilter2 && filterDiff > 0.02,
+           "фильтр соседнего слота пересобирает превью Morph", num (filterDiff, 4));
+
+    // Стек — только выбранный слот; Split — все включённые в зоне C4.
+    setP (p, "gl_mode", 0.0f);
+    const bool readyStackA = refresh();
+    const bool stackAEmpty = editor->previewWave().empty();
+    editor->showPage (1);
+    const bool readyStackB = editor->waitForPreview (15000);
+    const bool stackBActive = ! editor->previewWave().empty();
+    check (readyStackA && stackAEmpty && readyStackB && stackBActive,
+           "Stack показывает только выбранный слот, учитывая его on/off");
+
+    editor->showPage (0);
+    setP (p, "gl_mode", 2.0f);
+    setP (p, "sA_on", 1.0f);
+    setP (p, "sA_hi", 59.0f);
+    setP (p, "sB_lo", 60.0f);
+    setP (p, "sB_on", 1.0f);
+    const bool readySplit = refresh();
+    const bool splitActive = ! editor->previewWave().empty();
+    setP (p, "sB_on", 0.0f);
+    const bool readySplitMuted = refresh();
+    check (readySplit && splitActive && readySplitMuted && editor->previewWave().empty(),
+           "Split показывает только реальные включённые слоты в зоне C4");
+
+    // Запросы при быстром движении перезаписывают очередь, а не оставляют
+    // устаревшую картинку. Все вызовы submit выполняются на message thread.
+    setP (p, "gl_mode", 1.0f);
+    setP (p, "sA_hi", 127.0f);
+    setP (p, "sB_on", 1.0f);
+    const double tStart = juce::Time::getMillisecondCounterHiRes();
+    double maxSubmitMs = 0.0;
+    for (int i = 0; i < 30; ++i)
+    {
+        setP (p, "gl_morph", (float) i / 29.0f);
+        const double t0 = juce::Time::getMillisecondCounterHiRes();
+        editor->rebuildPreview (true);
+        maxSubmitMs = juce::jmax (maxSubmitMs, juce::Time::getMillisecondCounterHiRes() - t0);
+    }
+    const double submitMs = juce::Time::getMillisecondCounterHiRes() - tStart;
+    setP (p, "sA_on", 0.0f);
+    setP (p, "sB_on", 0.0f);
+    const bool readyLatest = refresh();
+    std::printf ("   30 запросов: %.2f мс суммарно, максимум %.2f мс; последняя генерация %.2f мс\n",
+                 submitMs, maxSubmitMs, editor->lastPreviewRenderMs());
+    check (readyLatest && editor->previewWave().empty(), "очередь превью публикует последнее, а не устаревшее состояние");
+    check (maxSubmitMs < 50.0, "рендер превью не блокирует GUI на каждом запросе", num (maxSubmitMs, 2) + " мс максимум");
+
+    // Без анимаций листание не застревает в сдвинутом положении; после
+    // повторного включения снова виден плавный переход.
+    editor->showPage (8);
+    editor->nextColumnPage (0);
+    check (! editor->columnTransitioning (0) && editor->columnPageShift (0) == 0,
+           "при выключенных анимациях страница меняется без сдвига");
+    editor->setAnimationsEnabled (true);
+    editor->nextColumnPage (0);
+    const int shiftStart = editor->columnPageShift (0);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil (500);
+    const int shiftEnd = editor->columnPageShift (0);
+    std::printf ("   переход: %d → %d px\n", shiftStart, shiftEnd);
+    check (shiftStart > 0 && shiftEnd == 0 && ! editor->columnTransitioning (0),
+           "переход следующей страницы завершается, в том числе на циклическом переходе");
+    editor->nextColumnPage (0);
+    editor->setAnimationsEnabled (false);
+    check (! editor->columnTransitioning (0) && editor->columnPageShift (0) == 0,
+           "выключение анимаций во время перехода сразу выравнивает карточки");
+
+    // Страницы полосы FX тоже плавно проявляются, а при выключенных
+    // анимациях переключаются сразу, не блокируя клики по чипам.
+    editor->clickMain ({ 925.0f, 586.0f });
+    const float chipOff = editor->chipPageTransition();
+    editor->setAnimationsEnabled (true);
+    editor->clickMain ({ 925.0f, 586.0f });
+    const float chipStart = editor->chipPageTransition();
+    juce::MessageManager::getInstance()->runDispatchLoopUntil (500);
+    const float chipEnd = editor->chipPageTransition();
+    check (chipOff == 0.0f && chipStart > 0.99f && chipEnd < 0.01f,
+           "страницы чипов FX плавные только при включённых анимациях",
+           num (chipStart, 2) + " → " + num (chipEnd, 2));
+    editor->setAnimationsEnabled (false);
+
+    // Тестируем отправку настоящих callbacks mouseEnter/mouseExit компонентам,
+    // включая маленькие кольца в карточках, а не только внутренний тестовый API.
+    std::function<juce::Slider* (juce::Component&, const juce::String&)> findSlider;
+    findSlider = [&findSlider] (juce::Component& parent, const juce::String& id) -> juce::Slider*
+    {
+        for (auto* child : parent.getChildren())
+        {
+            if (auto* slider = dynamic_cast<juce::Slider*> (child))
+                if (slider->getProperties().getWithDefault ("paramId", "").toString() == id)
+                    return slider;
+            if (auto* found = findSlider (*child, id)) return found;
+        }
+        return nullptr;
+    };
+    auto hoverEvent = [] (juce::Slider& slider, bool enter)
+    {
+        const auto source = juce::Desktop::getInstance().getMainMouseSource();
+        const auto time = juce::Time::getCurrentTime();
+        const auto pos = slider.getLocalBounds().getCentre().toFloat();
+        const juce::MouseEvent event (source, pos, juce::ModifierKeys(), 0.0f,
+                                      0.0f, 0.0f, 0.0f, 0.0f,
+                                      &slider, &slider, time, pos, time, 0, false);
+        if (enter) slider.mouseEnter (event); else slider.mouseExit (event);
+    };
+    editor->showPage (0);
+    auto* mainKnob = findSlider (*editor, "sA_cutoff");
+    auto* bottomKnob = findSlider (*editor, "gl_morph");
+    auto* smallKnob = findSlider (*editor, "fx_drive");
+    check (mainKnob != nullptr && bottomKnob != nullptr && smallKnob != nullptr,
+           "главные и малые кольцевые ручки найдены в GUI");
+    if (mainKnob != nullptr && bottomKnob != nullptr && smallKnob != nullptr)
+    {
+        int immediate = 0, cleared = 0;
+        for (auto* knob : { mainKnob, bottomKnob, smallKnob })
+        {
+            hoverEvent (*knob, true);
+            if ((double) knob->getProperties().getWithDefault ("hover", 0.0) > 0.99) ++immediate;
+            hoverEvent (*knob, false);
+            if ((double) knob->getProperties().getWithDefault ("hover", 1.0) < 0.01) ++cleared;
+        }
+        check (immediate == 3 && cleared == 3, "hover работает на центральной, нижней и малой ручках без анимаций",
+               juce::String (immediate) + "/3 on, " + juce::String (cleared) + "/3 off");
+
+        // На 100 % все активные насечки заняты: подсветка всё равно видна.
+        setP (p, "sA_cutoff", 1.0f);
+        const auto idle = capture (*mainKnob);
+        hoverEvent (*mainKnob, true);
+        const auto hovered = capture (*mainKnob);
+        const int hoverPixels = diffRegion (idle, hovered, idle.getBounds());
+        hoverEvent (*mainKnob, false);
+        std::printf ("   hover при 100%%: %d пикселей\n", hoverPixels);
+        check (hoverPixels > 20, "подсветка заметна даже при максимальном значении ручки",
+               juce::String (hoverPixels) + " px");
+
+        editor->setAnimationsEnabled (true);
+        hoverEvent (*mainKnob, true);
+        juce::MessageManager::getInstance()->runDispatchLoopUntil (350);
+        const double levelOn = (double) mainKnob->getProperties().getWithDefault ("hover", 0.0);
+        hoverEvent (*mainKnob, false);
+        juce::MessageManager::getInstance()->runDispatchLoopUntil (350);
+        const double levelOff = (double) mainKnob->getProperties().getWithDefault ("hover", 1.0);
+        check (levelOn > 0.99 && levelOff < 0.01, "mouseEnter/mouseExit плавно зажигают и гасят ручку",
+               num (levelOn, 2) + " → " + num (levelOff, 2));
+    }
+
+    // Fade секций оверлея: доступность контролов не зависит от эффекта.
+    editor->showPage (100);
+    editor->showPage (200);        // ALL вкладки 0
+    auto* overlay = editor->paramsOverlay();
+    juce::Viewport* viewport = nullptr;
+    if (overlay != nullptr)
+        for (auto* child : overlay->getChildren())
+            if (auto* v = dynamic_cast<juce::Viewport*> (child)) viewport = v;
+    editor->showPage (201);        // первая секция
+    const float alphaStart = viewport != nullptr ? viewport->getAlpha() : 1.0f;
+    juce::MessageManager::getInstance()->runDispatchLoopUntil (500);
+    const float alphaEnd = viewport != nullptr ? viewport->getAlpha() : 0.0f;
+    std::printf ("   оверлей PARAMS: alpha %.2f → %.2f\n", alphaStart, alphaEnd);
+    check (viewport != nullptr && alphaStart < 0.99f && alphaEnd > 0.99f,
+           "вкладки и секции PARAMS плавно проявляются");
+    editor->setAnimationsEnabled (false);
+    editor->showPage (200);
+    check (viewport != nullptr && viewport->getAlpha() > 0.99f,
+           "без анимаций оверлей сразу полностью виден");
+}
+
+int main (int argc, char** argv)
 {
     // Голова без X11: GUI-инициализация здесь упала бы (нет дисплея), а
     // аудио-плагину нужен только менеджер сообщений — он же крутит AsyncUpdater,
@@ -170,6 +523,14 @@ int main()
     auto* mm = juce::MessageManager::getInstance();
     std::printf ("OROGEN test_plugin: старт\n");
     juce::ignoreUnused (mm);
+    if (argc > 1 && juce::String (argv[1]) == "--gui-only")
+    {
+        testGuiRegressions();
+        juce::DeletedAtShutdown::deleteAll();
+        juce::MessageManager::deleteInstance();
+        std::printf ("\nGUI-регрессии: провалов %d\n", failures);
+        return failures == 0 ? 0 : 1;
+    }
     const double sr = 48000.0;
 
     // ---------------------------------------------------------------- 1
@@ -2114,6 +2475,8 @@ int main()
                                 // форма волны на дисплее
                                 auto shot = [ore2]
                                 {
+                                    ore2->rebuildPreview (true);
+                                    if (! ore2->waitForPreview (10000)) ++failures;
                                     juce::Image img (juce::Image::ARGB, 1280, 800, true);
                                     juce::Graphics g (img);
                                     ore2->setAnimationPhase (0.0);
@@ -2150,8 +2513,9 @@ int main()
                                             prm->setValueNotifyingHost (prm->convertTo0to1 (cutoff));
                                         if (auto* prm = q.apvts.getParameter ("sA_filter"))
                                             prm->setValueNotifyingHost (prm->convertTo0to1 ((float) model));
-                                        // превью пересобирает таймер (20 Гц) — даём ему тик
-                                        juce::MessageManager::getInstance()->runDispatchLoopUntil (300);
+                                        juce::MessageManager::getInstance()->runDispatchLoopUntil (100);
+                                        ore2->rebuildPreview (true);
+                                        if (! ore2->waitForPreview (10000)) ++failures;
                                         ore2->setAnimationPhase (0.0);
                                         juce::Image img (juce::Image::ARGB, 1280, 800, true);
                                         juce::Graphics g (img);
@@ -2200,6 +2564,8 @@ int main()
                                     // 14.1 Morph: превью показывает смесь слотов, а не один слот
                                     auto shotNow = [ore2]
                                     {
+                                        ore2->rebuildPreview (true);
+                                        if (! ore2->waitForPreview (10000)) ++failures;
                                         ore2->setAnimationPhase (0.0);
                                         juce::Image img (juce::Image::ARGB, 1280, 800, true);
                                         juce::Graphics g (img);
@@ -2227,12 +2593,12 @@ int main()
                                     const auto stackShot = shotNow();
 
                                     setP (q, "gl_mode", 1.0f);       // Morph
-                                    setP (q, "gl_morph", 0.5f);
+                                    setP (q, "gl_morph", 0.071f);
                                     juce::MessageManager::getInstance()->runDispatchLoopUntil (400);
                                     const auto morphShot = shotNow();
 
                                     const int dMode = diff2 (stackShot, morphShot);
-                                    std::printf ("   превью: Stack против Morph (morph 50%%) — %d пикселей\n", dMode);
+                                    std::printf ("   превью: Stack против Morph (A/B 50%%) — %d пикселей\n", dMode);
                                     check (dMode > 2000, "режим Morph виден в превью дисплея",
                                            juce::String (dMode) + " пикселей");
 
@@ -2274,6 +2640,7 @@ int main()
         }
     }
 
+    testGuiRegressions();
     juce::DeletedAtShutdown::deleteAll();
     juce::MessageManager::deleteInstance();
 

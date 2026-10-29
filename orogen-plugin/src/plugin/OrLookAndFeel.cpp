@@ -416,6 +416,15 @@ void ring (juce::Graphics& g, juce::Rectangle<float> area, float value01,
         g.strokePath (lit, juce::PathStrokeType (big ? 1.6f : 1.2f));
     }
 
+    // Тонкое белое кольцо видно даже при значении 100 %, когда активные
+    // насечки перекрывают все неактивные. Не меняет геометрию ручки.
+    if (hover > 0.001f)
+    {
+        const auto halo = juce::Rectangle<float> (d - 1.0f, d - 1.0f).withCentre (c);
+        g.setColour (Palette::signal.withAlpha (0.28f * juce::jlimit (0.0f, 1.0f, hover)));
+        g.drawEllipse (halo, 1.0f);
+    }
+
     // тело ручки
     g.setColour (Palette::disc);
     g.fillEllipse (juce::Rectangle<float> (rDisc * 2.0f, rDisc * 2.0f).withCentre (c));

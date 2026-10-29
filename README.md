@@ -6,10 +6,17 @@ DSP-ядро на C++ без зависимостей + обёртка VST3 на
 | каталог | что внутри |
 |---|---|
 | `orogen-dsp/` | DSP-ядро: 9 движков (включая слайсер CHOP), инструмент, 16 фильтров, 16 эффектов, арпеджиатор, мод-матрица. Сборка `make`, тесты `make test`, демо `make demo` → `audio/` |
-| `orogen-plugin/` | VST3-обёртка: 294 параметра APVTS, 7 пресетов, интерфейс по макету 1280×800 + оверлей всех 294 параметров (`docs/ui_main.png`, `docs/ui_params_*.png`, спецификация — `gui-spec.md`). `artifact/OROGEN.vst3` — собранный плагин (8.85 МБ, Release, stripped, с интерфейсом по макету и интерактивным главным экраном) |
+| `orogen-plugin/` | VST3-обёртка: 294 параметра APVTS, 7 пресетов, GUI 1280×800 и оверлей 294/294. Локальный `artifact/OROGEN.vst3` — Linux x86-64, Release, stripped, 8 941 176 байт. Бинарный `.so` исключён из истории git. |
 | `orogen/` | веб-разбор движков (`index.html`, `ENGINES.md`) |
 | `terrain-deep-dive.md` | разбор оригинала: спецификации, архитектура, план |
-| `OROGEN-vst3-vs2022.zip` | **готовый кит для сборки VST3 в Visual Studio 2022**: исходники + `build_vst3.bat` / `build_vst3.ps1` / `CMakePresets.json` + инструкция `README-BUILD-WINDOWS.md`. 1814 КБ, 109 файлов, sha256 `69a02910…` (ревизия 20: 19 интерактивных зон главного экрана — дисплей тянется (позиция/варп таблицы), чипы FX листаются (10 эффектов на 2 страницах), 8 маршрутов мод-матрицы с приёмником, банк программ в GUI; LOAD/SAVE с меню банка; анимации интерфейса (блок 11), дисплей показывает форму выбранного движка — рендер из DSP (блок 12: переключение движка в селекторе слышно 36/36 пар, видно по 20 204 пикселям); `test_plugin` — 141 проверка, провалов 0 |
+| `OROGEN-vst3-vs2022.zip` | Исходники и скрипты сборки Visual Studio 2022; ревизия 21, 2 594 837 байт, 114 файлов, sha256 `9e8deec66e3bcf6ae477805dd97577864db0b5dc461d231be70d8a848c52f85a`. Сборка Windows не проверялась в Linux-песочнице. |
+| `OROGEN-linux-vst3.zip` | Локально собранный Linux x86-64 VST3 (не входит в git/bundle): 3 960 252 байта, ELF требует GLIBC ≥ 2.38 и GLIBCXX 3.4.32. |
+
+Текущий результат: **169 проверок `test_plugin`, провалов 0 в двух полных
+прогонах**; `verify_vst3` — **24/24**. Переходы страниц и hover см.
+`orogen-plugin/docs/ui_transitions.gif`. Превью Morph показывает фактическую
+смесь слотов и их фильтры для ноты C4 **до мастер-FX**, а не выход DAW;
+примеры — `orogen-plugin/docs/ui_morph_a.png`, `ui_morph_ab.png`, `ui_morph_h.png`.
 
 Документы: `orogen-dsp/FX.md` (эффекты и замеры), `orogen-dsp/INSTRUMENT.md`,
 `orogen-dsp/FILTERS.md` (16 моделей фильтра и их АЧХ),
@@ -31,6 +38,10 @@ sudo apt-get install -y cmake ninja-build git pkg-config libx11-dev libxrandr-de
 CMAKE_BUILD_PARALLEL_LEVEL=1 cmake -S orogen-plugin -B orogen-plugin/build-cmake \
       -G Ninja -DCMAKE_BUILD_TYPE=Debug -DOROGEN_BUILD_VST3=OFF
 CMAKE_BUILD_PARALLEL_LEVEL=1 ninja -C orogen-plugin/build-cmake -j2 render_ui test_plugin
+
+# полная проверка и быстрые GUI-регрессии
+./orogen-plugin/build-cmake/test_plugin
+./orogen-plugin/build-cmake/test_plugin --gui-only
 
 # стенды без дисплея: 0…7 — слоты, 8…11 — секции колонки, 100 — все параметры
 ./orogen-plugin/build-cmake/render_ui orogen-plugin/docs/ui_main.png 0 1280 800

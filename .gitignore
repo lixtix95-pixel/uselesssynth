@@ -24,3 +24,6 @@ __pycache__/
 .idea/
 .sudo_as_admin_successful
 orogen-repo.bundle
+
+# local Linux VST3 distribution (binary remains outside git history)
+/OROGEN-linux-vst3.zip

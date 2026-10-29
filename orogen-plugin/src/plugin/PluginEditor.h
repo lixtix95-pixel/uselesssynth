@@ -57,6 +57,7 @@ public:
     int  mainScreenHitCount() const;                    // сколько целей на экране (для теста)
     int  chipPageCount() const;                         // страниц чипов FX
     int  chipCount() const;                             // всего чипов (эффекты с ручкой доли)
+    float chipPageTransition() const { return chipTransition; }
     juce::String chipParamId (int index) const;         // параметр чипа по порядку
 
     // --- анимации ---
@@ -68,12 +69,15 @@ public:
     bool  animationsEnabled() const { return animOn; }
     void  setAnimationsEnabled (bool on);
     void  repaintAnimated();          // перерисовать только «живые» зоны
-    // Превью формы волны выбранного слота: рендерится настоящим движком,
-    // поэтому на дисплее видно, чем Granular отличается от Wavetable.
+    // Превью: C4, настоящий DSP-голос и фильтры, до мастер-FX. В Stack —
+    // выбранный слот; в Morph/Split — фактические слоты и диапазоны нот.
+    // Рендер происходит в отдельном потоке; эти методы ожидания — для стендов.
     void  rebuildPreview (bool force = false);
+    bool  waitForPreview (int timeoutMs = 10000);
+    bool  isPreviewPending() const { return prevPending; }
+    double lastPreviewRenderMs() const { return prevRenderMs; }
     const std::vector<float>& previewWave() const { return prevWave; }
-    const juce::Path& previewPath() const { return prevPath; }   // кэш формы в 0…1
-    static constexpr int kPreviewSamples = 1024;
+    const juce::Path& previewPath() const { return prevPath; }
     int   animatedAreaPercent() const;// сколько площади экрана реально двигается
 
     // --- банк программ (был только в API процессора) ---
@@ -100,8 +104,10 @@ private:
     class ParamsPage;        // полный список параметров (оверлей)
     class IconButton;        // кнопка-иконка секции
     class VectorPad;         // векторный блок справа внизу
+    class PreviewWorker;     // владеет DSP-голосом вне message/audio thread
 
     void timerCallback() override;
+    void takePreviewResult();
     void buildRail();
     void buildCentre();
     void buildBottom();
@@ -185,13 +191,15 @@ private:
     std::array<float, 10> chipLast { 0.45f, 0.50f, 0.40f, 0.35f, 0.45f,
                                      0.50f, 0.45f, 0.40f, 0.45f, 0.50f };
     int chipPage = 0;
+    float chipTransition = 0.0f;
 
-    // превью движка для дисплея
-    std::unique_ptr<Instrument> prevIns;
+    // Превью с независимым DSP и коалесцированием частых изменений.
+    std::unique_ptr<PreviewWorker> previewWorker;
     std::vector<float> prevWave;
-    juce::Path prevPath;              // та же форма, но готовая к рисованию
-    juce::String prevSig;
-    double prevStampMs = 0.0;
+    juce::Path prevPath;
+    std::uint64_t prevHash = 0, prevGeneration = 0;
+    bool prevHashValid = false, prevPending = false;
+    double prevStampMs = 0.0, prevRenderMs = 0.0;
 
     double animSeconds = 0.0;         // время анимации, с
     double lastTimerMs = 0.0;

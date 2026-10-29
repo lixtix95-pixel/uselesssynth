@@ -11,6 +11,8 @@
 
 #include <cmath>
 #include <functional>
+#include <cstring>
+#include <cstdint>
 
 namespace orogen
 {
@@ -77,48 +79,75 @@ namespace
 // Bound — слайдер с привязкой к параметру (привязку можно перевесить: у
 // центральных ручек параметры зависят от выбранного слота A–H).
 //============================================================================
-struct OrogenEditor::Bound : private juce::Timer
+// Все кольцевые ручки (включая карточки колонки) используют один и тот же
+// обработчик настоящих mouseEnter/mouseExit. Без анимаций остаётся мгновенный
+// визуальный отклик, но нет перехода во времени.
+class HoverSlider : public juce::Slider, private juce::Timer
 {
-    juce::Slider slider;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> att;
-    // hover-подсветка: плавно 0 → 1 за ~120 мс, чтобы кольцо не «прыгало»
-    double hoverTarget = 0.0, hoverValue = 0.0;
-
-    struct HoverListener : public juce::MouseListener
+public:
+    void mouseEnter (const juce::MouseEvent& event) override
     {
-        explicit HoverListener (Bound& b) : owner (b) {}
-        void mouseEnter (const juce::MouseEvent&) override
-        {
-            owner.hoverTarget = 1.0;
-            if (! owner.isTimerRunning()) owner.startTimerHz (30);
-        }
-        void mouseExit (const juce::MouseEvent&) override
-        {
-            owner.hoverTarget = 0.0;
-            if (! owner.isTimerRunning()) owner.startTimerHz (30);
-        }
-        Bound& owner;
-    };
-
-    HoverListener hoverL { *this };
-
-    void timerCallback() override
-    {
-        const double step = 0.25;
-        if (hoverValue < hoverTarget) hoverValue = juce::jmin (hoverTarget, hoverValue + step);
-        else if (hoverValue > hoverTarget) hoverValue = juce::jmax (hoverTarget, hoverValue - step);
-        slider.getProperties().set ("hover", hoverValue);
-        slider.repaint();
-        if (std::abs (hoverValue - hoverTarget) < 1.0e-6) stopTimer();
+        juce::Slider::mouseEnter (event);
+        setHoverTarget (1.0);
     }
 
-    void animateHover (float target)
+    void mouseExit (const juce::MouseEvent& event) override
     {
-        hoverTarget = target;
-        if (! isTimerRunning()) startTimerHz (30);
+        juce::Slider::mouseExit (event);
+        setHoverTarget (0.0);
+    }
+
+    void setHoverTarget (double target)
+    {
+        hoverTarget = juce::jlimit (0.0, 1.0, target);
+        if (! animationsEnabled)
+        {
+            stopTimer();
+            setHoverLevel (hoverTarget);
+        }
+        else if (! isTimerRunning())
+            startTimerHz (30);
+    }
+
+    void setAnimationsEnabled (bool enabled)
+    {
+        animationsEnabled = enabled;
+        if (! enabled)
+        {
+            stopTimer();
+            setHoverLevel (hoverTarget);
+        }
     }
 
     double hoverLevel() const { return hoverValue; }
+
+private:
+    void setHoverLevel (double level)
+    {
+        hoverValue = level;
+        getProperties().set ("hover", hoverValue);
+        repaint();
+    }
+
+    void timerCallback() override
+    {
+        constexpr double step = 0.25;
+        if (hoverValue < hoverTarget) setHoverLevel (juce::jmin (hoverTarget, hoverValue + step));
+        else if (hoverValue > hoverTarget) setHoverLevel (juce::jmax (hoverTarget, hoverValue - step));
+        if (std::abs (hoverValue - hoverTarget) < 1.0e-6) stopTimer();
+    }
+
+    double hoverTarget = 0.0, hoverValue = 0.0;
+    bool animationsEnabled = true;
+};
+
+struct OrogenEditor::Bound
+{
+    HoverSlider slider;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> att;
+
+    void animateHover (float target) { slider.setHoverTarget (target); }
+    double hoverLevel() const { return slider.hoverLevel(); }
 
     void setup (juce::Slider::SliderStyle style, bool big)
     {
@@ -127,7 +156,6 @@ struct OrogenEditor::Bound : private juce::Timer
         slider.getProperties().set ("big", big);
         slider.setScrollWheelEnabled (true);
         slider.setVelocityBasedMode (false);
-        slider.addMouseListener (&hoverL, false);
     }
 
     void bind (juce::AudioProcessorValueTreeState& apvts, const juce::String& id)
@@ -214,10 +242,11 @@ public:
 
     ParamCard& knob (const juce::String& id)
     {
-        auto* s = new juce::Slider();
+        auto* s = new HoverSlider();
         s->setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
         s->setTextBoxStyle (juce::Slider::NoTextBox, true, 0, 0);
         s->getProperties().set ("big", false);
+        s->getProperties().set ("paramId", id);
         addAndMakeVisible (s);
         knobAtts.push_back (std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
             proc.apvts, id, *s));
@@ -235,6 +264,13 @@ public:
         toggles.add (t);
         ids.add (id);
         return *this;
+    }
+
+    void setAnimationsEnabled (bool enabled)
+    {
+        for (auto* knob : knobs)
+            if (auto* hoverKnob = dynamic_cast<HoverSlider*> (knob))
+                hoverKnob->setAnimationsEnabled (enabled);
     }
 
     // Компактная раскладка: два списка друг под другом слева, ручка справа.
@@ -462,10 +498,12 @@ public:
         // Плавный переход: новая страница въезжает по вертикали. Направление
         // зависит от номера страницы, поэтому листание «вперёд» и «назад»
         // читается одинаково на любой колонке.
-        transitionDir = (next > page) ? 1.0f : -1.0f;
+        // Используем запрошенное направление, а не сравнение нормализованных
+        // номеров: переход с последней страницы на первую тоже идёт вперёд.
+        transitionDir = (p > page) ? 1.0f : -1.0f;
         page = next;
-        transition = 1.0f;              // 1 — только что начали, 0 — доехали
-        pageShift = transitionDir * kTransitionPx;
+        transition = animationsEnabled ? 1.0f : 0.0f;
+        pageShift = transitionDir * kTransitionPx * transition;
         resized();
         repaint();
     }
@@ -478,6 +516,18 @@ public:
         pageShift = transitionDir * kTransitionPx * transition * transition;   // ease-out
         resized();
         repaint();
+    }
+
+    void setAnimationsEnabled (bool enabled)
+    {
+        animationsEnabled = enabled;
+        for (auto* card : cards) card->setAnimationsEnabled (enabled);
+        if (! enabled && transition > 0.0f)
+        {
+            transition = pageShift = 0.0f;
+            resized();
+            repaint();
+        }
     }
 
     bool isTransitioning() const { return transition > 0.0f; }
@@ -501,6 +551,7 @@ public:
 
     float animPhase = 0.0f;
     float transition = 0.0f, pageShift = 0.0f, transitionDir = 1.0f;
+    bool animationsEnabled = true;
     OrogenProcessor& proc;
     juce::String title;
     juce::OwnedArray<ParamCard> cards;
@@ -660,7 +711,9 @@ public:
 
     void setTab (int index)
     {
-        currentTab = juce::jlimit (0, (int) tabs.size() - 1, index);
+        const int next = juce::jlimit (0, (int) tabs.size() - 1, index);
+        const bool changed = next != currentTab;
+        currentTab = next;
         for (int i = 0; i < contents.size(); ++i) contents[i]->setVisible (i == currentTab);
         for (int i = 0; i < tabButtons.size(); ++i) tabButtons[i]->setActive (i == currentTab);
         rebuildSectionButtons();
@@ -668,6 +721,7 @@ public:
         viewport.setViewedComponent (contents[currentTab], false);
         viewport.setViewPosition (0, 0);
         resized();
+        if (changed) beginTransition();
         repaint();
     }
 
@@ -680,13 +734,33 @@ public:
         auto* c = contents[currentTab];
         if (c == nullptr) return;
         const int n = c->sectionCount();
-        currentSection = (index < 0 || n == 0) ? -1 : juce::jlimit (0, n - 1, index);
+        const int next = (index < 0 || n == 0) ? -1 : juce::jlimit (0, n - 1, index);
+        const bool changed = next != currentSection;
+        currentSection = next;
         c->setSectionFilter (currentSection < 0 ? juce::String() : c->sectionName (currentSection));
         for (int i = 0; i < sectionButtons.size(); ++i)
             sectionButtons[i]->setActive (currentSection < 0 ? i == 0 : i == currentSection + 1);
         viewport.setViewPosition (0, 0);
         resized();
+        if (changed) beginTransition();
         repaint();
+    }
+
+    void setAnimationsEnabled (bool enabled)
+    {
+        animationsEnabled = enabled;
+        if (! enabled)
+        {
+            transition = 0.0f;
+            viewport.setAlpha (1.0f);
+        }
+    }
+
+    void tickTransition (float dtSeconds)
+    {
+        if (transition <= 0.0f) return;
+        transition = juce::jmax (0.0f, transition - dtSeconds / 0.14f);
+        viewport.setAlpha (1.0f - 0.35f * transition * transition);
     }
 
     int getSection() const { return currentSection; }
@@ -776,6 +850,12 @@ public:
     }
 
 private:
+    void beginTransition()
+    {
+        transition = (animationsEnabled && isVisible()) ? 1.0f : 0.0f;
+        viewport.setAlpha (1.0f - 0.35f * transition);
+    }
+
     // --- кнопка вкладки ---
     class TabButton : public juce::Button
     {
@@ -996,6 +1076,8 @@ private:
     std::vector<UiTab> tabs;
     int currentTab = 0;
     int currentSection = -1;
+    float transition = 0.0f;
+    bool animationsEnabled = true;
 
     juce::Viewport viewport;
     juce::OwnedArray<TabContent> contents;
@@ -1005,6 +1087,191 @@ private:
     TabButton allSectionsButton { "ALL", [this] { setSection (-1); } };
     juce::TextButton closeButton { "CLOSE" };
 };
+
+//============================================================================
+// Превью считается не на message thread и не на аудиопотоке хоста. Воркер
+// получает копию Patch, владеет собственными банком и Voice и сворачивает
+// частые изменения в последний запрос. Старый результат никогда не публикуется.
+//============================================================================
+class OrogenEditor::PreviewWorker : private juce::Thread
+{
+public:
+    struct Result
+    {
+        std::uint64_t generation = 0;
+        std::vector<float> wave;
+        double renderMs = 0.0;
+    };
+
+    PreviewWorker() : juce::Thread ("OROGEN waveform preview")
+    {
+        startThread (juce::Thread::Priority::low);
+    }
+
+    ~PreviewWorker() override
+    {
+        signalThreadShouldExit();
+        wake.signal();
+        waitForThreadToExit (-1);
+    }
+
+    void submit (const Patch& p, std::uint64_t generation)
+    {
+        const juce::ScopedLock guard (lock);
+        pendingPatch = p;
+        pendingGeneration = generation;
+        hasPending = true;
+        latest.store (generation, std::memory_order_release);
+        wake.signal();
+    }
+
+    bool take (Result& out)
+    {
+        const juce::ScopedLock guard (lock);
+        if (! hasResult) return false;
+        out = std::move (result);
+        hasResult = false;
+        return true;
+    }
+
+private:
+    void run() override
+    {
+        constexpr double sampleRate = 48000.0;
+        EngineBank bank;
+        bank.build (sampleRate);             // один раз на воркер, не на GUI
+        Voice voice;
+        voice.init (bank, sampleRate);
+
+        while (! threadShouldExit())
+        {
+            Patch patch;
+            std::uint64_t generation = 0;
+            {
+                const juce::ScopedLock guard (lock);
+                if (hasPending)
+                {
+                    patch = pendingPatch;
+                    generation = pendingGeneration;
+                    hasPending = false;
+                }
+            }
+            if (generation == 0)
+            {
+                wake.wait (250);
+                continue;
+            }
+
+            const double started = juce::Time::getMillisecondCounterHiRes();
+            voice.stageSlots (patch, bank);
+            voice.applyPendingEngines();
+            voice.start (patch, 60, 1.0f, 60.0f, 1);  // C4, одна нота
+
+            // Сканируем с атаки: короткий слайс CHOP может закончиться до
+            // любого фиксированного прогрева; редкий Granular успевает выдать
+            // хотя бы два зерна за 0.5 с. Самое громкое окно — 4096/48000 с.
+            constexpr int kScan = 24000, kCapture = 4096, kStep = 512;
+            std::vector<float> scan ((size_t) kScan, 0.0f);
+            bool cancelled = false;
+            for (int i = 0; i < kScan; ++i)
+            {
+                if ((i & 511) == 0 && (threadShouldExit()
+                    || latest.load (std::memory_order_acquire) != generation))
+                {
+                    cancelled = true;
+                    break;
+                }
+                float l = 0.0f, r = 0.0f;
+                const bool active = voice.render (patch, l, r);
+                const float sample = 0.5f * (l + r);
+                scan[(size_t) i] = std::isfinite (sample) ? sample : 0.0f;
+                if (! active) break;
+            }
+            if (cancelled) continue;
+
+            size_t bestStart = 0;
+            double bestEnergy = -1.0;
+            for (int start = 0; start + kCapture <= kScan; start += kStep)
+            {
+                double energy = 0.0;
+                for (int i = 0; i < kCapture; ++i)
+                {
+                    const double v = scan[(size_t) (start + i)];
+                    energy += v * v;
+                }
+                if (energy > bestEnergy) { bestEnergy = energy; bestStart = (size_t) start; }
+            }
+
+            std::vector<float> wave (scan.begin() + (std::ptrdiff_t) bestStart,
+                                     scan.begin() + (std::ptrdiff_t) (bestStart + kCapture));
+            double mean = 0.0;
+            for (const auto v : wave) mean += v;
+            mean /= (double) wave.size();
+            float peak = 0.0f;
+            for (auto& v : wave) { v -= (float) mean; peak = juce::jmax (peak, std::abs (v)); }
+            if (peak > 1.0e-5f)
+                for (auto& v : wave) v /= peak;
+            else
+                wave.clear();                 // настоящая тишина, не фиктивный движок
+
+            const double elapsed = juce::Time::getMillisecondCounterHiRes() - started;
+            const juce::ScopedLock guard (lock);
+            if (latest.load (std::memory_order_acquire) == generation && ! threadShouldExit())
+            {
+                result = { generation, std::move (wave), elapsed };
+                hasResult = true;
+            }
+        }
+    }
+
+    juce::CriticalSection lock;
+    juce::WaitableEvent wake;
+    Patch pendingPatch;
+    std::uint64_t pendingGeneration = 0;
+    std::atomic<std::uint64_t> latest { 0 };
+    bool hasPending = false, hasResult = false;
+    Result result;
+};
+
+// Хэшируем поля, а не байты структуры (в ней возможны padding-байты). Это
+// снимок тех же данных, которые обёртка передаёт в DSP, включая все слоты,
+// их фильтры и зоны, LFO и маршруты; для выключенного слота важен только on.
+static std::uint64_t previewPatchHash (const Patch& patch, int selectedSlot)
+{
+    std::uint64_t h = 1469598103934665603ull;
+    auto mix = [&h] (std::uint32_t v) { h = (h ^ v) * 1099511628211ull; };
+    auto mf = [&mix] (float f)
+    {
+        std::uint32_t bits = 0;
+        static_assert (sizeof (bits) == sizeof (f), "float must be 32-bit");
+        std::memcpy (&bits, &f, sizeof (bits));
+        mix (bits);
+    };
+    mix ((std::uint32_t) selectedSlot);
+    mix ((std::uint32_t) patch.mode);
+    mf (patch.morph); mf (patch.glide); mf (patch.width);
+    mf (patch.bend); mf (patch.modWheel);
+    for (const auto& lfo : patch.lfo)
+    {
+        mf (lfo.rate); mf (lfo.amount); mix ((std::uint32_t) lfo.dest); mix ((std::uint32_t) lfo.shape);
+    }
+    for (const auto& route : patch.routes)
+    {
+        mix ((std::uint32_t) route.source); mix ((std::uint32_t) route.dest); mf (route.amount);
+    }
+    for (const auto& slot : patch.slots)
+    {
+        mix (slot.on ? 1u : 0u);
+        if (! slot.on) continue;
+        mix ((std::uint32_t) slot.type); mix ((std::uint32_t) slot.filterType);
+        mix ((std::uint32_t) slot.params.table);
+        for (float v : slot.params.p) mf (v);
+        mf (slot.params.level); mf (slot.params.pan); mf (slot.params.tuneSemis); mf (slot.params.detune);
+        mf (slot.attack); mf (slot.decay); mf (slot.sustain); mf (slot.release); mf (slot.tail);
+        mf (slot.cutoff); mf (slot.res); mix ((std::uint32_t) slot.loNote); mix ((std::uint32_t) slot.hiNote);
+    }
+    return h;
+}
 
 //============================================================================
 // Конструктор редактора.
@@ -1068,6 +1335,7 @@ OrogenEditor::OrogenEditor (OrogenProcessor& p)
 OrogenEditor::~OrogenEditor()
 {
     stopTimer();
+    previewWorker.reset();                  // ждём воркер до уничтожения редактора
     setLookAndFeel (nullptr);
 }
 
@@ -1529,125 +1797,38 @@ void OrogenEditor::setAnimationPhase (double seconds)
 
 void OrogenEditor::rebuildPreview (bool force)
 {
-    // Подпись из всего, что меняет форму: слот, движок, контент, макросы, тюн.
-    const auto pre = slotPrefix (selectedSlot);
-    const juce::String sig = pre
-        + "|" + juce::String (pi (pre + "type"))
-        + "|" + juce::String (pi (pre + "table"))
-        + "|" + juce::String (pv (pre + "p0"), 3) + "|" + juce::String (pv (pre + "p1"), 3)
-        + "|" + juce::String (pv (pre + "p2"), 3) + "|" + juce::String (pv (pre + "p3"), 3)
-        + "|" + juce::String (pv (pre + "tune"), 2)
-        + "|" + juce::String (pv (pre + "cutoff"), 3) + "|" + juce::String (pv (pre + "res"), 3)
-        + "|" + juce::String (pi (pre + "filter"))
-        + "|mode" + juce::String (pi ("gl_mode"))
-        + "|morph" + juce::String (pv ("gl_morph"), 3);
-
-    // Та же подпись — тот же звук: перерисовывать нечего. Раньше force=true
-    // (смена слота) гонял движок повторно, и у грануляра второе окно попадало
-    // в паузу между зёрнами — дисплей пустел.
-    // Та же подпись — не пересобираем вообще (даже если превью пустое: иначе
-    // «тихий» движок заставлял бы пересоздавать инструмент на каждом тике).
-    const double sincePrev = juce::Time::getMillisecondCounterHiRes() - prevStampMs;
-    if (sig == prevSig) return;
-    // Троттлинг 40 мс < периода таймера (50 мс при 20 Гц), иначе часть тиков
-    // пропускала пересборку и дисплей отставал от параметра на кадр — из-за
-    // этого тест «смена движка видна» плавал (1783 пикселя вместо 20 000).
-    if (! force && sincePrev < 40.0) return;
-    prevSig = sig;
-    prevStampMs = juce::Time::getMillisecondCounterHiRes();
-
-    // Патч: только выбранный слот, чистая форма без фильтра и эффектов
-    // Режим патча входит в превью: в Morph слышно смесь соседних слотов, в
-    // Split — только свою зону клавиш. Раньше превью всегда собиралось как
-    // Stack из одного слота, и для Morph-пресета картинка врала.
-    const int patchMode = juce::jlimit (0, 2, pi ("gl_mode"));
-    const float morphPos = pv ("gl_morph");
-
     Patch patch;
-    patch.mode = (PatchMode) patchMode;
-    patch.morph = morphPos;
-    patch.slots[(size_t) selectedSlot].on = true;
-    for (int i = 0; i < kNumSlots; ++i)
-        if (i != selectedSlot) patch.slots[(size_t) i].on = (patchMode != 0);   // Stack — только слот
+    FxChain::Settings unusedFx;
+    proc.collectPatch (patch, unusedFx);             // те же параметры, что у процессора
 
-    SlotPatch& sl = patch.slots[(size_t) selectedSlot];
-    sl.type   = (EngineType) juce::jlimit (0, 8, pi (pre + "type"));
-    sl.params.table = pi (pre + "table");
-    sl.params.p[0] = pv (pre + "p0");
-    sl.params.p[1] = pv (pre + "p1");
-    sl.params.p[2] = pv (pre + "p2");
-    sl.params.p[3] = pv (pre + "p3");
-    sl.params.tuneSemis = pv (pre + "tune");
-    sl.params.level = 1.0f;
-    // Фильтр слота входит в превью: на дисплее должно быть видно то, что
-    // слышно, а не «сырой» движок. 16 моделей при низкой отсечке дают
-    // заметно разные формы.
-    sl.cutoff = pv (pre + "cutoff");
-    sl.res = pv (pre + "res");
-    sl.filterType = juce::jlimit (0, 15, pi (pre + "filter"));
-    sl.loNote = 0;
-    sl.hiNote = 127;
+    // В Stack редактор остаётся осциллографом выбранного слота; в Morph и Split
+    // показываем реальный микс включённых слотов на ноте C4, с их настройками.
+    if (patch.mode == PatchMode::Stack)
+        for (int i = 0; i < kNumSlots; ++i)
+            if (i != selectedSlot) patch.slots[(size_t) i].on = false;
 
-    // Одна попытка: прогрев, полсекунды звука, из них — самое громкое окно.
-    // Грануляр при малой плотности выдаёт зёрна пачками (в замере бывают паузы
-    // по 200 мс), фиксированное окно попадало в тишину — берём громкое.
-    auto attempt = [&patch] (std::unique_ptr<Instrument>& ins)
-    {
-        if (ins == nullptr)
-        {
-            ins = std::make_unique<Instrument>();
-            ins->prepare (48000.0, 1);
-        }
-        ins->stagePatch (patch);
-        ins->setFx (FxChain::Settings());            // сухой сигнал
-        ins->noteOff (60);
-        ins->noteOn (60, 1.0f);
+    const auto hash = previewPatchHash (patch, selectedSlot);
+    if (prevHashValid && hash == prevHash) return;
+    const double now = juce::Time::getMillisecondCounterHiRes();
+    if (! force && now - prevStampMs < 40.0) return;
 
-        constexpr int kWarmup = 4096;
-        for (int i = 0; i < kWarmup; ++i) { float l = 0.0f, r = 0.0f; ins->render (l, r); }
+    if (previewWorker == nullptr) previewWorker = std::make_unique<PreviewWorker>();
+    prevHash = hash;
+    prevHashValid = true;
+    prevStampMs = now;
+    prevPending = true;
+    previewWorker->submit (patch, ++prevGeneration);
+    repaint (R (248.0f, 66.0f, 736.0f, 214.0f));
+}
 
-        constexpr int kScan = 24000;                 // 0.5 с
-        constexpr int kCapture = 4096;
-        std::vector<float> scan ((size_t) kScan, 0.0f);
-        for (int i = 0; i < kScan; ++i)
-        {
-            float l = 0.0f, r = 0.0f;
-            ins->render (l, r);
-            scan[(size_t) i] = l;
-        }
-
-        size_t bestStart = 0;
-        double bestEnergy = -1.0;
-        for (int st = 0; st + kCapture <= kScan; st += 512)
-        {
-            double e = 0.0;
-            for (int i = 0; i < kCapture; ++i) e += (double) scan[(size_t) (st + i)] * scan[(size_t) (st + i)];
-            if (e > bestEnergy) { bestEnergy = e; bestStart = (size_t) st; }
-        }
-
-        std::vector<float> w (scan.begin() + (long) bestStart,
-                              scan.begin() + (long) bestStart + kCapture);
-        double mean = 0.0;
-        for (const auto v : w) mean += v;
-        mean /= (double) w.size();
-        for (auto& v : w) v -= (float) mean;
-
-        float pk = 0.0f;
-        for (const auto v : w) pk = juce::jmax (pk, std::abs (v));
-        if (pk > 1.0e-6f) for (auto& v : w) v /= pk;
-        return std::pair<std::vector<float>, float> { std::move (w), pk };
-    };
-
-    auto result = attempt (prevIns);
-    if (result.second <= 1.0e-5f)
-        result = attempt (prevIns);      // вторая попытка на том же инструменте:
-                                         // пересоздание тянуло пересбор банка (секунды)
-
-    prevWave = (result.second > 1.0e-5f) ? std::move (result.first) : std::vector<float>();
-
-    // Готовая форма для рисования: по колонке на пиксель при ширине 736,
-    // вертикальный отрезок min…max. Один Path стоит 0.2 мс вместо 8 мс на
-    // 736 отдельных drawVerticalLine — кадр снова укладывается в бюджет.
+void OrogenEditor::takePreviewResult()
+{
+    if (previewWorker == nullptr) return;
+    PreviewWorker::Result result;
+    if (! previewWorker->take (result) || result.generation != prevGeneration) return;
+    prevPending = false;
+    prevRenderMs = result.renderMs;
+    prevWave = std::move (result.wave);
     prevPath.clear();
     if (! prevWave.empty())
     {
@@ -1659,15 +1840,33 @@ void OrogenEditor::rebuildPreview (bool force)
             size_t i1 = (size_t) ((double) (c + 1) / kCols * (double) count);
             if (i1 <= i0) i1 = i0 + 1;
             if (i1 > count) i1 = count;
-
-            float mn = 0.0f, mx = 0.0f;
-            for (size_t i = i0; i < i1; ++i) { mn = juce::jmin (mn, prevWave[i]); mx = juce::jmax (mx, prevWave[i]); }
-
+            // Настоящий min/max, а не min/max относительно нуля: иначе
+            // каждая положительная колонка ошибочно тянется до оси.
+            float mn = prevWave[i0], mx = prevWave[i0];
+            for (size_t i = i0 + 1; i < i1; ++i) { mn = juce::jmin (mn, prevWave[i]); mx = juce::jmax (mx, prevWave[i]); }
             const float x = ((float) c + 0.5f) / (float) kCols;
             prevPath.startNewSubPath (x, juce::jlimit (-1.2f, 1.2f, mx));
             prevPath.lineTo (x, juce::jlimit (-1.2f, 1.2f, mn));
         }
     }
+    // Таймер раньше менял только кэш, но не помечал дисплей как грязный:
+    // paintEntireComponent в тесте это скрывал, а в настоящем окне рисунок
+    // мог оставаться прежним до постороннего repaint.
+    repaint (R (248.0f, 66.0f, 736.0f, 214.0f));
+}
+
+bool OrogenEditor::waitForPreview (int timeoutMs)
+{
+    // Только для offline-рендера и тестов, никогда не вызывается GUI-кодом.
+    const double deadline = juce::Time::getMillisecondCounterHiRes() + juce::jmax (0, timeoutMs);
+    do
+    {
+        takePreviewResult();
+        if (! prevPending) return true;
+        juce::Thread::sleep (2);
+    } while (juce::Time::getMillisecondCounterHiRes() < deadline);
+    takePreviewResult();
+    return ! prevPending;
 }
 
 void OrogenEditor::repaintAnimated()
@@ -1699,6 +1898,11 @@ int OrogenEditor::animatedAreaPercent() const
 void OrogenEditor::setAnimationsEnabled (bool on)
 {
     animOn = on;
+    if (! on) chipTransition = 0.0f;
+    for (auto* knob : centreKnobs) knob->slider.setAnimationsEnabled (on);
+    for (auto* knob : bottomKnobs) knob->slider.setAnimationsEnabled (on);
+    for (auto* c : columns) c->setAnimationsEnabled (on);
+    if (paramsPage != nullptr) paramsPage->setAnimationsEnabled (on);
     const float v = on ? (float) animSeconds : 0.0f;
     for (auto* c : columns) c->setAnimPhase (v);
     if (vectorPad != nullptr) vectorPad->setAnimPhase (v);
@@ -1730,6 +1934,8 @@ void OrogenEditor::timerCallback()
         if (vectorPad != nullptr) vectorPad->setAnimPhase ((float) animSeconds);
         for (auto* b : sectionButtons) b->setAnimPhase ((float) animSeconds);
         for (auto* c : columns) c->tickTransition ((float) dt);   // плавное листание
+        if (paramsPage != nullptr) paramsPage->tickTransition ((float) dt);
+        chipTransition = juce::jmax (0.0f, chipTransition - (float) dt / 0.14f);
         repaintAnimated();                  // только живые зоны, не весь экран
     }
 
@@ -1745,8 +1951,10 @@ void OrogenEditor::timerCallback()
         if (std::abs (sm - slotLevels[(size_t) i]) > 0.2f) { slotLevels[(size_t) i] = sm; changed = true; }
     }
 
-    // превью движка для дисплея: пересобирается только когда меняется подпись
+    // Забираем только результат последней подписи; обновление области дисплея
+    // происходит отдельно от 14 % постоянно анимируемых зон.
     rebuildPreview (false);
+    takePreviewResult();
 
     // программа могла смениться извне (хост, MIDI program change) — держим
     // селектор в шапке синхронным с банком
@@ -1934,11 +2142,11 @@ void OrogenEditor::paintDisplay (juce::Graphics& g)
         if (! previewPath().isEmpty())
         {
             const auto tr = juce::AffineTransform::scale (inner.getWidth(),
-                                                          inner.getHeight() * 0.42f)
+                                                          -inner.getHeight() * 0.42f)
                                 .translated (inner.getX(), inner.getCentreY());
             auto scaled = previewPath();
             scaled.applyTransform (tr);
-            g.setColour (Palette::signal.withAlpha (0.85f));
+            g.setColour (Palette::signal.withAlpha (prevPending ? 0.28f : 0.85f));
             g.strokePath (scaled, juce::PathStrokeType (0.9f));
         }
     }
@@ -1970,14 +2178,17 @@ void OrogenEditor::paintDisplay (juce::Graphics& g)
     }
 
     {
-        static const char* modeNames[3] = { "STACK", "MORPH", "SPLIT" };
-        static const char* modeIds[3]   = { "", "", "" };
-        juce::ignoreUnused (modeIds);
+        static const char* modeNames[3] = { "STACK / SLOT", "MORPH / MIX", "SPLIT / MIX" };
         const int m = juce::jlimit (0, 2, pi ("gl_mode"));
         sub += "  ";
         sub += modeNames[m];
         if (m == 1) sub += " " + juce::String (juce::roundToInt (pv ("gl_morph") * 100.0f)) + "%";
+        sub += "  C4  NO FX";
     }
+
+    if (prevPending)
+        draw::caption (g, "updating", { (int) inner.getRight() - 100, (int) inner.getY() + 4, 96, 10 },
+                       Palette::textDim, 6.0f, juce::Justification::centredRight);
 
     draw::caption (g, sub, { (int) inner.getX(), (int) inner.getBottom() - 14, 460, 12 },
                    Palette::textFaint, 6.5f);
@@ -2177,6 +2388,8 @@ void OrogenEditor::paintCentreKnobs (juce::Graphics& g)
 void OrogenEditor::paintChips (juce::Graphics& g)
 {
     // чипы эффектов: по 5 на страницу, все 10 эффектов с ручкой доли
+    const bool fading = chipTransition > 0.0f;
+    if (fading) g.beginTransparencyLayer (1.0f - 0.35f * chipTransition * chipTransition);
     for (int i = 0; i < kChipsPerPage; ++i)
     {
         const int idx = chipPage * kChipsPerPage + i;
@@ -2223,6 +2436,8 @@ void OrogenEditor::paintChips (juce::Graphics& g)
             g.fillEllipse (x1 + 1.0f, y - 1.5f, 3.0f, 3.0f);
         }
     }
+
+    if (fading) g.endTransparencyLayer();
 
     // кнопка страниц чипов (та же логика, что у колонки FX CHAIN)
     if (chipPageCount() > 1)
@@ -2614,6 +2829,7 @@ bool OrogenEditor::clickMain (juce::Point<float> designPos)
     {
         const int n = chipPageCount();
         chipPage = n <= 1 ? 0 : (chipPage + 1) % n;
+        chipTransition = animOn && n > 1 ? 1.0f : 0.0f;
         repaint();
         return true;
     }
