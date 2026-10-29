@@ -7,6 +7,7 @@
 #include "PluginEditor.h"
 
 #include "UiParamMap.h"
+#include "EngineUi.h"
 #include "content/wavetable_bank.h"
 
 #include <cmath>
@@ -668,7 +669,7 @@ private:
 
 //============================================================================
 // Оверлей параметров: 5 вкладок из UiParamMap.h, в каждой — секции карточками.
-// Так у всех 294 параметров есть место в интерфейсе, а не плоский список.
+// Так у всех 298 параметров есть место в интерфейсе, а не плоский список.
 //============================================================================
 class OrogenEditor::ParamsPage : public juce::Component
 {
@@ -764,6 +765,7 @@ public:
     }
 
     int getSection() const { return currentSection; }
+    void refreshEngineLabels() { if (! contents.isEmpty()) contents[0]->refreshEngineLabels(); }
     auto* currentContent() const { return contents[currentTab]; }
     int sectionCount() const { return contents[currentTab] != nullptr ? contents[currentTab]->sectionCount() : 0; }
 
@@ -786,12 +788,21 @@ public:
         // второй ряд — секции текущей вкладки (ALL + по одной на секцию)
         auto secRow = r.removeFromTop (24);
         {
+            int naturalWidth = 0;
+            for (auto* b : sectionButtons)
+                naturalWidth += juce::jmax (56, b->getButtonText().length() * 8 + 22) + 5;
+            // Место справа для номера страницы; при узком окне ужимаем только
+            // второй ряд, чтобы все 13 секций FX оставались кликабельными.
+            const int available = juce::jmax (1, secRow.getWidth() - 150);
+            const float scale = juce::jmin (1.0f, (float) available / (float) juce::jmax (1, naturalWidth));
             int sx = 0;
             for (auto* b : sectionButtons)
             {
-                const int w = juce::jmax (56, b->getButtonText().length() * 8 + 22);
+                const int w = juce::jmax (1, juce::roundToInt (
+                    (float) juce::jmax (56, b->getButtonText().length() * 8 + 22) * scale));
+                const int gap = juce::jmax (2, juce::roundToInt (5.0f * scale));
                 b->setBounds (secRow.getX() + sx, secRow.getY(), w, 22);
-                sx += w + 5;
+                sx += w + gap;
             }
         }
 
@@ -822,7 +833,8 @@ public:
         draw::caption (g, currentSection < 0 ? juce::String ("all sections")
                                             : juce::String ("section ") + juce::String (currentSection + 1)
                                                   + " / " + juce::String (sectionCount()),
-                       { getWidth() - 300, 54, 280, 10 }, Palette::textFaint, 6.0f);
+                       { getWidth() - 160, 54, 140, 10 }, Palette::textFaint, 6.0f,
+                       juce::Justification::centredRight);
         g.setColour (Palette::text);
         g.setFont (orFont (10.5f, true));
         g.drawText (spaced (tabs[(size_t) currentTab].title),
@@ -888,7 +900,8 @@ private:
     public:
         struct Entry
         {
-            juce::String section, name;
+            juce::String section, name, id;
+            int slot = -1, macro = -1;
             juce::Component* ctl = nullptr;
             juce::Rectangle<int> captionRect, headerRect;
         };
@@ -912,6 +925,22 @@ private:
                     Entry e;
                     e.section = sec.title;
                     e.name = name;
+                    e.id = id;
+                    // sA_p0…sH_p3 и общий table показывают смысл для
+                    // движка именно ЭТОГО слота, не выбранного глобально.
+                    if (id.length() >= 5 && id[0] == 's' && id[1] >= 'A' && id[1] <= 'H' && id[2] == '_')
+                    {
+                        if (id.length() == 5 && id[3] == 'p' && id[4] >= '0' && id[4] <= '3')
+                        {
+                            e.slot = (int) (id[1] - 'A');
+                            e.macro = (int) (id[4] - '0');
+                        }
+                        else if (id.substring (3) == "table")
+                        {
+                            e.slot = (int) (id[1] - 'A');
+                            e.macro = -1; // выбор источника
+                        }
+                    }
 
                     if (auto* ch = dynamic_cast<juce::AudioParameterChoice*> (base))
                     {
@@ -942,8 +971,34 @@ private:
                         e.ctl = sl;
                     }
 
+                    if (e.ctl != nullptr) e.ctl->getProperties().set ("paramId", id);
                     entries.push_back (e);
                 }
+            }
+            refreshEngineLabels();
+        }
+
+        // Обновление затрагивает только подписи слотов, чей тип изменился,
+        // включая автоматизацию хоста при открытом оверлее.
+        void refreshEngineLabels()
+        {
+            std::array<bool, kNumSlots> changed {};
+            for (int s = 0; s < kNumSlots; ++s)
+            {
+                auto* value = proc.apvts.getRawParameterValue (slotPrefix (s) + "type");
+                const int type = value != nullptr ? juce::roundToInt (value->load()) : 0;
+                changed[(size_t) s] = type != engineTypes[(size_t) s];
+                engineTypes[(size_t) s] = type;
+            }
+            for (auto& e : entries)
+            {
+                if (e.slot < 0 || ! changed[(size_t) e.slot] || e.ctl == nullptr) continue;
+                const int type = engineTypes[(size_t) e.slot];
+                const juce::String label = e.name + "  ·  "
+                                         + (e.macro >= 0 ? engineMacroName (type, e.macro)
+                                                         : engineSourceControlName (type));
+                e.ctl->getProperties().set ("contextLabel", label);
+                repaint (e.captionRect);
             }
         }
 
@@ -1016,7 +1071,8 @@ private:
 
                 g.setColour (Palette::textFaint);
                 g.setFont (orFont (7.0f));
-                g.drawText (e.name, e.captionRect, juce::Justification::centredLeft, true);
+                const auto label = e.ctl->getProperties().getWithDefault ("contextLabel", e.name).toString();
+                g.drawText (label, e.captionRect, juce::Justification::centredLeft, true);
             }
         }
 
@@ -1050,6 +1106,7 @@ private:
 
         OrogenProcessor& proc;
         juce::String sectionFilter;          // пусто = показывать все секции
+        std::array<int, kNumSlots> engineTypes { -1, -1, -1, -1, -1, -1, -1, -1 };
         std::vector<Entry> entries;
         std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment>> comboAtts;
         std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>> sliderAtts;
@@ -1362,6 +1419,7 @@ void OrogenEditor::buildCentre()
     addAndMakeVisible (filterBox);
     engineBox.setTooltip ("Engine type of the selected slot (sA_type ... sH_type)");
     filterBox.setTooltip ("Filter model of the selected slot (sA_filter ... sH_filter)");
+    engineBox.onChange = [this] { refreshEngineContext(); };
 
     // три ручки центра: параметры зависят от слота → привязываются в selectSlot()
     for (int i = 0; i < 3; ++i)
@@ -1546,7 +1604,31 @@ void OrogenEditor::selectSlot (int slot)
     filterAtt = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (
         proc.apvts, slotId ("filter"), filterBox);
 
+    refreshEngineContext();
     repaint();
+}
+
+juce::String OrogenEditor::selectedMacroLabel (int macro) const
+{
+    return engineMacroName (pi (slotId ("type")), macro);
+}
+
+void OrogenEditor::refreshEngineContext()
+{
+    const int type = pi (slotId ("type"));
+    if (contextSlot != selectedSlot || contextEngine != type)
+    {
+        contextSlot = selectedSlot;
+        contextEngine = type;
+        if (centreKnobs.size() > 1 && centreBars.size() > 1)
+        {
+            centreKnobs[1]->slider.setTooltip ("P1: " + selectedMacroLabel (0));
+            centreBars[1]->slider.setTooltip ("P2: " + selectedMacroLabel (1));
+        }
+        repaint (R (448.0f, 558.0f, 160.0f, 30.0f));
+        repaint (R (568.0f, 88.0f, 280.0f, 24.0f));
+    }
+    if (paramsPage != nullptr) paramsPage->refreshEngineLabels();
 }
 
 void OrogenEditor::setSection (int index)
@@ -1951,6 +2033,10 @@ void OrogenEditor::timerCallback()
         if (std::abs (sm - slotLevels[(size_t) i]) > 0.2f) { slotLevels[(size_t) i] = sm; changed = true; }
     }
 
+    // Имена макросов реагируют и на выбор мышью, и на автоматизацию хоста,
+    // в том числе когда анимации отключены.
+    refreshEngineContext();
+
     // Забираем только результат последней подписи; обновление области дисплея
     // происходит отдельно от 14 % постоянно анимируемых зон.
     rebuildPreview (false);
@@ -2113,6 +2199,35 @@ void OrogenEditor::paintRail (juce::Graphics& g)
     }
 }
 
+juce::String OrogenEditor::selectedSourceLabel() const
+{
+    const int type = pi (slotId ("type"));
+    const int table = juce::jlimit (0, 7, pi (slotId ("table")));
+    if (type == (int) EngineType::Wavetable)
+    {
+        const auto& bank = waveStore().get();
+        if (table < (int) bank.tables.size())
+            return juce::String (bank.tables[(size_t) table].name.c_str()).toUpperCase()
+                 + " " + juce::String (table + 1) + "/" + juce::String ((int) bank.tables.size());
+    }
+    if (type == (int) EngineType::Sample || type == (int) EngineType::Granular
+        || type == (int) EngineType::Resynth || type == (int) EngineType::Organics)
+        return juce::String (oneShotName ((OneShotKind) table)).toUpperCase()
+             + " " + juce::String (table + 1) + "/8";
+    if (type == (int) EngineType::Modal)
+        return "MODEL " + juce::String (table + 1) + "/8";
+    if (type == (int) EngineType::Chop)
+    {
+        const int n = (int) LoopKind::Count;
+        const int index = juce::jlimit (0, n - 1, table);
+        return juce::String (loopName ((LoopKind) index)).toUpperCase()
+             + " " + juce::String (index + 1) + "/" + juce::String (n)
+             + (table != index ? " MAX" : "");
+    }
+    // FM и Harmonic не читают table — не рисуем вымышленный банк 1/8.
+    return "NO TABLE";
+}
+
 // ------- отрисовка: дисплей формы волны -------------------------------------
 void OrogenEditor::paintDisplay (juce::Graphics& g)
 {
@@ -2131,7 +2246,6 @@ void OrogenEditor::paintDisplay (juce::Graphics& g)
     g.drawHorizontalLine ((int) inner.getCentreY(), inner.getX(), inner.getRight());
 
     const int type = pi (slotId ("type"));
-    const int table = juce::jlimit (0, 7, pi (slotId ("table")));
 
     // --- форма волны ЭТОГО движка: рендерится из DSP (rebuildPreview) ---
     const auto& wave = previewWave();
@@ -2155,6 +2269,8 @@ void OrogenEditor::paintDisplay (juce::Graphics& g)
                    Palette::textFaint, 6.0f);
     draw::caption (g, "filter", { (int) area.getX() + 190, (int) area.getY() + 18, 100, 10 },
                    Palette::textFaint, 6.0f);
+    draw::caption (g, "drag x: " + selectedMacroLabel (0) + " / y: " + selectedMacroLabel (1),
+                   { 578, 96, 258, 10 }, Palette::textFaint, 5.8f);
 
     // подпись: движок + контент (для вейвтейбла — имя таблицы)
     juce::String sub = juce::String (engineName (type)).toUpperCase();
@@ -2165,17 +2281,7 @@ void OrogenEditor::paintDisplay (juce::Graphics& g)
         const int f = juce::jlimit (0, juce::jmax (0, items.size() - 1), pi (slotId ("filter")));
         if (items.size() > f) sub += items[f] + "  ";
     }
-    if (type == (int) EngineType::Wavetable)
-    {
-        const auto& bank = waveStore().get();
-        if (table < (int) bank.tables.size())
-            sub += juce::String (bank.tables[(size_t) table].name.c_str()).toUpperCase()
-                 + "  " + juce::String (table + 1) + "/" + juce::String ((int) bank.tables.size());
-    }
-    else
-    {
-        sub += "TABLE " + juce::String (table + 1) + "/8";
-    }
+    sub += selectedSourceLabel();
 
     {
         static const char* modeNames[3] = { "STACK / SLOT", "MORPH / MIX", "SPLIT / MIX" };
@@ -2363,14 +2469,15 @@ void OrogenEditor::paintModEditor (juce::Graphics& g)
 // ------- отрисовка: три ручки центра ---------------------------------------
 void OrogenEditor::paintCentreKnobs (juce::Graphics& g)
 {
-    struct L { const char* name; const char* bar; };
-    static const L labels[3] = { { "CUTOFF", "RESO" }, { "SHAPE", "P2" }, { "LEVEL", "DETUNE" } };
-
     for (int i = 0; i < 3; ++i)
     {
         const float gx = 262.0f + 200.0f * (float) i;
+        const juce::String knobLabel = i == 0 ? juce::String ("CUTOFF")
+                                      : i == 1 ? selectedMacroLabel (0) : juce::String ("LEVEL");
+        const juce::String barLabel = i == 0 ? juce::String ("RESO")
+                                     : i == 1 ? selectedMacroLabel (1) : juce::String ("DETUNE");
 
-        draw::caption (g, labels[i].name, { (int) gx, 570, 96, 12 }, Palette::textDim, 7.5f,
+        draw::caption (g, knobLabel, { (int) gx, 570, 96, 12 }, Palette::textDim, 7.5f,
                        juce::Justification::centred);
 
         g.setColour (Palette::text);
@@ -2379,7 +2486,7 @@ void OrogenEditor::paintCentreKnobs (juce::Graphics& g)
                     juce::Rectangle<int> ((int) gx + 112, 520, 84, 14),
                     juce::Justification::centredLeft, false);
 
-        draw::caption (g, labels[i].bar, { (int) (gx + 92), 570, 44, 12 }, Palette::textFaint, 6.0f,
+        draw::caption (g, barLabel, { (int) (gx + 92), 570, 44, 12 }, Palette::textFaint, 6.0f,
                        juce::Justification::centredLeft);
     }
 }

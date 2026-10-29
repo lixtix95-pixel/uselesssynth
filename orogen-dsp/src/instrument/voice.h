@@ -102,9 +102,16 @@ public:
             slotType[(size_t) i] = pendingType[(size_t) i];
             env[(size_t) i].reset();
             slotRunning[(size_t) i] = false;
+            slotStarted[(size_t) i] = false;
+            tailLeft[(size_t) i] = 0.0f;
+            lastAmp[(size_t) i] = 0.0f;
             lastParams[(size_t) i] = EngineParams();
             lastParamsValid[(size_t) i] = false;
         }
+        // Активный голос не должен умереть в первые 1…127 отсчётов до
+        // очередного control tick: новый движок стартует на текущей ноте
+        // сразу, без повторного MIDI Note On. Отпущенные голоса не рестартуют.
+        controlCounter = 0;
     }
 
     void setSampleRate (double sr)

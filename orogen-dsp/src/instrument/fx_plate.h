@@ -79,6 +79,7 @@ public:
         decayCur = decayTarget; tankDiffCur = tankDiffTarget;
         inDiff1Cur = inDiff1Target; inDiff2Cur = inDiff2Target;
         dampCur = dampTarget; preFiltCur = preFiltTarget; preDelayCur = preDelayTarget;
+        outTrimCur = outTrimTarget;
 
         smoothCoef = 1.0 - std::exp (-1.0 / (0.008 * sr));
         dcCoef = (float) std::exp (-2.0 * (float) kPi * 20.0f / (float) sr);
@@ -90,7 +91,7 @@ public:
     void setDecay (float d)      { decayTarget   = clamp (d, 0.0f, 1.0f); }
     void setDamping (float d)    { dampTarget    = clamp (d, 0.0f, 1.0f); }
     void setPreFilter (float f)  { preFiltTarget = clamp (f, 0.0f, 1.0f); }
-    void setPreDelay (float sec) { preDelayTarget = clamp (sec, 0.0f, 0.1f); }
+    void setPreDelay (float sec) { preDelayTarget = clamp (sec, 0.0f, 0.2f); }
     // Ручек диффузии в референсе три и они независимы:
     //   inputDiffusion1 (диффузоры 1-2), inputDiffusion2 (диффузоры 3-4),
     //   decayDiffusion1 (всепропускающие звенья внутри бака).
@@ -107,8 +108,9 @@ public:
         applyPreDelay();
         preDelayApplied = preDelayCur;
     }
-    // 1.0 — как в референсе (сумма семи съёмов), 0.6 — рабочий уровень в цепочке
-    void setOutputTrim (float t) { outTrim = clamp (t, 0.05f, 2.0f); }
+    // 1.0 — как в референсе; 0.6 — прежний уровень в цепочке. Сглаживаем,
+    // поскольку теперь выходной трим доступен автоматизации хоста.
+    void setOutputTrim (float t) { outTrimTarget = clamp (t, 0.0f, 2.0f); }
 
     // DC-блокер 20 Гц — наше добавление (в референсе его нет). Для посэмпловой
     // сверки с оригиналом отключается, в цепочке всегда включён.
@@ -171,7 +173,7 @@ public:
     }
 
 private:
-    static constexpr int kMaxPreDelaySamples = 4800;   // 100 мс при 48 кГц
+    static constexpr int kMaxPreDelaySamples = 9600;   // 200 мс при 48 кГц, как у параметра хоста
 
     int scaled (int samples48k) const
     {
@@ -233,7 +235,7 @@ private:
         a -= preDamp[0].read (3, t);
         a -= decayDiff2[0].read (1, t);
         a += postDamp[0].read (1, t);
-        return a * outTrim;                 // семь съёмов суммируются — нужен трим
+        return a * outTrimCur;              // семь съёмов суммируются — нужен трим
     }
 
     // DattorroVerb_getRight: preDampingDelay[0] OUT1+OUT2, −decayDiffusion2[0] OUT2,
@@ -248,7 +250,7 @@ private:
         a -= preDamp[1].read (3, t);
         a -= decayDiff2[1].read (1, t);
         a += postDamp[1].read (1, t);
-        return a * outTrim;
+        return a * outTrimCur;
     }
 
     void applyPreDelay()
@@ -270,6 +272,7 @@ private:
         step (dampCur, targetFromNorm (dampTarget));
         step (preFiltCur, targetFromNorm (preFiltTarget));
         step (preDelayCur, preDelayTarget);
+        step (outTrimCur, outTrimTarget);
 
         diff2TankCur = clamp (decayCur + 0.15, 0.25, 0.50);  // decayDiffusion2Amount в референсе
 
@@ -303,6 +306,7 @@ private:
         diff2TankCur = clamp (decayCur + 0.15, 0.25, 0.50);
         preDelayCur = preDelayTarget;
         preDelayApplied = preDelayCur;
+        outTrimCur = outTrimTarget;
     }
 
     DelayLine preDelay, inDiff[4], decayDiff1[2], preDamp[2], decayDiff2[2], postDamp[2];
@@ -317,7 +321,7 @@ private:
     float tankDiffTarget = 0.70f, preDelayTarget = 0.01f;
     float inDiff1Target = 0.75f, inDiff2Target = 0.625f;
     float mix = 0.0f;
-    double outTrim = 0.6;
+    double outTrimCur = 0.6, outTrimTarget = 0.6;
     bool dcOn = true;
     float dcCoef = 0.997f, dcX1L = 0.0f, dcY1L = 0.0f, dcX1R = 0.0f, dcY1R = 0.0f;
     double sr = 48000.0, scale = 1.0;

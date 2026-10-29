@@ -169,7 +169,7 @@ echo.
 
 rem The window closes immediately only when started from an already open console.
 rem On a double click we wait for Enter, so the bundle path stays readable.
-if "%DOUBLECLICK%"=="1" if not defined OROGEN_NO_PAUSE (
+if "%DOUBLECLICK%"=="1" if not "%OROGEN_NO_PAUSE%"=="1" (
     echo Press any key to close...
     pause >nul
 )
@@ -195,7 +195,7 @@ echo.
 echo  How to retry:
 echo    build_vst3.bat %CONFIG%
 echo.
-if not defined OROGEN_NO_PAUSE (
+if not "%OROGEN_NO_PAUSE%"=="1" (
     echo  The window stays open. Press any key to close ^(or set OROGEN_NO_PAUSE=1^)...
     pause >nul
 )

@@ -133,6 +133,9 @@ public:
     }
 
 private:
+    // Тестовый пробник читает фактические границы активных зёрен без участия
+    // в аудиопотоке и без изменения алгоритма.
+    friend struct GranularTestProbe;
     struct Grain
     {
         MipReader mip;
@@ -160,7 +163,9 @@ private:
         const float maxSpan = 0.5f * ((float) lenOrig - 128.0f);
         const float want = size * (float) sampleRate;
         g->dur = std::max (16.0f, std::min (want, maxSpan / rate));
-        const float span = g->dur * g->rate;      // сколько исходных отсчётов съест зерно
+        // Используем скорость именно нового зерна: g->rate здесь ещё содержит
+        // скорость предыдущего зерна в переиспользованной ячейке (или 1.0).
+        const float span = g->dur * rate;
 
         // Позиция старта: базовый Scan + джиттер.
         //

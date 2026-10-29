@@ -73,10 +73,13 @@ enum FxIdx
     FxCombEnvelope, FxCombFreqA, FxCombFreqB, FxCombResA, FxCombResB,
     FxCombBalance, FxCombDelayMs, FxCombFeedback, FxCombHighpass, FxCombTune,
     FxRobinMix, FxRobinSemis, FxRobinSize, FxRobinSpread,
+    FxPlatePreFilter, FxPlateInputDiff1, FxPlateInputDiff2, FxPlateOutput,
     kFxCount
 };
 
-static_assert ((int) kFxCount == 66, "fxParamTable() и enum FxIdx разъехались");
+static_assert ((int) FxPlatePreFilter == kOriginalFxParamCount, "старый порядок FX нарушен");
+static_assert ((int) kFxCount == kOriginalFxParamCount + kAddedPlateParamCount,
+               "fxParamTable() и enum FxIdx разъехались");
 
 
 void OrogenProcessor::cachePointers()
@@ -352,6 +355,10 @@ void OrogenProcessor::collectPatch (Patch& p, FxChain::Settings& fx) const noexc
     fx.plateDamp         = X (FxPlateDamp);
     fx.plateDiffusion    = X (FxPlateDiffusion);
     fx.platePredelay     = X (FxPlatePredelay);
+    fx.platePreFilter    = X (FxPlatePreFilter);
+    fx.plateInputDiff1   = X (FxPlateInputDiff1);
+    fx.plateInputDiff2   = X (FxPlateInputDiff2);
+    fx.plateOutput       = X (FxPlateOutput);
     fx.eqLow             = X (FxEqLow);
     fx.eqHigh            = X (FxEqHigh);
     fx.compThreshold     = X (FxCompThreshold);
@@ -487,6 +494,9 @@ void OrogenProcessor::applyToParams (const Patch& p, const FxChain::Settings& fx
     put ("plateMix", fx.plateMix);           put ("plateDecay", fx.plateDecay);
     put ("plateDamp", fx.plateDamp);         put ("plateDiffusion", fx.plateDiffusion);
     put ("platePredelay", fx.platePredelay);
+    put ("platePreFilter", fx.platePreFilter);
+    put ("plateInputDiff1", fx.plateInputDiff1); put ("plateInputDiff2", fx.plateInputDiff2);
+    put ("plateOutput", fx.plateOutput);
     put ("eqLow", fx.eqLow);                 put ("eqHigh", fx.eqHigh);
     put ("compThreshold", fx.compThreshold); put ("compRatio", fx.compRatio);
     put ("compMakeup", fx.compMakeup);       put ("width", fx.width);
@@ -779,6 +789,23 @@ void OrogenProcessor::setStateInformation (const void* data, int sizeInBytes)
     if (xml == nullptr) return;
     auto state = juce::ValueTree::fromXml (*xml);
     if (! state.isValid()) return;
+
+    // В состояниях до этих четырёх параметров записи отсутствуют. JUCE при
+    // replaceState иначе сохраняет ТЕКУЩЕЕ значение отсутствующего параметра,
+    // а не его default. Старый проект должен звучать как раньше даже при
+    // загрузке поверх уже отредактированного экземпляра.
+    for (const char* id : { "fx_platePreFilter", "fx_plateInputDiff1",
+                            "fx_plateInputDiff2", "fx_plateOutput" })
+    {
+        if (state.getChildWithProperty ("id", id).isValid()) continue;
+        if (auto* parameter = apvts.getParameter (id))
+        {
+            juce::ValueTree entry ("PARAM");
+            entry.setProperty ("id", id, nullptr);
+            entry.setProperty ("value", parameter->convertFrom0to1 (parameter->getDefaultValue()), nullptr);
+            state.appendChild (entry, nullptr);
+        }
+    }
 
     apvts.replaceState (state);
     collectPatch (patch, fxSettings);

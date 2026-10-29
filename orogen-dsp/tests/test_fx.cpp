@@ -307,6 +307,122 @@ int main()
         check (std::fabs (dc / (kSr * 120)) < 1e-3, "нет постоянной составляющей", num (dc / (kSr * 120), 5));
     }
 
+    // Старый DSP ограничивал pre-delay 100 мс, хотя параметр хоста объявлен
+    // до 200 мс. Меряем настоящий первый ненулевой wet-отсчёт, а не значение
+    // параметра или разницу полной картинки/сигнала с сухим путём.
+    std::printf ("\n--- Plate: реальный диапазон pre-delay 0…200 мс ---\n");
+    {
+        bool timingOk = true;
+        for (double sr : { 44100.0, 48000.0, 96000.0 })
+        {
+            int first[3] {};
+            int j = 0;
+            for (float delay : { 0.10f, 0.15f, 0.20f })
+            {
+                PlateReverb pl;
+                pl.prepare (sr);
+                pl.setDcBlocker (false);
+                pl.setMix (1.0f);
+                pl.setPreDelay (delay);
+                pl.snapParams();
+                const auto ir = impulseResponse (pl, (int) (sr * 0.40));
+                first[j] = -1;
+                for (int i = 0; i < (int) ir.size(); ++i)
+                    if (std::fabs (ir[(size_t) i]) > 1.0e-8f) { first[j] = i; break; }
+                ++j;
+            }
+            const int expected = (int) std::lround (0.05 * sr);
+            const int d1 = first[1] - first[0], d2 = first[2] - first[1];
+            std::printf ("   %.0f Гц: первый wet %d / %d / %d, интервалы %d / %d (ожидается %d)\n",
+                         sr, first[0], first[1], first[2], d1, d2, expected);
+            if (first[0] < 0 || std::abs (d1 - expected) > 3 || std::abs (d2 - expected) > 3)
+                timingOk = false;
+        }
+        check (timingOk, "pre-delay 100→150→200 мс реально сдвигает wet-ответ на 50 мс");
+    }
+
+    std::printf ("\n--- Plate: четыре новых регулятора через полную FxChain ---\n");
+    {
+        auto response = [] (const FxChain::Settings& settings)
+        {
+            FxChain chain;
+            chain.prepare (kSr);
+            chain.set (settings);
+            std::vector<float> output (96000);
+            for (int i = 0; i < (int) output.size(); ++i)
+            {
+                // даём 250 мс сглаживанию параметров до импульса
+                float l = i == 12000 ? 0.5f : 0.0f, r = l;
+                chain.process (l, r);
+                output[(size_t) i] = l;
+            }
+            return output;
+        };
+        FxChain::Settings base;
+        base.plateMix = 1.0f;
+        base.compRatio = 1.0f;
+        base.compMakeup = 0.0f;
+        const auto ref = response (base);
+        double refEnergy = 0.0;
+        for (float x : ref) refEnergy += (double) x * x;
+        const char* names[] = { "pre-filter", "input diffusion 1", "input diffusion 2", "output" };
+        for (int control = 0; control < 4; ++control)
+        {
+            FxChain::Settings varied = base;
+            if (control == 0) varied.platePreFilter = 0.10f;
+            if (control == 1) varied.plateInputDiff1 = 0.10f;
+            if (control == 2) varied.plateInputDiff2 = 0.10f;
+            if (control == 3) varied.plateOutput = 1.40f;
+            const auto out = response (varied);
+            double diffEnergy = 0.0;
+            int bad = 0;
+            for (size_t i = 0; i < out.size(); ++i)
+            {
+                if (! std::isfinite (out[i])) ++bad;
+                const double d = (double) out[i] - ref[i];
+                diffEnergy += d * d;
+            }
+            const double rel = std::sqrt (diffEnergy / std::max (1.0e-30, refEnergy));
+            std::printf ("   %-18s: относительная ΔRMS %.5f, NaN %d\n", names[control], rel, bad);
+            check (refEnergy > 1.0e-10 && rel > 0.01 && bad == 0,
+                   std::string ("FxChain: ") + names[control] + " меняет wet-отклик",
+                   num (rel, 5));
+        }
+        FxChain::Settings muted = base;
+        muted.plateOutput = 0.0f;
+        const auto zero = response (muted);
+        const double zeroRms = rms (zero);
+        check (zeroRms < 1.0e-9, "нулевой Plate Output действительно гасит wet при Mix 100%", num (zeroRms, 9));
+    }
+
+    {
+        PlateReverb a, b;
+        a.prepare (kSr); b.prepare (kSr);
+        a.setMix (1.0f); b.setMix (1.0f);
+        a.setDcBlocker (false); b.setDcBlocker (false);
+        a.snapParams(); b.snapParams();
+        double ratio[3] = { -1.0, -1.0, -1.0 };
+        const int at[3] = { 0, 383, 3839 };  // сразу, через 8 мс, через 80 мс
+        for (int i = 0; i <= 48000 + at[2]; ++i)
+        {
+            if (i == 48000) b.setOutputTrim (0.0f);
+            float l1 = 0.15f * std::sin (2.0 * kPi * 271.0 * i / kSr), r1 = l1;
+            float l2 = l1, r2 = r1;
+            a.process (l1, r1); b.process (l2, r2);
+            for (int k = 0; k < 3; ++k)
+                if (i == 48000 + at[k])
+                {
+                    const double energy = (double) l1 * l1 + (double) r1 * r1;
+                    if (energy > 1.0e-15) ratio[k] = ((double) l1 * l2 + (double) r1 * r2) / energy;
+                }
+        }
+        std::printf ("   автоматизация Output 0.6→0: коэффициент %.6f → %.6f за 8 мс → %.6f за 80 мс\n",
+                     ratio[0], ratio[1], ratio[2]);
+        check (ratio[0] > 0.995 && ratio[0] < 1.0 && ratio[1] > 0.36 && ratio[1] < 0.38
+               && ratio[2] >= 0.0 && ratio[2] < 0.001,
+               "автоматизация Plate Output сглажена, без мгновенного скачка");
+    }
+
     // ---------------------------------------------------------------- 5
     std::printf ("\n--- 5. WDF-сатурация против tanh: THD и интермодуляция ---\n");
     {

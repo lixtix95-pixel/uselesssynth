@@ -1,15 +1,18 @@
 # Лицензии
 
-Проект целиком распространяется на условиях **GNU GPL-3.0-or-later** (текст —
-`LICENSE`): в нём есть GPL-3.0 код из плагина MonoJuice 0.9.5 (COMB: адаптация
-Odin 2 и ParallelComb от Uhhyou). Автор плагина разрешил использовать его код,
-а продажа не планируется, поэтому GPL-совместимость — не проблема, но условия
-GPL всё равно действуют на весь бинарник и исходники.
+Исходники DSP-проекта предоставлены на условиях **GNU GPL-3.0-or-later**
+(текст — `LICENSE`), но некоторые включённые файлы обозначены **GPL-3.0-only**
+(в частности, ParallelComb). Сборка VST3 дополнительно использует JUCE 8,
+доступный по AGPL-3.0 либо по отдельной коммерческой лицензии. Лицензии
+компонентов и их авторство следует учитывать вместе; условия и тексты GPL,
+AGPL и JUCE поставляются с архивами. Код с GPL-3.0-only сохраняет собственные
+SPDX-метки и уведомления об авторстве.
 
 ## Сторонний код и его лицензии
 
 | компонент | путь | лицензия | правообладатель |
 |---|---|---|---|
+| JUCE 8.0.15 (VST3-обёртка) | FetchContent, https://github.com/juce-framework/JUCE | AGPL-3.0 или коммерческая | © Raw Material Software Limited |
 | Dattorro plate reverb | `third_party/dattorro-verb/` | MIT | © 2022 Pauli Pölkki |
 | WDF (схемная сатурация) | `third_party/chowdsp_wdf/` | BSD-3-Clause | © Jatin Chowdhury |
 | Odin 2 comb (перенос) | `third_party/monojuice/dsp/OdinComb.h` | **GPL-3.0-or-later** | © 2020-2021 TheWaveWarden |

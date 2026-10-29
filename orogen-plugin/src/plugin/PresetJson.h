@@ -174,6 +174,9 @@ inline juce::var fxToVar (const FxChain::Settings& s)
     put ("plateMix", s.plateMix);     put ("plateDecay", s.plateDecay);
     put ("plateDamp", s.plateDamp);   put ("plateDiffusion", s.plateDiffusion);
     put ("platePredelay", s.platePredelay);
+    put ("platePreFilter", s.platePreFilter);
+    put ("plateInputDiff1", s.plateInputDiff1); put ("plateInputDiff2", s.plateInputDiff2);
+    put ("plateOutput", s.plateOutput);
     put ("eqLow", s.eqLow);           put ("eqHigh", s.eqHigh);
     put ("compThreshold", s.compThreshold); put ("compRatio", s.compRatio);
     put ("compMakeup", s.compMakeup); put ("width", s.width);
@@ -237,6 +240,10 @@ inline void fxFromVar (const juce::var& v, FxChain::Settings& s)
     s.plateMix = f ("plateMix", s.plateMix);   s.plateDecay = f ("plateDecay", s.plateDecay);
     s.plateDamp = f ("plateDamp", s.plateDamp); s.plateDiffusion = f ("plateDiffusion", s.plateDiffusion);
     s.platePredelay = f ("platePredelay", s.platePredelay);
+    s.platePreFilter = f ("platePreFilter", s.platePreFilter);
+    s.plateInputDiff1 = f ("plateInputDiff1", s.plateInputDiff1);
+    s.plateInputDiff2 = f ("plateInputDiff2", s.plateInputDiff2);
+    s.plateOutput = f ("plateOutput", s.plateOutput);
     s.eqLow = f ("eqLow", s.eqLow);           s.eqHigh = f ("eqHigh", s.eqHigh);
     s.compThreshold = f ("compThreshold", s.compThreshold); s.compRatio = f ("compRatio", s.compRatio);
     s.compMakeup = f ("compMakeup", s.compMakeup); s.width = f ("width", s.width);

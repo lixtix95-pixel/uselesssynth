@@ -35,6 +35,8 @@ public:
     int paramsSectionCount() const;
     juce::String paramsSectionName (int index) const;
     juce::StringArray mainScreenParamIds() const;   // что привязано к карточкам главного экрана
+    juce::String selectedMacroLabel (int macro) const; // названия P1…P4 выбранного движка
+    juce::String selectedSourceLabel() const;           // фактически выбранный фабричный источник
     int fxColumnPageCount() const;                  // страниц в FX-колонке (для теста)
     void nextFxColumnPage();
     int  columnPageCount (int column) const;        // страниц в любой из 4 колонок
@@ -114,6 +116,7 @@ private:
     void buildColumns();
     void buildParamsPage();
     void selectSlot (int slot);
+    void refreshEngineContext();
     void setSection (int index);
     void toggleParamsPage (bool shouldShow);
     void showBankMenu();
@@ -157,6 +160,7 @@ private:
     std::unique_ptr<OrLookAndFeel> lnf;
 
     int selectedSlot = 0;
+    int contextSlot = -1, contextEngine = -1;
     int section = 0;                 // 0 FX · 1 MATRIX · 2 ARP · 3 LFO
     bool paramsOpen = false;
 

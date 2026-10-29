@@ -164,6 +164,23 @@ static int countBoundControls (juce::Component& root, const orogen::UiTab& tab)
     return found;
 }
 
+static juce::StringArray visibleBoundIds (juce::Component& root)
+{
+    juce::StringArray ids;
+    std::function<void (juce::Component&)> walk = [&] (juce::Component& c)
+    {
+        for (auto* child : c.getChildren())
+        {
+            if (! effectivelyVisible (*child, &root)) continue;
+            const auto id = child->getProperties().getWithDefault ("paramId", {}).toString();
+            if (id.isNotEmpty()) ids.add (id);
+            walk (*child);
+        }
+    };
+    walk (root);
+    return ids;
+}
+
 // Регрессия GUI: реальные слоты/зоны Morph, не только разница пикселей за
 // счёт надписей. Отдельный режим --gui-only даёт короткий прогон при отладке.
 static void testGuiRegressions()
@@ -511,6 +528,210 @@ static void testGuiRegressions()
     editor->showPage (200);
     check (viewport != nullptr && viewport->getAlpha() > 0.99f,
            "без анимаций оверлей сразу полностью виден");
+
+    std::printf ("\n--- 16. Контекстные макросы и Plate в настоящем GUI ---\n");
+    editor->keyPressed (juce::KeyPress (juce::KeyPress::escapeKey));
+    editor->showPage (1);  // слот B, A остаётся независимым
+    setP (p, "sA_type", 1.0f);
+    const char* expected[9][4] = {
+        { "POSITION", "WARP", "FOLD", "TILT" },
+        { "RATIO", "FM 1", "FM 2", "FEEDBACK" },
+        { "TILT", "SHAPE", "SPREAD", "MOTION" },
+        { "SCAN", "GRAIN", "TONE", "AIR" },
+        { "POSITION", "SIZE", "DENSITY", "SPREAD" },
+        { "BRIGHT", "DECAY", "HARDNESS", "NONLINEAR" },
+        { "STRETCH", "PITCH", "TILT", "DRIFT" },
+        { "BODY", "AIR", "DRIFT", "BLOOM" },
+        { "SLICE", "LENGTH", "REPEATS", "REVERSE" }
+    };
+    int correctLabels = 0;
+    for (int type = 0; type < 9; ++type)
+    {
+        setP (p, "sB_type", (float) type);
+        for (int macro = 0; macro < 4; ++macro)
+            if (editor->selectedMacroLabel (macro) == expected[type][macro]) ++correctLabels;
+    }
+    check (correctLabels == 36 && (int) p.apvts.getRawParameterValue ("sA_type")->load() == 1,
+           "контекстные подписи P1…P4 для всех 9 движков относятся к выбранному слоту",
+           juce::String (correctLabels) + " / 36");
+
+    setP (p, "sB_type", 1.0f);
+    const auto fmSource = editor->selectedSourceLabel();
+    setP (p, "sB_type", 4.0f); setP (p, "sB_table", 2.0f);
+    const auto granularSource = editor->selectedSourceLabel();
+    setP (p, "sB_type", 8.0f); setP (p, "sB_table", 7.0f);
+    const auto chopSource = editor->selectedSourceLabel();
+    std::printf ("   источник: FM=%s; Granular=%s; Chop=%s\n",
+                 fmSource.toRawUTF8(), granularSource.toRawUTF8(), chopSource.toRawUTF8());
+    check (fmSource == "NO TABLE" && granularSource.contains ("CHOIR AH 3/8")
+           && chopSource.contains ("DUB STABS 3/3 MAX"),
+           "источники в дисплее соответствуют фактическому банку движка");
+
+    setP (p, "sB_type", 4.0f);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil (120);
+    const auto granularImage = capture (*editor);
+    setP (p, "sB_type", 5.0f);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil (120);
+    const auto modalImage = capture (*editor);
+    const int captionDiff = diffRegion (granularImage, modalImage, { 462, 570, 96, 12 });
+    check (captionDiff > 10, "подпись центрального P1 действительно перерисована",
+           juce::String (captionDiff) + " px в области подписи");
+
+    // На ALL вкладки SLOT разные слоты одновременно показывают собственный
+    // смысл P1. Хостовая автоматизация B должна обновить только подпись B.
+    setP (p, "sA_type", 1.0f); setP (p, "sB_type", 4.0f);
+    editor->showPage (100);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil (120);
+    auto* aP1 = overlay != nullptr ? findSlider (*overlay, "sA_p0") : nullptr;
+    auto* bP1 = overlay != nullptr ? findSlider (*overlay, "sB_p0") : nullptr;
+    auto* aTable = overlay != nullptr ? findSlider (*overlay, "sA_table") : nullptr;
+    auto* bTable = overlay != nullptr ? findSlider (*overlay, "sB_table") : nullptr;
+    const auto labelOf = [] (juce::Slider* s)
+    {
+        return s != nullptr ? s->getProperties().getWithDefault ("contextLabel", "").toString()
+                            : juce::String();
+    };
+    const auto aLabel = labelOf (aP1), bLabel = labelOf (bP1);
+    const auto unusedTable = labelOf (aTable), sourceTable = labelOf (bTable);
+    setP (p, "sB_type", 5.0f);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil (120);
+    const auto modelTable = labelOf (bTable);
+    check (aLabel.contains ("RATIO") && bLabel.contains ("POSITION")
+           && labelOf (aP1).contains ("RATIO") && labelOf (bP1).contains ("BRIGHT"),
+           "подписи оверлея учитывают тип каждого слота и автоматизацию хоста");
+    setP (p, "sB_type", 8.0f);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil (120);
+    check (unusedTable.contains ("UNUSED") && sourceTable.contains ("SOURCE 0-7")
+           && modelTable.contains ("MODEL 0-7") && labelOf (bTable).contains ("LOOP 0-2"),
+           "общий Table в оверлее честно показывает реальную функцию или UNUSED");
+
+    // Все четыре новых параметра представлены живыми SliderAttachment.
+    const auto tabs = buildUiTabs();
+    int plateSection = -1;
+    for (int i = 0; i < (int) tabs[1].sections.size(); ++i)
+        if (tabs[1].sections[(size_t) i].title == "PLATE") plateSection = i;
+    if (plateSection >= 0) editor->showPage (301 + plateSection);
+    const char* ids[4] = { "fx_platePreFilter", "fx_plateInputDiff1", "fx_plateInputDiff2", "fx_plateOutput" };
+    const float values[4] = { 0.23f, 0.41f, 0.73f, 1.27f };
+    int visiblePlate = 0, updatedPlate = 0;
+    for (int i = 0; i < 4; ++i)
+    {
+        auto* slider = overlay != nullptr ? findSlider (*overlay, ids[i]) : nullptr;
+        if (slider != nullptr && effectivelyVisible (*slider, overlay))
+        {
+            ++visiblePlate;
+            slider->setValue (values[i], juce::sendNotificationSync);
+            auto* raw = p.apvts.getRawParameterValue (ids[i]);
+            if (raw != nullptr && std::fabs (raw->load() - values[i]) < 1.0e-4f) ++updatedPlate;
+        }
+    }
+    Patch afterGui; FxChain::Settings plateAfterGui;
+    p.collectPatch (afterGui, plateAfterGui);
+    check (visiblePlate == 4 && updatedPlate == 4
+           && std::fabs (plateAfterGui.platePreFilter - values[0]) < 1.0e-4f
+           && std::fabs (plateAfterGui.plateInputDiff1 - values[1]) < 1.0e-4f
+           && std::fabs (plateAfterGui.plateInputDiff2 - values[2]) < 1.0e-4f
+           && std::fabs (plateAfterGui.plateOutput - values[3]) < 1.0e-4f,
+           "четыре регулятора Plate в GUI меняют реальные настройки FX",
+           juce::String (visiblePlate) + "/4 видимы, " + juce::String (updatedPlate) + "/4 связаны");
+
+    editor->setSize (960, 600);     // минимальный поддерживаемый размер окна
+    editor->showPage (101);        // FX / ALL
+    int sectionBtns = 0, boundsErrors = 0, lastRight = 0;
+    juce::Button* robinButton = nullptr;
+    for (auto* child : overlay->getChildren())
+        if (auto* button = dynamic_cast<juce::Button*> (child))
+            if (button->isVisible() && button->getY() == 46)
+            {
+                ++sectionBtns;
+                if (button->getX() < lastRight || button->getRight() > overlay->getWidth() - 140) ++boundsErrors;
+                lastRight = button->getRight();
+                if (button->getButtonText() == "ROBIN") robinButton = button;
+            }
+    if (robinButton != nullptr) robinButton->triggerClick();
+    juce::MessageManager::getInstance()->runDispatchLoopUntil (80);
+    const auto narrowIds = visibleBoundIds (*overlay);
+    check (sectionBtns == 14 && boundsErrors == 0 && narrowIds.contains ("fx_robinMix"),
+           "в узком окне все 13 FX-секций помещаются и последняя открывается мышью",
+           juce::String (sectionBtns) + " кнопок, " + juce::String (boundsErrors) + " ошибок геометрии");
+    editor->setSize (1280, 800);
+
+    // Пользователь может менять ENGINE, пока MIDI-нота удерживается. Сравниваем
+    // с идентичным инстансом без переключения, НЕ посылая повторный Note On.
+    std::printf ("\n--- 17. Смена движка GUI на удержанной ноте ---\n");
+    editor->keyPressed (juce::KeyPress (juce::KeyPress::escapeKey));
+    editor->showPage (0);
+    OrogenProcessor unchanged;
+    for (auto* processor : { &p, &unchanged })
+    {
+        processor->setCurrentProgram (0);
+        processor->setPlayConfigDetails (0, 2, 48000.0, 512);
+        processor->prepareToPlay (48000.0, 512);
+        soloSlot (*processor, 0, 0);
+        setP (*processor, "gl_mode", 0.0f);
+        setP (*processor, "sA_sustain", 0.8f);
+        setP (*processor, "sA_tail", 0.0f);
+        for (const char* id : { "fx_drive", "fx_chorusMix", "fx_delayMix", "fx_reverbMix", "fx_plateMix",
+                                "fx_materialMix", "fx_spectreMix", "fx_glitchMix", "fx_robinMix", "fx_combMix" })
+            setP (*processor, id, 0.0f);
+    }
+    juce::MessageManager::getInstance()->runDispatchLoopUntil (120);
+    juce::ComboBox* selector = nullptr;
+    for (auto* child : editor->getChildren())
+        if (auto* box = dynamic_cast<juce::ComboBox*> (child))
+            if (box->isVisible() && box->getNumItems() == 9) { selector = box; break; }
+    juce::AudioBuffer<float> a (2, 512), b (2, 512);
+    juce::MidiBuffer noteOn, emptyMidi;
+    noteOn.addEvent (juce::MidiMessage::noteOn (1, 60, 0.8f), 0);
+    double beforeEnergy = 0.0;
+    float lastBefore = 0.0f;
+    for (int block = 0; block < 30; ++block)
+    {
+        auto& midi = block == 0 ? noteOn : emptyMidi;
+        p.processBlock (a, midi); unchanged.processBlock (b, midi);
+        if (block >= 20)
+            for (int i = 0; i < 512; ++i) beforeEnergy += (double) a.getSample (0, i) * a.getSample (0, i);
+        lastBefore = a.getSample (0, 511);
+    }
+    if (selector != nullptr) selector->setSelectedItemIndex (4, juce::sendNotificationSync);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil (120);
+    double afterEnergy = 0.0, diffEnergy = 0.0;
+    float firstAfter = 0.0f, prevA = lastBefore, prevB = lastBefore;
+    float maxStepA = 0.0f, maxStepB = 0.0f;
+    int maxStepAt = 0, badSwap = 0;
+    for (int block = 0; block < 60; ++block)
+    {
+        p.processBlock (a, emptyMidi); unchanged.processBlock (b, emptyMidi);
+        if (block == 0) firstAfter = a.getSample (0, 0);
+        for (int i = 0; i < 512; ++i)
+        {
+            const float x = a.getSample (0, i), y = b.getSample (0, i);
+            if (! std::isfinite (x) || ! std::isfinite (y)) ++badSwap;
+            if (block < 20)
+            {
+                if (std::fabs (x - prevA) > maxStepA) { maxStepA = std::fabs (x - prevA); maxStepAt = block * 512 + i; }
+                maxStepB = std::max (maxStepB, std::fabs (y - prevB));
+            }
+            prevA = x; prevB = y;
+            if (block >= 20)
+            {
+                afterEnergy += (double) x * x;
+                const double delta = (double) x - y;
+                diffEnergy += delta * delta;
+            }
+        }
+    }
+    const double beforeRms = std::sqrt (beforeEnergy / (10.0 * 512.0));
+    const double afterRms = std::sqrt (afterEnergy / (40.0 * 512.0));
+    const double swapDiff = std::sqrt (diffEnergy / (40.0 * 512.0));
+    std::printf ("   до %.5f, после %.5f, ΔRMS с неизменённым %.5f, переход %.5f, NaN %d\n",
+                 beforeRms, afterRms, swapDiff, std::fabs (firstAfter - lastBefore), badSwap);
+    std::printf ("   максимальный соседний скачок после смены %.5f на отсчёте %d; без смены %.5f\n",
+                 maxStepA, maxStepAt, maxStepB);
+    check (selector != nullptr && (int) p.apvts.getRawParameterValue ("sA_type")->load() == 4
+           && beforeRms > 1.0e-3 && afterRms > 1.0e-3 && swapDiff > 1.0e-3 && badSwap == 0,
+           "GUI меняет звук удержанной ноты без повторного Note On",
+           num (afterRms, 5) + " RMS после");
 }
 
 int main (int argc, char** argv)
@@ -539,7 +760,23 @@ int main (int argc, char** argv)
         OrogenProcessor p;
         const int count = p.getParameters().size();
         std::printf ("   параметров: %d, программ: %d\n", count, p.getNumPrograms());
-        check (count > 200, "все параметры объявлены", num (count, 0));
+        check (count == 298, "все параметры объявлены", num (count, 0));
+
+        // Снимок последовательности ID rev21 до добавления Plate. Хэшируем
+        // первые 294 ID с '\\n' между ними: даже перестановка не пройдёт.
+        std::uint64_t legacyHash = 14695981039346656037ull;
+        bool legacyIdsPresent = count >= 294;
+        for (int i = 0; i < 294 && i < count; ++i)
+        {
+            auto* prm = dynamic_cast<juce::AudioProcessorParameterWithID*> (p.getParameters()[i]);
+            if (prm == nullptr) { legacyIdsPresent = false; break; }
+            const auto legacyId = prm->paramID + "\n";
+            const auto utf8 = legacyId.toRawUTF8();
+            for (const unsigned char* b = (const unsigned char*) utf8; *b != 0; ++b)
+                legacyHash = (legacyHash ^ *b) * 1099511628211ull;
+        }
+        check (legacyIdsPresent && legacyHash == 0x92b97459d55b24e1ull,
+               "порядок и ID первых 294 параметров сохранены");
 
         juce::StringArray ids;
         bool allHaveId = true;
@@ -557,6 +794,7 @@ int main (int argc, char** argv)
         // каждый слот и ключевые эффекты на месте
         const char* must[] = { "sA_type", "sH_tail", "fx_reverbMix", "fx_combTune",
                                "gl_gain", "lfo2_shape", "fx_spectreModel",
+                               "fx_platePreFilter", "fx_plateInputDiff1", "fx_plateInputDiff2", "fx_plateOutput",
                                "fx_robinMix", "fx_robinSemis",           // эффект 15/16
                                "arpOn", "arpMode", "arpDiv", "arpOctaves", "arpGate", "arpLatch",
                                "mod1_src", "mod1_dst", "mod1_amt",        // мод-матрица
@@ -715,7 +953,9 @@ int main (int argc, char** argv)
             { "fx_delayMix", 0.29f }, { "fx_delayTime", 0.77f }, { "fx_delayFb", 0.66f },
             { "fx_reverbMix", 0.41f }, { "fx_reverbSize", 0.83f }, { "fx_reverbDamp", 0.17f },
             { "fx_plateMix", 0.53f }, { "fx_plateDecay", 0.61f }, { "fx_plateDamp", 0.29f },
-            { "fx_plateDiffusion", 0.87f }, { "fx_platePredelay", 0.033f },
+            { "fx_plateDiffusion", 0.87f }, { "fx_platePredelay", 0.173f },
+            { "fx_platePreFilter", 0.23f }, { "fx_plateInputDiff1", 0.42f },
+            { "fx_plateInputDiff2", 0.71f }, { "fx_plateOutput", 1.24f },
             { "fx_materialMix", 0.47f }, { "fx_materialMode", 3.0f }, { "fx_materialExcite", 0.71f },
             { "fx_materialTone", 0.13f }, { "fx_materialDamp", 0.57f }, { "fx_materialSize", 0.79f },
             { "fx_materialFeedback", 0.31f },
@@ -749,6 +989,7 @@ int main (int argc, char** argv)
         int missingKeys = 0;
         // DEL/DEP/SPD/MIX/FB/WID/LP/INP лежат одним массивом "chorusFw"
         for (const char* key : { "chorusFw", "glitchFeedback", "glitchFold", "glitchTone",
+                                 "platePreFilter", "plateInputDiff1", "plateInputDiff2", "plateOutput",
                                  "spectreLow", "spectreHigh",
                                  "robinMix", "robinSemis", "robinSize", "robinSpread" })
             if (! text.contains (key)) ++missingKeys;
@@ -790,6 +1031,10 @@ int main (int argc, char** argv)
         cmp ("plateDamp", fxd ((float) a.plateDamp, (float) b.plateDamp));
         cmp ("plateDiffusion", fxd ((float) a.plateDiffusion, (float) b.plateDiffusion));
         cmp ("platePredelay", fxd ((float) a.platePredelay, (float) b.platePredelay));
+        cmp ("platePreFilter", fxd (a.platePreFilter, b.platePreFilter));
+        cmp ("plateInputDiff1", fxd (a.plateInputDiff1, b.plateInputDiff1));
+        cmp ("plateInputDiff2", fxd (a.plateInputDiff2, b.plateInputDiff2));
+        cmp ("plateOutput", fxd (a.plateOutput, b.plateOutput));
         cmp ("driveModel", fxd ((float) a.driveModel, (float) b.driveModel));
         cmp ("driveTone", fxd ((float) a.driveTone, (float) b.driveTone));
         cmp ("combMix", fxd ((float) a.combMix, (float) b.combMix));
@@ -858,7 +1103,7 @@ int main (int argc, char** argv)
         cmp ("chorusFw[6]", fxd ((float) a.chorusFw[(size_t) 6], (float) b.chorusFw[(size_t) 6]));
         cmp ("chorusFw[7]", fxd ((float) a.chorusFw[(size_t) 7], (float) b.chorusFw[(size_t) 7]));
 
-        std::printf ("   сверено полей: 75 + chorusFw[8], худшее расхождение %.6f у %s\n",
+        std::printf ("   сверено полей: 79 + chorusFw[8], худшее расхождение %.6f у %s\n",
                      err, worstField);
         check (badField == 0, "все поля FX переживают пресет", num ((double) badField, 0) + " расхождений");
         check (err < 1.0e-3, "круг FX -> JSON -> FX точен", num (err, 6));
@@ -892,7 +1137,11 @@ int main (int argc, char** argv)
         check (std::fabs (fa.reverbMix - fb.reverbMix) < 1.0e-4f, "эффекты идентичны",
                num (fb.reverbMix, 4));
 
-        // состояние сессии
+        // состояние сессии: все новые поля проходят именно через хостовый XML
+        setP (p, "fx_platePreFilter", 0.21f);
+        setP (p, "fx_plateInputDiff1", 0.37f);
+        setP (p, "fx_plateInputDiff2", 0.82f);
+        setP (p, "fx_plateOutput", 1.36f);
         juce::MemoryBlock mb;
         p.getStateInformation (mb);
         OrogenProcessor r;
@@ -901,6 +1150,44 @@ int main (int argc, char** argv)
         r.collectPatch (c, fc);
         check (std::fabs (c.gain - a.gain) < 1.0e-3f, "состояние сессии сохраняет патч",
                num ((double) mb.getSize(), 0) + " байт");
+        check (std::fabs (fc.platePreFilter - 0.21f) < 1.0e-4f
+               && std::fabs (fc.plateInputDiff1 - 0.37f) < 1.0e-4f
+               && std::fabs (fc.plateInputDiff2 - 0.82f) < 1.0e-4f
+               && std::fabs (fc.plateOutput - 1.36f) < 1.0e-4f,
+               "четыре новых регулятора Plate переживают состояние сессии");
+
+        // Эмуляция состояния старой версии: удалить четыре PARAM-узла и
+        // загрузить ПОВЕРХ не-дефолтных значений (новый пустой инстанс не
+        // выявил бы сохранение старого текущего значения в replaceState).
+        auto legacy = p.apvts.copyState();
+        int removed = 0;
+        for (const char* id : { "fx_platePreFilter", "fx_plateInputDiff1", "fx_plateInputDiff2", "fx_plateOutput" })
+        {
+            auto node = legacy.getChildWithProperty ("id", id);
+            if (node.isValid()) { legacy.removeChild (node, nullptr); ++removed; }
+        }
+        juce::MemoryBlock oldBlob;
+        if (auto xml = legacy.createXml()) juce::AudioProcessor::copyXmlToBinary (*xml, oldBlob);
+        r.setStateInformation (oldBlob.getData(), (int) oldBlob.getSize());
+        r.collectPatch (c, fc);
+        check (removed == 4 && std::fabs (fc.platePreFilter - 0.85f) < 1.0e-4f
+               && std::fabs (fc.plateInputDiff1 - 0.75f) < 1.0e-4f
+               && std::fabs (fc.plateInputDiff2 - 0.625f) < 1.0e-4f
+               && std::fabs (fc.plateOutput - 0.60f) < 1.0e-4f,
+               "старая сессия получает прежние фиксированные значения Plate");
+
+        // То же правило для JSON-пресета старой версии.
+        auto oldPreset = presetToVar ("old", patchInit(), FxChain::Settings());
+        auto* fxObject = oldPreset.getDynamicObject()->getProperty ("fx").getDynamicObject();
+        for (const char* id : { "platePreFilter", "plateInputDiff1", "plateInputDiff2", "plateOutput" })
+            fxObject->removeProperty (id);
+        Patch oldPatch; FxChain::Settings oldFx; juce::String oldName;
+        const bool loaded = presetFromVar (oldPreset, oldPatch, oldFx, oldName);
+        check (loaded && std::fabs (oldFx.platePreFilter - 0.85f) < 1.0e-4f
+               && std::fabs (oldFx.plateInputDiff1 - 0.75f) < 1.0e-4f
+               && std::fabs (oldFx.plateInputDiff2 - 0.625f) < 1.0e-4f
+               && std::fabs (oldFx.plateOutput - 0.60f) < 1.0e-4f,
+               "старый JSON-пресет получает прежние коэффициенты Plate");
     }
 
     // ---------------------------------------------------------------- 4
@@ -1210,8 +1497,8 @@ int main (int argc, char** argv)
         check (dupes == 0, "в карте нет повторов", num ((double) dupes, 0));
         check (missing.isEmpty(), "каждый параметр APVTS есть в карте", num ((double) missing.size(), 0));
         check (extra.isEmpty(), "в карте нет несуществующих параметров", num ((double) extra.size(), 0));
-        check (mapIds.size() == apvtsIds.size() && apvtsIds.size() == 294,
-               "покрытие 294/294", juce::String (mapIds.size()) + " / " + juce::String (apvtsIds.size()));
+        check (mapIds.size() == apvtsIds.size() && apvtsIds.size() == 298,
+               "покрытие 298/298", juce::String (mapIds.size()) + " / " + juce::String (apvtsIds.size()));
 
         // --- управление в оверлее реально создаётся для каждого параметра ---
         juce::AudioProcessorEditor* ed = p.createEditor();
@@ -1234,7 +1521,7 @@ int main (int argc, char** argv)
             // страница (плюс ALL). Считаем контролы по всем парам «вкладка ×
             // секция» и проверяем, что вместе они дают все параметры.
             int seen = 0;
-            int pages = 0;
+            int pages = 0, wrongIds = 0;
             int sectionsTotal = 0;
             juce::StringArray pageTitles;
             for (int t = 0; t < (int) tabs.size(); ++t)
@@ -1253,7 +1540,16 @@ int main (int argc, char** argv)
                     if (auto* overlay = ore->paramsOverlay())
                     {
                         const int c = countBoundControls (*overlay, tabs[(size_t) t]);
-                        const int expected = (int) tabs[(size_t) t].sections[(size_t) sIdx].ids.size();
+                        const auto& expectedIds = tabs[(size_t) t].sections[(size_t) sIdx].ids;
+                        const int expected = expectedIds.size();
+                        const auto actualIds = visibleBoundIds (*overlay);
+                        if (actualIds.size() != expected) ++wrongIds;
+                        for (const auto& id : expectedIds)
+                        {
+                            int occurrences = 0;
+                            for (const auto& got : actualIds) if (got == id) ++occurrences;
+                            if (occurrences != 1) ++wrongIds;
+                        }
                         std::printf ("   %-10s map:%-14s view:%-14s %d / %d\n",
                                      tabs[(size_t) t].title.toRawUTF8(),
                                      tabs[(size_t) t].sections[(size_t) sIdx].title.toRawUTF8(),
@@ -1267,6 +1563,8 @@ int main (int argc, char** argv)
                    num ((double) pages, 0));
             check (seen == apvtsIds.size(), "на все параметры есть контрол в постраничном оверлее",
                    juce::String (seen) + " / " + juce::String (apvtsIds.size()));
+            check (wrongIds == 0, "каждый видимый контрол привязан к нужному ID своей секции",
+                   juce::String (wrongIds) + " ошибок");
 
             // навигация клавишами: ↑/↓ листают секции, PageDown-подобный сброс — ALL
             {

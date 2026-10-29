@@ -390,6 +390,10 @@ public:
         float reverbMix = 0.0f, reverbSize = 0.6f, reverbDamp = 0.4f;
         float plateMix = 0.0f, plateDecay = 0.75f, plateDamp = 0.6f, plateDiffusion = 0.7f;
         float platePredelay = 0.01f;
+        // Остальные независимые органы управления Dattorro и выходной трим.
+        // Значения совпадают с прежними фиксированными коэффициентами.
+        float platePreFilter = 0.85f, plateInputDiff1 = 0.75f, plateInputDiff2 = 0.625f;
+        float plateOutput = 0.60f;
         // модель драйва: индекс DriveModel (0…18), 3 = Tanh
         int   driveModel = 3;
         float driveTone = 0.0f;                 // −1…+1, наклон ±8 дБ
@@ -497,7 +501,9 @@ public:
         eq.setLow (s.eqLow); eq.setHigh (s.eqHigh);
         plate.setMix (s.plateMix); plate.setDecay (s.plateDecay); plate.setDamping (s.plateDamp);
         plate.setDiffusion (s.plateDiffusion); plate.setPreDelay (s.platePredelay);
-        plate.setOutputTrim (0.6f);
+        plate.setPreFilter (s.platePreFilter);
+        plate.setInputDiffusion1 (s.plateInputDiff1); plate.setInputDiffusion2 (s.plateInputDiff2);
+        plate.setOutputTrim (s.plateOutput);
         const int dm = (s.driveModel >= 0 && s.driveModel < (int) DriveModel::Count) ? s.driveModel : 3;
         if (dm != lastDriveModel) { drive.setModel ((DriveModel) dm); lastDriveModel = dm; }
         drive.setAmount (s.drive);

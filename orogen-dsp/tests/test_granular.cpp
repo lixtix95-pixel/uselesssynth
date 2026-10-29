@@ -5,8 +5,52 @@
 #include <cstdio>
 #include <cmath>
 #include <vector>
+#include <array>
 
 using namespace orogen;
+
+namespace orogen {
+// Наблюдаем настоящие MIP-ридеры и исходные координаты, а не уровень смеси:
+// соседние зёрна могут замаскировать заворот на начало записи.
+struct GranularTestProbe
+{
+    struct Stats
+    {
+        int spawned = 0, unsafe = 0, wrappedReads = 0;
+        double worstOverrun = 0.0;
+    };
+
+    static void observe (const GranularEngine& e, std::array<bool, GranularEngine::kMaxGrains>& previous,
+                         Stats& stats)
+    {
+        for (int i = 0; i < GranularEngine::kMaxGrains; ++i)
+        {
+            const auto& g = e.grains[i];
+            if (g.active && ! previous[(size_t) i])
+            {
+                ++stats.spawned;
+                // observe() вызывается сразу после первого render(): позиция уже
+                // сдвинута на один rate, но phase ещё в начале Hann-окна.
+                const double start = (double) g.pos - (double) g.rate;
+                const double end = start + (double) g.dur * (double) g.rate;
+                const double safeEnd = (double) g.mip.lenOrig - 128.0;
+                const double over = end - safeEnd;
+                if (over > 0.25) { ++stats.unsafe; stats.worstOverrun = std::max (stats.worstOverrun, over); }
+            }
+            if (g.active)
+            {
+                const double wrapA = ((double) g.mip.lenA - 8.0) / (double) g.mip.invScaleA;
+                const double wrapB = ((double) g.mip.lenB - 8.0) / (double) g.mip.invScaleB;
+                // Текущая позиция уже продвинута; проверяем отсчёт, только что
+                // переданный MipReader. B читается лишь при весе > 0.001.
+                const double justRead = (double) g.pos - (double) g.rate;
+                if (justRead >= wrapA || (g.mip.wB > 0.001f && justRead >= wrapB)) ++stats.wrappedReads;
+            }
+            previous[(size_t) i] = g.active;
+        }
+    }
+};
+}
 
 // Окно анализа. Гранулярный сигнал нестационарен по природе (зёрна рождаются
 // и умирают), поэтому окно берём короче: 2048 = 43 мс, внутри него фаза
@@ -275,6 +319,48 @@ int main()
         const double spreadDb = 20.0 * std::log10 (hi / std::max (1.0e-9, lo));
         std::printf ("   RMS по 8 источникам: от %.4f до %.4f — разброс %.1f дБ\n", lo, hi, spreadDb);
         suite::check (spreadDb < 12.0, "уровень не зависит от источника", suite::num (spreadDb, 1) + " дБ");
+    }
+
+    // Проверяем КАЖДОЕ зерно и каждое фактическое чтение, включая повторное
+    // использование ячеек: раньше span считался по g.rate от предыдущего зерна.
+    // Высокая нота и длинное зерно делают заворот воспроизводимым.
+    std::printf ("\n--- Границы каждого зерна: скорости, повторное использование, MIP ---\n");
+    {
+        GranularTestProbe::Stats stats;
+        int badSamples = 0;
+        for (double sr : { 44100.0, 48000.0, 96000.0 })
+        {
+            SampleBank shortBank;
+            shortBank.shots.push_back (buildOneShot (OneShotKind::FmTine, sr, 0.50));
+            for (int note : { 45, 69, 93, 117, 127 })
+                for (float spread : { 0.0f, 1.0f })
+                  for (float tune : { -24.0f, 0.0f, 24.0f })
+                {
+                    GranularEngine e;
+                    e.setBank (&shortBank);
+                    e.setSampleRate (sr);
+                    e.start (note, 1.0f);
+                    EngineParams p;
+                    p.table = 0; p.p[0] = 0.97f; p.p[1] = 1.0f;
+                    p.p[2] = 1.0f; p.p[3] = spread;
+                    p.detune = 0.0f; p.tuneSemis = tune; p.level = 1.0f;
+                    e.prepare (p);
+                    std::array<bool, GranularEngine::kMaxGrains> previous {};
+                    for (int i = 0; i < (int) (sr * 0.5); ++i)
+                    {
+                        if (! std::isfinite (e.render (p))) ++badSamples;
+                        GranularTestProbe::observe (e, previous, stats);
+                    }
+                }
+        }
+        std::printf ("   зёрен %d, небезопасных %d, чтений с заворотом %d, макс. выход %.1f отсч., NaN %d\n",
+                     stats.spawned, stats.unsafe, stats.wrappedReads, stats.worstOverrun, badSamples);
+        suite::check (stats.spawned > 700 && stats.unsafe == 0,
+                      "каждое зерно целиком помещается в источник",
+                      suite::num (stats.unsafe, 0) + " / " + suite::num (stats.spawned, 0));
+        suite::check (stats.wrappedReads == 0 && badSamples == 0,
+                      "MIP не заворачивает чтение внутри окна зерна",
+                      suite::num (stats.wrappedReads, 0) + " чтений, " + suite::num (badSamples, 0) + " NaN");
     }
 
     fails = suite::gFailures - before;

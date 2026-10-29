@@ -20,6 +20,11 @@ inline constexpr int kNumSlots = 8;
 
 inline juce::String slotPrefix (int slot) { return juce::String ("s") + kSlotLetters[slot] + "_"; }
 
+// Добавленные в rev22 параметры FX размещаются в САМОМ КОНЦЕ ParameterLayout,
+// чтобы индексы первых 294 параметров хоста остались прежними.
+inline constexpr int kOriginalFxParamCount = 66;
+inline constexpr int kAddedPlateParamCount = 4;
+
 // Имена параметров для UI: «A · Level» и т.п.
 struct SlotParam
 {
@@ -136,7 +141,12 @@ inline const FxParam* fxParamTable (int& count)
         { "robinMix",         "Robin Mix",     0.0f,   1.0f,  0.0f,  0.001f },
         { "robinSemis",       "Robin Semis", -24.0f,  24.0f,  0.0f,  0.01f  },
         { "robinSize",        "Robin Size",    0.0f,   1.0f,  0.5f,  0.001f },
-        { "robinSpread",      "Robin Spread",  0.0f,   1.0f,  0.0f,  0.001f }
+        { "robinSpread",      "Robin Spread",  0.0f,   1.0f,  0.0f,  0.001f },
+        // Новые независимые органы Plate — обязательно в конце таблицы.
+        { "platePreFilter",   "Plate Pre Filter", 0.0f, 1.0f, 0.850f, 0.001f },
+        { "plateInputDiff1",  "Plate Input Diff 1", 0.0f, 1.0f, 0.750f, 0.001f },
+        { "plateInputDiff2",  "Plate Input Diff 2", 0.0f, 1.0f, 0.625f, 0.001f },
+        { "plateOutput",      "Plate Output", 0.0f, 2.0f, 0.600f, 0.001f }
     };
     count = (int) (sizeof (table) / sizeof (table[0]));
     return table;
@@ -229,7 +239,8 @@ inline juce::AudioProcessorValueTreeState::ParameterLayout makeLayout()
     // --- эффекты ---
     int fn = 0;
     const FxParam* ft = fxParamTable (fn);
-    for (int i = 0; i < fn; ++i)
+    jassert (fn == kOriginalFxParamCount + kAddedPlateParamCount);
+    for (int i = 0; i < kOriginalFxParamCount; ++i)
         addFloat (String ("fx_") + ft[i].id, ft[i].name, ft[i].min, ft[i].max, ft[i].def, ft[i].step);
 
     // список моделей берётся из движка, чтобы не разъезжаться с enum DriveModel
@@ -303,6 +314,12 @@ inline juce::AudioProcessorValueTreeState::ParameterLayout makeLayout()
     addFloat ("arpSwing", "Arp Swing", 0.0f,  0.6f, 0.0f, 0.001f);
     layout.add (std::make_unique<AudioParameterBool> (
         ParameterID { "arpLatch", 1 }, "Arp Latch", false));
+
+    // Только после ВСЕХ старых параметров, включая ARP: стабильный порядок
+    // и ID автоматизации существующих сессий. Карта UI при этом группирует
+    // эти четыре значения с остальными настройками PLATE по префиксу.
+    for (int i = kOriginalFxParamCount; i < fn; ++i)
+        addFloat (String ("fx_") + ft[i].id, ft[i].name, ft[i].min, ft[i].max, ft[i].def, ft[i].step);
 
     return layout;
 }

@@ -1,27 +1,33 @@
 // Проверка собранного .vst3 «снаружи»: загружаем бандл так, как это делает хост
 // (через VST3PluginFormat), и проверяем то, что видит DAW:
 //   — имя/производителя/категорию из moduleinfo;
-//   — число параметров и что все они имеют уникальные id;
+//   — число параметров и уникальные имена (порядок ID проверяет test_plugin);
 //   — размер редактора (интерфейс из макета 1280×800);
 //   — что процессор выдаёт звук и не выдаёт NaN.
 //
 //   verify_vst3 <путь к OROGEN.vst3> [секунды]
 #include <juce_audio_processors/juce_audio_processors.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <set>
 
 using namespace juce;
 
-static constexpr int kNumApvtsParams = 294;   // см. Params.h / test_plugin
+static constexpr int kNumApvtsParams = 298;   // см. Params.h / test_plugin
 
 static int failures = 0;
 static void check (bool ok, const String& what, const String& detail = {})
 {
-    std::printf ("  [ %s ] %s%s\n", ok ? "OK" : "FAIL", what.toRawUTF8(),
-                 detail.isEmpty() ? "" : ("  —  " + detail).toRawUTF8());
+    std::printf ("  [ %s ] %s%s%s\n", ok ? "OK" : "FAIL", what.toRawUTF8(),
+                 detail.isEmpty() ? "" : "  —  ", detail.toRawUTF8());
     if (! ok) ++failures;
+}
+
+static void check (bool ok, const char* what, const String& detail = {})
+{
+    check (ok, String::fromUTF8 (what), detail);
 }
 
 int main (int argc, char** argv)
@@ -45,7 +51,7 @@ int main (int argc, char** argv)
     if (format == nullptr) { std::printf ("формат VST3 недоступен\n"); return 2; }
 
     format->findAllTypesForFile (types, bundle.getFullPathName());
-    check (types.size() >= 1, "хост видит плагин в бандле", String (types.size()) + " тип(ов)");
+    check (types.size() >= 1, "хост видит плагин в бандле", String (types.size()) + String::fromUTF8 (" тип(ов)"));
     if (types.isEmpty()) return 2;
 
     auto& d = *types[0];
@@ -85,8 +91,9 @@ int main (int argc, char** argv)
         std::printf ("\n");
     }
 
-    check (ours >= kNumApvtsParams, "наши параметры доходят до хоста",
-           String (ours) + " из " + String (kNumApvtsParams));
+    check (ours == kNumApvtsParams + 2 && names.count ("Bypass") == 1 && names.count ("Program") == 1,
+           "все параметры APVTS и два служебных доходят до хоста",
+           String (ours) + " = " + String (kNumApvtsParams) + " + 2");
     check (midiCC == 16 * 130, "MIDI CC обёртки на месте", String (midiCC));
     check (names.size() == (size_t) params.size(), "имена параметров не совпадают ни у кого",
            String ((int) names.size()));
@@ -94,14 +101,35 @@ int main (int argc, char** argv)
     // по одному представителю каждой группы: имена как в Params.h
     for (const char* probe : { "sA_Level", "sA_Cutoff", "sA_Filter", "sA_Engine",
                                "Reverb Mix", "Comb Hz A", "Master", "mod1_Amount",
-                               "Arp On", "lfo1_Rate" })
-        check (names.count (String (probe)) == 1, String ("виден хосту: ") + probe);
+                               "Arp On", "lfo1_Rate", "Plate Pre Filter", "Plate Input Diff 1",
+                               "Plate Input Diff 2", "Plate Output" })
+        check (names.count (String (probe)) == 1, String::fromUTF8 ("виден хосту: ") + probe);
 
-    // --- состояние: сохранить/загрузить ---
+    // --- состояние: сохранить/загрузить через настоящий VST3-хост ---
+    const char* plateNames[] = { "Plate Pre Filter", "Plate Input Diff 1", "Plate Input Diff 2", "Plate Output" };
+    const float plateValues[] = { 0.23f, 0.41f, 0.73f, 0.635f }; // нормализованный диапазон хоста
+    AudioProcessorParameter* plateParams[4] {};
+    for (auto* parameter : params)
+        for (int i = 0; i < 4; ++i)
+            if (parameter->getName (64) == plateNames[i]) plateParams[i] = parameter;
+    for (int i = 0; i < 4; ++i)
+        if (plateParams[i] != nullptr) plateParams[i]->setValueNotifyingHost (plateValues[i]);
     MemoryBlock state;
     inst->getStateInformation (state);
-    check (state.getSize() > 0, "состояние сериализуется", String (state.getSize()) + " байт");
+    check (state.getSize() > 0, "состояние сериализуется", String (state.getSize()) + String::fromUTF8 (" байт"));
+    for (auto* parameter : plateParams)
+        if (parameter != nullptr) parameter->setValueNotifyingHost (0.05f);
     inst->setStateInformation (state.getData(), (int) state.getSize());
+    float maxStateDiff = 0.0f;
+    int foundPlate = 0;
+    for (int i = 0; i < 4; ++i)
+        if (plateParams[i] != nullptr)
+        {
+            ++foundPlate;
+            maxStateDiff = std::max (maxStateDiff, std::fabs (plateParams[i]->getValue() - plateValues[i]));
+        }
+    check (foundPlate == 4 && maxStateDiff < 0.002f,
+           "4 параметра Plate переживают VST3 host state", String (maxStateDiff, 6));
 
     // --- редактор ---
     check (inst->hasEditor(), "есть редактор");
@@ -154,7 +182,7 @@ int main (int argc, char** argv)
     const double rms = std::sqrt (sumSq / (double) jmax (1, samples));
     check (rms > 0.01, "после note-on есть звук", "RMS " + String (rms, 4));
     check (nans == 0, "нет NaN/Inf", String (nans));
-    check (peak < 1.0f, "нет клиппинга", "пик " + String (peak, 3));
+    check (peak < 1.0f, "нет клиппинга", String::fromUTF8 ("пик ") + String (peak, 3));
 
     inst->releaseResources();
 

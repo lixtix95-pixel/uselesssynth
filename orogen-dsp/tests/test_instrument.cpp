@@ -474,6 +474,57 @@ int main()
         check (live2 == 128, "все заменённые движки удалены", num ((double) live2, 0) + " живых");
     }
 
+    // Отдельно от теста аллокаций: обновлённый движок должен начать звук
+    // ДЕЙСТВУЮЩЕЙ ноты, а не ждать следующего Note On. Тестируем все девять
+    // типов (включая возврат на Wavetable) и разные фазы control tick.
+    std::printf ("\n--- Смена каждого движка при удержанной ноте ---\n");
+    {
+        EngineBank bank;
+        bank.build (48000.0);
+        int sounding = 0, different = 0, nonFinite = 0;
+        for (int target = 0; target < (int) EngineType::Count; ++target)
+        {
+            Patch original = patchInit();
+            if (target == 0) original.slots[0].type = EngineType::FM;
+            original.slots[0].tail = 0.0f;
+            original.slots[0].sustain = 0.9f;
+            Voice changed, unchanged;
+            changed.init (bank, 48000.0); unchanged.init (bank, 48000.0);
+            changed.stageSlots (original, bank); unchanged.stageSlots (original, bank);
+            changed.applyPendingEngines(); unchanged.applyPendingEngines();
+            changed.start (original, 60, 0.8f, 60.0f);
+            unchanged.start (original, 60, 0.8f, 60.0f);
+            float l = 0.0f, r = 0.0f, lr = 0.0f, rr = 0.0f;
+            const int warm = 12001 + 17 * target;  // не совпадает с 128 отсчётами
+            for (int i = 0; i < warm; ++i)
+            {
+                changed.render (original, l, r); unchanged.render (original, lr, rr);
+            }
+            Patch swapped = original;
+            swapped.slots[0].type = (EngineType) target;
+            changed.stageSlots (swapped, bank);
+            changed.applyPendingEngines();
+            double energy = 0.0, delta = 0.0;
+            for (int i = 0; i < 24000; ++i)
+            {
+                changed.render (swapped, l, r); unchanged.render (original, lr, rr);
+                if (! std::isfinite (l) || ! std::isfinite (r)) ++nonFinite;
+                energy += (double) l * l;
+                const double d = (double) l - lr;
+                delta += d * d;
+            }
+            const double rms = std::sqrt (energy / 24000.0);
+            const double diff = std::sqrt (delta / 24000.0);
+            if (rms > 1.0e-4) ++sounding;
+            if (diff > 1.0e-3) ++different;
+            std::printf ("   %-10s: RMS %.5f, ΔRMS %.5f\n",
+                         engineTypeName ((EngineType) target), rms, diff);
+        }
+        check (sounding == 9 && different == 9 && nonFinite == 0,
+               "9 типов запускаются и звучат иначе без повторного Note On",
+               std::to_string (sounding) + "/9, NaN " + std::to_string (nonFinite));
+    }
+
     // ---------------------------------------------------------------- арпеджиатор
     std::printf ("\n--- Арпеджиатор (эффект 16/16): порядок нот, гейт, latch, режимы ---\n");
     {
