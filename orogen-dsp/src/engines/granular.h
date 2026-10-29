@@ -6,9 +6,9 @@
 //      Без этого верхние ноты снова дают алиасинг, только теперь «размазанный».
 //   2. Окно Ханна по фазе зерна: края зерна всегда в нуле -> нет щелчков,
 //      даже если зерно стартует в середине громкой атаки.
-//   3. Нормировка на перекрытие: амплитуда = 1/sqrt(density · size).
-//      Некогерентные зёрна складываются по мощности, поэтому уровень
-//      не зависит от плотности — иначе ручка Density работала бы как громкость.
+//   3. Нормировка каждого зерна по фактическому перекрытию с учётом его
+//      укороченной длительности и лимита голосов. При автоматизации Density
+//      амплитуда уже звучащих зёрен не меняется скачком.
 //   4. Псевдослучайный планировщик с фиксированным seed: два прогона
 //      с одинаковыми параметрами дают бит-в-бит одинаковый результат (тест).
 //   5. Сглаживание позиции/размера: ручки не «зипперят» и не щёлкают.
@@ -37,13 +37,21 @@ public:
         sampleRate = sr;
         posSm.setTime (sr, 45.0);
         sizeSm.setTime (sr, 60.0);
+        // Создание lookup-таблиц не должно попадать на первую ноту и первый
+        // render(). setSampleRate вызывается при подготовке/создании движка,
+        // вне горячего аудиоцикла; далее эти таблицы только читаются.
+        (void) sincKernel();
+        (void) grainSincKernel();
+        (void) fastCosTbl (0.0f);
     }
 
     void start (int midiNote, float velocity) override
     {
         note = midiNote;
         vel  = velocity;
-        spawnAcc = 0.0f;
+        // Первая гранула запускается сразу на note-on. Дальнейшие интервалы
+        // задаёт Density; прежде первый запуск ждал до 250 мс при 4 зернах/с.
+        spawnAcc = 1.0f;
         dcX = dcY = 0.0f;
         for (auto& g : grains) g.active = false;
         needSnap = true;
@@ -67,7 +75,9 @@ public:
         bodyRms = std::max (1.0e-4f, bodyLevel (s));
 
         // p[0] — позиция чтения по записи, p[1] — размер зерна, p[2] — плотность, p[3] — спред
-        const float posT   = clamp (p.p[0], 0.0f, 1.0f) * 0.85f;
+        // Позиция задаётся в диапазоне допустимых стартов, а не в полной
+        // длине файла: при длинном/быстром зерне его хвост занимает место.
+        const float posT   = clamp (p.p[0], 0.0f, 1.0f);
         const float sizeT  = clamp (p.p[1], 0.0f, 1.0f);
         const float densT  = clamp (p.p[2], 0.0f, 1.0f);
         spread             = clamp (p.p[3], 0.0f, 1.0f);
@@ -115,18 +125,9 @@ public:
             if (g.phase >= 1.0f) g.active = false;
         }
 
-        // Нормировка на перекрытие: сумма некогерентных зёрен растёт как sqrt(N).
-        // Ожидаемое перекрытие = density · size, при 1 зерне нормировка = 1.
-        // 1/sqrt(overlap) — пересчитываем не каждый сэмпл: density/size ползут
-        // медленно, а sqrt в цикле заметен
-        if (--normCountdown <= 0)
-        {
-            normCountdown = 16;
-            normCur = 1.0f / std::sqrt (std::max (1.0f, density * size));
-        }
-        const float norm = normCur;
-
-        const float out = sum * norm * gain;
+        // Нормировка зафиксирована при запуске каждого зерна. Уже звучащее
+        // окно не получает мгновенный скачок при автоматизации Density.
+        const float out = sum * gain;
         const float y = out - dcX + dcCoef * dcY;
         dcX = out; dcY = y;
         return y;
@@ -153,39 +154,44 @@ private:
         const float jitter = spread * 7.0f * rng.nextBipolar();
         const float rate = baseRate * (float) std::pow (2.0, (double) jitter / 12.0);
 
-        // Длительность зерна в отсчётах. Если источник короче зерна, зерно
-        // растягивается по времени — иначе оно читало бы за концом записи
-        // и MipReader заворачивал бы чтение на атаку ПРЯМО ВНУТРИ окна
-        // (щелчок в середине зерна, слышимый как грязь на коротких источниках).
-        // Зерно должно оставлять место для позиции: занимаем не больше половины
-        // записи, иначе все зёрна сбиваются в её начало (у коротких источников
-        // уровень падал до −57 дБ относительно длинных).
-        const float maxSpan = 0.5f * ((float) lenOrig - 128.0f);
+        // Учитываем ВСЕ 32/64 отвода выбранного sinc, а не только центр.
+        // Уровень L читает исходник с шагом 2^L, поэтому фиксированного
+        // запаса в 128 исходных отсчётов недостаточно.
+        if (! g->mip.setupGranular (*shot, rate)) return;
+        const int half = g->mip.grainHalf();
+        if (g->mip.lenA < 2 * half + 4 || g->mip.invScaleA <= 0.0f) return;
+        float safeBegin = std::max (64.0f, (float) (half + 1) / g->mip.invScaleA);
+        float safeEnd = std::min ((float) lenOrig - 128.0f,
+                                  (float) (g->mip.lenA - half - 2) / g->mip.invScaleA);
+
+        // Зерно занимает максимум половину доступного участка, оставляя
+        // пространство для управления позицией. Два дополнительных шага
+        // учитывают округление длительности. Если даже 16 отсчётов физически
+        // не помещаются в короткий источник, зерно не запускается.
+        const float usable = safeEnd - safeBegin;
+        const float maxDur = 0.5f * usable / rate - 2.0f;
+        if (maxDur < 16.0f) return;
         const float want = size * (float) sampleRate;
-        g->dur = std::max (16.0f, std::min (want, maxSpan / rate));
-        // Используем скорость именно нового зерна: g->rate здесь ещё содержит
-        // скорость предыдущего зерна в переиспользованной ячейке (или 1.0).
-        const float span = g->dur * rate;
+        g->dur = std::min (want, maxDur);
+        const float span = (g->dur + 2.0f) * rate;
+        const float startRange = usable - span;
+        if (startRange <= 0.0f) return;
 
-        // Позиция старта: базовый Scan + джиттер.
-        //
-        // Джиттер нужен ВСЕГДА, даже при spread = 0. Без него зёрна читают
-        // один и тот же материал с одинаковым шагом, и их взаимная фаза
-        // жёстко определяется плотностью: при density 51/с и ноте 69 (440 Гц)
-        // соседние зёрна расходились на 216° и гасили друг друга — уровень
-        // падал на 27 дБ (замер: RMS 0.054 при ноте 45 против 0.0023 при 69).
-        // Джиттер в пределах половины зерна делает фазы независимыми,
-        // и сумма 12 зёрен растёт как sqrt(N) — как и предполагает нормировка.
-        const float jitterRange = 0.5f * size * (float) sampleRate * rate;
+        // Джиттер используется и при spread=0, чтобы зёрна не гасили друг
+        // друга. Его масштаб берём по РЕАЛЬНОМУ проходу, а не по желаемой
+        // длине: при высокой ноте последнее давало произвольный обход файла и
+        // почти убивало влияние Position. На краях отражаем позицию обратно,
+        // а не переносим маленький отрицательный джиттер на противоположный край.
+        const float jitterRange = 0.5f * g->dur * rate;
         const float posJit = rng.nextBipolar() * jitterRange
-                           + spread * 0.25f * rng.nextBipolar() * (float) lenOrig;
-        float pos = posT * (float) lenOrig + posJit;
-        // зерно должно целиком уложиться в запись: без заворота внутри окна
-        const float limit = std::max (64.0f, (float) lenOrig - 128.0f - span);
-        pos = std::fmod (pos, limit);
-        if (pos < 0.0f) pos += limit;
+                           + spread * 0.25f * rng.nextBipolar() * startRange;
+        float positionInRange = posT * startRange + posJit;
+        const float foldedRange = 2.0f * startRange;
+        positionInRange = std::fmod (positionInRange, foldedRange);
+        if (positionInRange < 0.0f) positionInRange += foldedRange;
+        if (positionInRange > startRange) positionInRange = foldedRange - positionInRange;
+        const float pos = safeBegin + positionInRange;
 
-        g->mip.setup (*shot, rate);
         g->pos   = pos;
         g->rate  = rate;
         g->phase = 0.0f;
@@ -202,11 +208,15 @@ private:
         // 0.14 давал разницу 11 дБ при одинаковых настройках).
         const float bodyScale = clamp (kBodyTarget / bodyRms, 0.05f, 6.0f);
 
-        // компенсация: короткие зёрна звучат тише при равной амплитуде
-        // компенсация укороченного зерна: перекрытие = density · dur/sr, а не
-        // density · size — иначе короткие зерна звучат тише пропорционально
-        const float durScale = std::sqrt (std::max (0.05f, g->dur / std::max (16.0f, want)));
-        g->amp   = (0.6f + 0.4f * std::min (1.0f, size / 0.05f)) * comp * bodyScale * durScale;
+        // Фактическое ожидаемое перекрытие: density × реальная длительность.
+        // Прежний sqrt(dur / want) уменьшал короткие зёрна ещё сильнее;
+        // общий 1/sqrt(density × want) учитывал несуществующее перекрытие.
+        // При ожидаемом числе больше ёмкости учитываем только 12 живых зёрен;
+        // ниже единицы не усиливаем паузы и не поднимаем единичный импульс.
+        const float overlap = clamp (density * g->dur / (float) sampleRate,
+                                     1.0f, (float) kMaxGrains);
+        const float norm = 1.0f / std::sqrt (overlap);
+        g->amp = (0.6f + 0.4f * std::min (1.0f, size / 0.05f)) * comp * bodyScale * norm;
         g->active = true;
     }
 
@@ -221,8 +231,6 @@ private:
 
     float  baseRate = 1.0f, spread = 0.0f, sizeSec = 0.08f, density = 20.0f, bodyRms = 1.0f;
     float  spawnAcc = 0.0f, gain = 0.5f, dcX = 0.0f, dcY = 0.0f, dcCoef = 0.999f;
-    float  normCur = 1.0f;
-    int    normCountdown = 0;
     SmoothedValue posSm, sizeSm;
     Rng rng { 0x51F3A7u };
 };

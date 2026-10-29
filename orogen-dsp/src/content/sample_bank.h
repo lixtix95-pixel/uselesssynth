@@ -5,10 +5,11 @@
 // структурой, которая нужна движкам: питч-стабильный основной тон 110 Гц,
 // атака, тело, хвост, и — главное — MIP-уровни для питч-шифта вверх.
 //
-// Ключевая деталь: у каждого сэмпла строятся 4 уровня по октавам
-// (полуполосная децимация). Без них повышение ноты на октаву даёт алиасинг —
-// ровно та же проблема, что у вейвтейбла, только здесь её нельзя решить
-// «на этапе контента», потому что питч задаётся пользователем в реальном времени.
+// Ключевая деталь: у каждого сэмпла строятся MIP-уровни по октавам
+// (полуполосная децимация), с компенсацией задержки фильтра. Без них при
+// повышении ноты высокие частоты заворачиваются внутрь слышимой полосы.
+// Количество уровней ограничивается длиной записи, чтобы даже самый короткий
+// уровень безопасно читался 32-отводным sinc-интерполятором.
 #pragma once
 
 #include "../core/dsp.h"
@@ -22,7 +23,8 @@
 
 namespace orogen {
 
-inline constexpr int kSampleLevels = 5;      // 1x … 16x down (16-кратный питч-шифт)
+inline constexpr int kSampleLevels = 11;     // максимум: 1x … 1024x down
+inline constexpr int kMinMipLength = 64;     // не строить уровни короче sinc-окна
 inline constexpr double kSampleF0 = 110.0;   // основной тон всех источников
 inline constexpr double kSampleRate = 48000.0;
 
@@ -106,6 +108,17 @@ inline void computeEnvelope (OneShot& s, double sr = kSampleRate)
         double acc = 0.0;
         for (int i = 0; i < s.envStep; ++i) acc += (double) l0[p + (size_t) i] * l0[p + (size_t) i];
         s.env.push_back ((float) std::sqrt (acc / s.envStep));
+    }
+
+    // Если источник короче окна огибающей, не берём begin()+1 у пустого
+    // вектора. Медиану заменить RMS всей короткой записи можно при сборке;
+    // короткий источник не превращаем в фиктивную 10-мс огибающую.
+    if (s.env.empty())
+    {
+        double acc = 0.0;
+        for (float v : l0) acc += (double) v * v;
+        s.bodyRms = std::max (1.0e-4f, (float) std::sqrt (acc / std::max<size_t> (1, l0.size())));
+        return;
     }
 
     // медиана по первым 60 % — один раз, на сборке банка (не в аудио-потоке)
@@ -345,31 +358,37 @@ inline void findLoopPoints (OneShot& s, double sr)
 
 inline void buildMipLevels (OneShot& os, double sr)
 {
-    (void) sr;
-    os.levels.resize (kSampleLevels);
-    os.lens.resize (kSampleLevels);
-    os.lens[0] = (int) os.levels[0].size();
+    os.levels.resize (1);
+    os.lens.assign (1, (int) os.levels[0].size());
 
     for (int l = 1; l < kSampleLevels; ++l)
     {
-        const std::vector<float>& in = os.levels[(size_t) (l - 1)];
+        const std::vector<float>& in = os.levels.back();
+        const size_t outCount = in.size() / 2;
+        if (outCount < (size_t) kMinMipLength) break;
         std::vector<float> outv;
-        outv.reserve (in.size() / 2);
+        outv.reserve (outCount);
 
-        HalfbandDecimator2x<255, 220> dec;   // качество важнее: строится один раз на банк
+        using Decimator = HalfbandDecimator2x<255, 220>;
+        Decimator dec;                        // строится вне аудио-потока
         dec.reset();
-        int phase = 0;
-        for (float x : in)
+        // decimate() центрирует 255 отводов в кольце на x[n-128].
+        // Снимаем выходы на чётных n и пропускаем 64 выходных значения:
+        // уровень L[n] тогда соответствует входу L-1[2n], без фазового сдвига.
+        // Для последних значений фильтр дополняется нулями, длина остаётся
+        // ровно floor(in.size()/2), а сопоставление времени уровней сохраняется.
+        constexpr int delay = Decimator::kSize - 1 - Decimator::kHalf;
+        static_assert ((delay & 1) == 0, "decimator alignment requires even delay");
+        const size_t firstOutput = (size_t) delay;
+        const size_t inputCount = 2 * outCount + firstOutput;
+        for (size_t i = 0; i < inputCount; ++i)
         {
-            dec.push (x);
-            if ((++phase & 1) == 0) outv.push_back (dec.decimate());
+            dec.push (i < in.size() ? in[i] : 0.0f);
+            if ((i & 1u) == 0 && i >= firstOutput)
+                outv.push_back (dec.decimate());
         }
-        // НЕ обрезаем начало: длина уровня должна оставаться ровно len/2,
-        // иначе карта времени «плывёт» (см. комментарий в sample.h).
-        // Задержку фильтра компенсируем тем, что масштаб считается по факту.
-
-        os.levels[(size_t) l] = std::move (outv);
-        os.lens[(size_t) l] = (int) os.levels[(size_t) l].size();
+        os.lens.push_back ((int) outv.size());
+        os.levels.push_back (std::move (outv));
     }
     computeEnvelope (os, sr);
     findLoopPoints (os, sr);

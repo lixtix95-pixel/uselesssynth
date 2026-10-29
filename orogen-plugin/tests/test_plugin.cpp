@@ -734,6 +734,105 @@ static void testGuiRegressions()
            num (afterRms, 5) + " RMS после");
 }
 
+// Те же проблемы Granular проверяем через AudioProcessor/APVTS и MIDI, а не
+// только вызовом GranularEngine. Два инстанса дают одинаковый детерминированный
+// сигнал; во втором Density не трогаем, чтобы отделить щелчок от формы волны.
+static void testGranularProcessorRegression()
+{
+    std::printf ("\n--- 18. Granular через AudioProcessor: атака и автоматизация Density ---\n");
+    OrogenProcessor changed, reference;
+    for (auto* pr : { &changed, &reference })
+    {
+        pr->setPlayConfigDetails (0, 2, 48000.0, 128);
+        pr->prepareToPlay (48000.0, 128);
+        pr->setCurrentProgram (0);
+        soloSlot (*pr, 0, 4);
+        setP (*pr, "gl_mode", 0.0f);
+        setP (*pr, "gl_gain", 0.7f);
+        setP (*pr, "gl_master", 0.8f);
+        setP (*pr, "arpOn", 0.0f);
+        setP (*pr, "lfo1_amount", 0.0f); setP (*pr, "lfo2_amount", 0.0f);
+        for (int k = 1; k <= 8; ++k) setP (*pr, "mod" + juce::String (k) + "_amt", 0.0f);
+        setP (*pr, "sA_level", 0.8f); setP (*pr, "sA_table", 0.0f);
+        setP (*pr, "sA_p0", 0.35f); setP (*pr, "sA_p1", 0.45f);
+        setP (*pr, "sA_p2", 0.0f); setP (*pr, "sA_p3", 0.0f);
+        setP (*pr, "sA_attack", 0.001f); setP (*pr, "sA_sustain", 1.0f);
+        setP (*pr, "sA_tail", 0.0f); setP (*pr, "sA_cutoff", 1.0f); setP (*pr, "sA_res", 0.0f);
+        for (const char* id : { "fx_drive", "fx_chorusMix", "fx_delayMix", "fx_reverbMix", "fx_plateMix",
+                                "fx_materialMix", "fx_spectreMix", "fx_glitchMix", "fx_robinMix", "fx_combMix" })
+            setP (*pr, id, 0.0f);
+        setP (*pr, "fx_compRatio", 1.0f); setP (*pr, "fx_compMakeup", 0.0f);
+    }
+    juce::MessageManager::getInstance()->runDispatchLoopUntil (160);
+
+    juce::AudioBuffer<float> a (2, 128), b (2, 128);
+    juce::MidiBuffer note, empty;
+    note.addEvent (juce::MidiMessage::noteOn (1, 60, 0.8f), 0);
+    int first = -1, bad = 0;
+    for (int block = 0; block < 400; ++block)
+    {
+        auto& m = block == 0 ? note : empty;
+        changed.processBlock (a, m); reference.processBlock (b, m);
+        for (int i = 0; i < 128; ++i)
+        {
+            const float x = a.getSample (0, i), y = b.getSample (0, i);
+            if (! std::isfinite (x) || ! std::isfinite (y)) ++bad;
+            if (first < 0 && std::fabs (x) > 1.0e-5f) first = block * 128 + i;
+        }
+    }
+    // ROBIN держит постоянную задержку 1024 отсчёта даже при mix=0; отделяем
+    // её от времени атаки движка и не выдаём тест за полностью сухой тракт.
+    const int latency = changed.reportedLatency();
+    const double onsetMs = first >= 0 ? first / 48.0 : -1.0;
+    const double intrinsicMs = first >= latency ? (first - latency) / 48.0 : -1.0;
+    std::printf ("   note-on: первый отсчёт %d / %.3f мс, latency %d, после неё %.3f мс; NaN %d\n",
+                 first, onsetMs, latency, intrinsicMs, bad);
+    check (latency == 1024 && first >= latency && first - latency < 960 && bad == 0,
+           "при минимальной Density атака доходит через плагин без 250-мс паузы",
+           num (onsetMs, 3) + " мс, latency " + juce::String (latency));
+
+    setP (changed, "sA_p2", 1.0f);
+    float earlyDiff = 0.0f;
+    double referenceEnergy = 0.0;
+    int measured = 0;
+    // Измеряем именно сэмплы, которые прошли через изменённый движок, а не
+    // старый сигнал, ещё находящийся в задержке эффекта.
+    const int blocksToMeasure = (latency + 128 + 127) / 128;
+    for (int block = 0; block < blocksToMeasure; ++block)
+    {
+        changed.processBlock (a, empty); reference.processBlock (b, empty);
+        for (int i = 0; i < 128; ++i)
+        {
+            const int at = block * 128 + i;
+            if (at < latency || at >= latency + 128) continue;
+            const float x = a.getSample (0, i), y = b.getSample (0, i);
+            earlyDiff = std::max (earlyDiff, std::fabs (x - y));
+            referenceEnergy += (double) y * y;
+            ++measured;
+        }
+    }
+    const double refRms = std::sqrt (referenceEnergy / std::max (1, measured));
+    std::printf ("   после задержки, Density 0 → 1: max |Δ| %.8f, RMS эталона %.6f, %d отсч.\n",
+                 earlyDiff, refRms, measured);
+    check (measured == 128 && earlyDiff < 1.0e-5f && refRms > 1.0e-4,
+           "Density не скачком меняет звучащее зерно в плагине",
+           "max diff " + num (earlyDiff, 8));
+
+    double deltaEnergy = 0.0;
+    for (int block = 0; block < 40; ++block)
+    {
+        changed.processBlock (a, empty); reference.processBlock (b, empty);
+        for (int i = 0; i < 128; ++i)
+        {
+            const double d = (double) a.getSample (0, i) - b.getSample (0, i);
+            deltaEnergy += d * d;
+        }
+    }
+    const double diffRms = std::sqrt (deltaEnergy / (40.0 * 128.0));
+    std::printf ("   последующие 107 мс: ΔRMS %.6f\n", diffRms);
+    check (diffRms > 1.0e-4, "автоматизация Density действительно меняет звук", num (diffRms, 6));
+}
+
 int main (int argc, char** argv)
 {
     // Голова без X11: GUI-инициализация здесь упала бы (нет дисплея), а
@@ -744,6 +843,14 @@ int main (int argc, char** argv)
     auto* mm = juce::MessageManager::getInstance();
     std::printf ("OROGEN test_plugin: старт\n");
     juce::ignoreUnused (mm);
+    if (argc > 1 && juce::String (argv[1]) == "--granular-only")
+    {
+        testGranularProcessorRegression();
+        juce::DeletedAtShutdown::deleteAll();
+        juce::MessageManager::deleteInstance();
+        std::printf ("\nGranular AudioProcessor: провалов %d\n", failures);
+        return failures == 0 ? 0 : 1;
+    }
     if (argc > 1 && juce::String (argv[1]) == "--gui-only")
     {
         testGuiRegressions();
@@ -2939,6 +3046,7 @@ int main (int argc, char** argv)
     }
 
     testGuiRegressions();
+    testGranularProcessorRegression();
     juce::DeletedAtShutdown::deleteAll();
     juce::MessageManager::deleteInstance();
 

@@ -6,6 +6,7 @@
 #include <cmath>
 #include <vector>
 #include <array>
+#include <utility>
 
 using namespace orogen;
 
@@ -16,8 +17,8 @@ struct GranularTestProbe
 {
     struct Stats
     {
-        int spawned = 0, unsafe = 0, wrappedReads = 0;
-        double worstOverrun = 0.0;
+        int spawned = 0, unsafe = 0, wrappedReads = 0, kernelWrapReads = 0;
+        double worstOverrun = 0.0, startSum = 0.0, durationSum = 0.0;
     };
 
     static void observe (const GranularEngine& e, std::array<bool, GranularEngine::kMaxGrains>& previous,
@@ -33,18 +34,30 @@ struct GranularTestProbe
                 // сдвинута на один rate, но phase ещё в начале Hann-окна.
                 const double start = (double) g.pos - (double) g.rate;
                 const double end = start + (double) g.dur * (double) g.rate;
+                stats.startSum += start;
+                stats.durationSum += (double) g.dur;
                 const double safeEnd = (double) g.mip.lenOrig - 128.0;
                 const double over = end - safeEnd;
                 if (over > 0.25) { ++stats.unsafe; stats.worstOverrun = std::max (stats.worstOverrun, over); }
             }
-            if (g.active)
+            // Проверяем и последний отсчёт зерна: после render() active уже
+            // может быть false, хотя MipReader только что выполнил чтение.
+            if (g.active || previous[(size_t) i])
             {
                 const double wrapA = ((double) g.mip.lenA - 8.0) / (double) g.mip.invScaleA;
                 const double wrapB = ((double) g.mip.lenB - 8.0) / (double) g.mip.invScaleB;
-                // Текущая позиция уже продвинута; проверяем отсчёт, только что
-                // переданный MipReader. B читается лишь при весе > 0.001.
                 const double justRead = (double) g.pos - (double) g.rate;
                 if (justRead >= wrapA || (g.mip.wB > 0.001f && justRead >= wrapB)) ++stats.wrappedReads;
+                // 32/64 отвода sinc могут пересечь край MIP-уровня, даже
+                // если центральный индекс ещё лежит внутри буфера.
+                const auto kernelWrap = [justRead, &g] (int len, float invScale) {
+                    const int centre = (int) std::floor (justRead * (double) invScale);
+                    const int half = g.mip.grainHalf();
+                    return centre - (half - 1) < 0 || centre + half >= len;
+                };
+                if (kernelWrap (g.mip.lenA, g.mip.invScaleA)
+                    || (g.mip.wB > 0.001f && kernelWrap (g.mip.lenB, g.mip.invScaleB)))
+                    ++stats.kernelWrapReads;
             }
             previous[(size_t) i] = g.active;
         }
@@ -110,6 +123,64 @@ static double bandAliasDb (EngineBase& eng, const EngineParams& p, int note, dou
         if (hz > bandLimit) above += m2;
     }
     return 10.0 * std::log10 (above / std::max (1.0e-30, total));
+}
+
+// Стационарный синус нужен для измерений плотности/позиции: динамика и хвост
+// фабричных записей иначе смешивают изменение алгоритма с изменением материала.
+static OneShot makeStationaryShot (double sr, double seconds, double overtoneHz = 0.0,
+                                   double fundamentalHz = 110.0)
+{
+    OneShot s;
+    s.name = "Granular stationary test";
+    s.rootNote = 45;
+    s.levels.resize (1);
+    const int n = (int) (seconds * sr);
+    s.levels[0].resize ((size_t) n);
+    for (int i = 0; i < n; ++i)
+    {
+        const double t = i / sr;
+        s.levels[0][(size_t) i] = (float) (0.30 * std::sin (kTwoPi * fundamentalHz * t)
+            + (overtoneHz > 0.0 ? 0.30 * std::sin (kTwoPi * overtoneHz * t) : 0.0));
+    }
+    buildMipLevels (s, sr);
+    return s;
+}
+
+// Мощность двух независимых тонов в рендере настоящего двигателя. Источник
+// содержит равные амплитуды; 24 окна усредняют случайные фазы зёрен. Верхний
+// тон задаётся в частотах выхода, а измеряемая частота может быть его alias.
+static std::pair<double, double> twoToneGranularDb (double rate, double inputToneAtOutputHz,
+                                                    double measuredToneHz)
+{
+    constexpr double sr = 48000.0, fundamentalHz = 30.0;
+    constexpr int N = 2048, windows = 24;
+    SampleBank b;
+    b.shots.push_back (makeStationaryShot (sr, 4.0, inputToneAtOutputHz / rate, fundamentalHz));
+    GranularEngine e;
+    e.setBank (&b); e.setSampleRate (sr); e.start (93, 1.0f); // базовый rate=16
+    EngineParams p;
+    p.p[0] = 0.4f; p.p[1] = 0.45f; p.p[2] = 1.0f; p.p[3] = 0.0f;
+    p.tuneSemis = (float) (12.0 * std::log2 (rate / 16.0)); p.level = 1.0f;
+    e.prepare (p);
+    for (int i = 0; i < 24000; ++i) (void) e.render (p);
+    double fundamentalPower = 0.0, tonePower = 0.0;
+    for (int w = 0; w < windows; ++w)
+    {
+        double ls = 0.0, lc = 0.0, hs = 0.0, hc = 0.0;
+        for (int i = 0; i < N; ++i)
+        {
+            const double x = e.render (p);
+            const double window = 0.5 - 0.5 * std::cos (kTwoPi * i / (N - 1));
+            const double lo = kTwoPi * fundamentalHz * rate * i / sr;
+            const double hi = kTwoPi * measuredToneHz * i / sr;
+            ls += window * x * std::sin (lo); lc += window * x * std::cos (lo);
+            hs += window * x * std::sin (hi); hc += window * x * std::cos (hi);
+        }
+        fundamentalPower += ls * ls + lc * lc;
+        tonePower += hs * hs + hc * hc;
+    }
+    return { 10.0 * std::log10 (std::max (1.0e-30, tonePower)
+                                 / std::max (1.0e-30, fundamentalPower)), fundamentalPower };
 }
 
 int main()
@@ -361,6 +432,339 @@ int main()
         suite::check (stats.wrappedReads == 0 && badSamples == 0,
                       "MIP не заворачивает чтение внутри окна зерна",
                       suite::num (stats.wrappedReads, 0) + " чтений, " + suite::num (badSamples, 0) + " NaN");
+    }
+
+    // Первая гранула не должна ждать целый интервал планировщика: при 4/с
+    // это 250 мс тишины до атаки инструмента.
+    std::printf ("\n--- Задержка первой гранулы при разных Density и sample rate ---\n");
+    {
+        double worstMs = 0.0;
+        int missing = 0;
+        for (double sr : { 44100.0, 48000.0, 96000.0 })
+        {
+            SampleBank b;
+            b.shots.push_back (makeStationaryShot (sr, 2.0));
+            for (float density : { 0.0f, 0.5f, 1.0f })
+            {
+                GranularEngine e;
+                e.setBank (&b); e.setSampleRate (sr); e.start (57, 1.0f);
+                EngineParams p;
+                p.p[0] = 0.3f; p.p[1] = 0.5f; p.p[2] = density; p.p[3] = 0.0f; p.level = 1.0f;
+                e.prepare (p);
+                int first = -1;
+                for (int i = 0; i < (int) (sr * 0.35); ++i)
+                    if (std::fabs (e.render (p)) > 1.0e-4f) { first = i; break; }
+                if (first < 0) ++missing;
+                else worstMs = std::max (worstMs, 1000.0 * first / sr);
+                std::printf ("   %.1f кГц, density %.1f: %d отсч. / %.3f мс\n",
+                             sr / 1000.0, density, first, first < 0 ? -1.0 : 1000.0 * first / sr);
+            }
+        }
+        suite::check (missing == 0 && worstMs < 6.0,
+                      "первая гранула начинается без ожидания периода Density",
+                      suite::num (worstMs, 3) + " мс, пропусков " + suite::num (missing, 0));
+    }
+
+    // Сравниваем с неизменённым двойником НА ТОМ ЖЕ отсчёте. Так естественный
+    // наклон волны не принимается за щелчок автоматизации.
+    std::printf ("\n--- Ступень Density без скачка уже звучащих зёрен ---\n");
+    {
+        SampleBank b;
+        b.shots.push_back (makeStationaryShot (48000.0, 2.0));
+        double worstRel = 0.0, worstJump = 0.0, worstNatural = 0.0;
+        int missing = 0;
+        for (float from : { 0.0f, 1.0f })
+        {
+            GranularEngine changed, reference;
+            changed.setBank (&b); reference.setBank (&b);
+            changed.setSampleRate (48000.0); reference.setSampleRate (48000.0);
+            changed.start (57, 1.0f); reference.start (57, 1.0f);
+            EngineParams p;
+            p.p[0] = 0.35f; p.p[1] = 1.0f; p.p[2] = from; p.p[3] = 0.2f; p.level = 1.0f;
+            changed.prepare (p); reference.prepare (p);
+            float previous = 0.0f;
+            bool found = false;
+            for (int i = 0; i < 48000 * 4; ++i)
+            {
+                previous = changed.render (p);
+                (void) reference.render (p);
+                // Совпадает с моментом старого пересчёта нормировки каждые
+                // 16 отсчётов, когда регрессия воспроизводилась стабильно.
+                if (i > 48000 && i % 16 == 15 && std::fabs (previous) > 0.05f)
+                { found = true; break; }
+            }
+            if (! found) { ++missing; continue; }
+            EngineParams q = p;
+            q.p[2] = 1.0f - from;
+            changed.prepare (q);
+            const float a = changed.render (q);
+            const float b0 = reference.render (p);
+            const double rel = std::fabs ((double) a - b0) / std::max (1.0e-9, std::fabs ((double) b0));
+            worstRel = std::max (worstRel, rel);
+            worstJump = std::max (worstJump, std::fabs ((double) a - previous));
+            worstNatural = std::max (worstNatural, std::fabs ((double) b0 - previous));
+            std::printf ("   %.0f → %.0f: до %.6f, после %.6f, без смены %.6f, Δ %.2f %%\n",
+                         from, q.p[2], previous, a, b0, 100.0 * rel);
+        }
+        suite::check (missing == 0 && worstRel < 0.005,
+                      "Density не делает ступень в текущих зёрнах",
+                      suite::num (worstRel * 100.0, 3) + " %, скачок " + suite::num (worstJump, 6)
+                      + ", естественный " + suite::num (worstNatural, 6));
+    }
+
+    // Одна и та же стационарная запись, но 0.5 с и 4 с: высокая нота вынуждает
+    // движок укоротить зерно в коротком источнике. Обе ожидаемые плотности
+    // перекрытия > 1, поэтому RMS должен оставаться близким без лимитера.
+    std::printf ("\n--- Нормировка фактической, а не запрошенной длины зерна ---\n");
+    {
+        double rms[2] = {};
+        int index = 0;
+        for (double seconds : { 0.5, 4.0 })
+        {
+            SampleBank b;
+            b.shots.push_back (makeStationaryShot (48000.0, seconds));
+            GranularEngine e;
+            e.setBank (&b); e.setSampleRate (48000.0); e.start (93, 1.0f);
+            EngineParams p;
+            p.p[0] = 0.4f; p.p[1] = 0.45f; p.p[2] = 1.0f; p.p[3] = 0.0f; p.level = 1.0f;
+            e.prepare (p);
+            double energy = 0.0;
+            for (int i = 0; i < 48000 * 5; ++i)
+            {
+                const float v = e.render (p);
+                if (i >= 48000) energy += (double) v * v;
+            }
+            rms[index++] = std::sqrt (energy / (48000.0 * 4.0));
+            std::printf ("   источник %.1f с: RMS %.6f\n", seconds, rms[index - 1]);
+        }
+        const double diffDb = std::fabs (20.0 * std::log10 (std::max (1.0e-12, rms[0])
+                                                          / std::max (1.0e-12, rms[1])));
+        suite::check (rms[0] > 0.01 && rms[1] > 0.01 && diffDb < 6.0,
+                      "укороченные зёрна не теряют уровень дважды", suite::num (diffDb, 2) + " дБ");
+    }
+
+    // Позиция контролирует возможный диапазон старта, даже если длина зерна
+    // урезана. Проверяем реальные позиции, не сравнение картинок и не RMS.
+    std::printf ("\n--- Position остаётся направленным на высокой ноте ---\n");
+    {
+        SampleBank b;
+        b.shots.push_back (makeStationaryShot (48000.0, 2.0));
+        double means[5] = {};
+        int index = 0, grains = 0;
+        for (float position : { 0.0f, 0.25f, 0.5f, 0.75f, 1.0f })
+        {
+            GranularEngine e;
+            e.setBank (&b); e.setSampleRate (48000.0); e.start (93, 1.0f);
+            EngineParams p;
+            p.p[0] = position; p.p[1] = 0.45f; p.p[2] = 1.0f; p.p[3] = 0.0f; p.level = 1.0f;
+            e.prepare (p);
+            std::array<bool, GranularEngine::kMaxGrains> previous {};
+            GranularTestProbe::Stats st;
+            for (int i = 0; i < 48000 * 5; ++i)
+            {
+                (void) e.render (p);
+                GranularTestProbe::observe (e, previous, st);
+            }
+            grains += st.spawned;
+            means[index++] = st.spawned > 0 ? st.startSum / st.spawned / 96000.0 : -1.0;
+            std::printf ("   position %.2f: средний старт %.2f %% записи (%d зёрен)\n",
+                         position, means[index - 1] * 100.0, st.spawned);
+        }
+        bool increasing = grains > 1000;
+        for (int i = 1; i < 5; ++i) increasing = increasing && means[i] - means[i - 1] > 0.025;
+        suite::check (increasing && means[4] - means[0] > 0.15,
+                      "Position сдвигает распределение стартов вперёд",
+                      suite::num ((means[4] - means[0]) * 100.0, 1) + " % длины источника");
+    }
+
+    // Намеренно очень короткий источник и крайние скорости. На таких данных
+    // минимум 16 выходных отсчётов может физически не помещаться — допустимо
+    // не запускать зерно, но недопустимо читать за край или заворачивать sinc.
+    std::printf ("\n--- Очень короткий источник: реальные границы sinc ---\n");
+    {
+        SampleBank b;
+        b.shots.push_back (makeStationaryShot (48000.0, 0.05));
+        GranularTestProbe::Stats st;
+        int bad = 0;
+        for (int note : { 69, 93, 117, 127 })
+            for (float tune : { 0.0f, 24.0f })
+            {
+                GranularEngine e;
+                e.setBank (&b); e.setSampleRate (48000.0); e.start (note, 1.0f);
+                EngineParams p;
+                p.p[0] = 0.97f; p.p[1] = 1.0f; p.p[2] = 1.0f; p.p[3] = 1.0f;
+                p.tuneSemis = tune; p.level = 1.0f;
+                e.prepare (p);
+                std::array<bool, GranularEngine::kMaxGrains> previous {};
+                for (int i = 0; i < 48000; ++i)
+                {
+                    if (! std::isfinite (e.render (p))) ++bad;
+                    GranularTestProbe::observe (e, previous, st);
+                }
+            }
+        std::printf ("   зёрен %d, выходов %d, fmod %d, заворотов sinc %d, NaN %d\n",
+                     st.spawned, st.unsafe, st.wrappedReads, st.kernelWrapReads, bad);
+        suite::check (st.spawned > 50 && st.unsafe == 0 && st.wrappedReads == 0
+                      && st.kernelWrapReads == 0 && bad == 0,
+                      "даже крайние скорости не заворачивают чтение sinc");
+    }
+
+    std::printf ("\n--- Источник короче окна огибающей (5 мс) ---\n");
+    {
+        SampleBank b;
+        b.shots.push_back (makeStationaryShot (48000.0, 0.005));
+        const bool validBody = b.shots[0].env.empty() && std::isfinite (b.shots[0].bodyRms)
+                            && b.shots[0].bodyRms > 1.0e-4f;
+        GranularEngine e;
+        e.setBank (&b); e.setSampleRate (48000.0); e.start (45, 1.0f);
+        EngineParams p;
+        p.p[0] = 0.5f; p.p[1] = 0.0f; p.p[2] = 1.0f; p.p[3] = 0.0f; p.level = 1.0f;
+        e.prepare (p);
+        GranularTestProbe::Stats st;
+        std::array<bool, GranularEngine::kMaxGrains> previous {};
+        int bad = 0;
+        for (int i = 0; i < 48000; ++i)
+        {
+            if (! std::isfinite (e.render (p))) ++bad;
+            GranularTestProbe::observe (e, previous, st);
+        }
+        std::printf ("   bodyRMS %.6f, уровней %zu, зёрен %d, sinc-заворотов %d, NaN %d\n",
+                     b.shots[0].bodyRms, b.shots[0].lens.size(), st.spawned, st.kernelWrapReads, bad);
+        suite::check (validBody && st.spawned > 10 && st.unsafe == 0 && st.wrappedReads == 0
+                      && st.kernelWrapReads == 0 && bad == 0,
+                      "короткая запись безопасна при построении банка и рендере");
+    }
+
+    // MIP-соседи обязаны описывать одну и ту же позицию исходника. Иначе их
+    // кроссфейд гасит тон; простое отношение длин буферов не исправляет задержку
+    // КИХ-дециматора. Замеряем фазу и амплитуду на стационарном синусе.
+    std::printf ("\n--- Фазовое совпадение соседних MIP-уровней ---\n");
+    {
+        const OneShot s = makeStationaryShot (48000.0, 2.0);
+        double worstPhase = 0.0, worstAmpError = 0.0;
+        int crossfades = 0;
+        for (float rate : { 1.04427378f, 2.08854756f, 4.17709512f, 8.35419024f,
+                            1.41421356f, 2.82842712f, 5.65685425f, 11.3137085f })
+        {
+            MipReader r;
+            r.setup (s, rate);
+            if (r.wA > 0.49f && r.wA < 0.51f && r.wB > 0.49f && r.wB < 0.51f) ++crossfades;
+            double sinDot = 0.0, cosDot = 0.0;
+            for (int i = 24000; i < 72000; ++i)  // ровно 110 периодов
+            {
+                const double ph = kTwoPi * 110.0 * i / 48000.0;
+                const double v = r.read ((float) i);
+                sinDot += v * std::sin (ph);
+                cosDot += v * std::cos (ph);
+            }
+            const double amp = std::hypot (sinDot, cosDot) / (0.30 * 24000.0);
+            const double phaseDeg = std::atan2 (cosDot, sinDot) * 180.0 / kPi;
+            worstAmpError = std::max (worstAmpError, std::fabs (1.0 - amp));
+            worstPhase = std::max (worstPhase, std::fabs (phaseDeg));
+            std::printf ("   rate %.3f: амплитуда %.4f, фаза %.2f°\n", rate, amp, phaseDeg);
+        }
+        suite::check (crossfades == 4 && worstAmpError < 0.03 && worstPhase < 2.0,
+                      "соседние MIP-уровни не гасят общий тон",
+                      "ошибка амплитуды " + suite::num (worstAmpError * 100.0, 2)
+                      + " %, фазы " + suite::num (worstPhase, 2) + "°, переходов "
+                      + suite::num (crossfades, 0));
+    }
+
+    // Нечётная длина уровня — результат отбрасывания последнего отсчёта,
+    // а не сдвиг sample rate. Проверяем масштаб и реконструкцию на уровне 8.
+    std::printf ("\n--- Нечётная длина источника не расстраивает MIP ---\n");
+    {
+        const OneShot s = makeStationaryShot (48000.0, 48001.0 / 48000.0, 0.0, 50.0);
+        MipReader r;
+        r.setup (s, 256.0f);
+        const double expected = 1.0 / 256.0;
+        double error = 0.0, energy = 0.0;
+        for (int i = 5000; i < 40000; ++i)
+        {
+            const double ideal = 0.30 * std::sin (kTwoPi * 50.0 * i / 48000.0);
+            const double d = r.read ((float) i) - ideal;
+            error += d * d; energy += ideal * ideal;
+        }
+        const double rel = std::sqrt (error / std::max (1.0e-20, energy));
+        std::printf ("   len0 %d, len8 %d, scale %.9f (ожидалось %.9f), ΔRMS %.5f\n",
+                     s.lens[0], r.lenA, r.invScaleA, expected, rel);
+        suite::check (s.lens.size() > 8 && r.lenA == 187
+                      && std::fabs ((double) r.invScaleA - expected) < 1.0e-9 && rel < 0.02,
+                      "шкала позиции задаётся прореживанием 2^L, а не длиной буфера");
+    }
+
+    // Стоп-полоса важна, но нельзя оплачивать её исчезновением слышимой
+    // полосы: проверяем одновременно тон 14.4 кГц и alias тона, который на
+    // 1% выше Найквиста (24.24 → 23.76 кГц).
+    std::printf ("\n--- Дробный pitch: полоса 14.4 кГц и alias у Найквиста ---\n");
+    {
+        double worstBandError = 0.0, worstAlias = -200.0, minReference = 1.0e30;
+        for (double rate : { 17.6, 20.0, 24.0, 48.0, 150.0 })
+        {
+            const auto band = twoToneGranularDb (rate, 14400.0, 14400.0);
+            const auto alias = twoToneGranularDb (rate, 24240.0, 23760.0);
+            worstBandError = std::max (worstBandError, std::fabs (band.first));
+            worstAlias = std::max (worstAlias, alias.first);
+            minReference = std::min (minReference, std::min (band.second, alias.second));
+            std::printf ("   rate %.1f: полоса %.2f дБ, alias %.2f дБ\n",
+                         rate, band.first, alias.first);
+        }
+        suite::check (worstBandError < 3.5 && minReference > 100.0,
+                      "частота 14.4 кГц не пропадает между уровнями MIP",
+                      "макс. |Δ| " + suite::num (worstBandError, 2) + " дБ");
+        suite::check (worstAlias < -60.0 && minReference > 100.0,
+                      "alias у Найквиста остаётся подавлен",
+                      "худший " + suite::num (worstAlias, 2) + " дБ");
+    }
+
+    // Тон выше НИКВИСТА после изменения питча заворачивается внутрь слышимой
+    // полосы; прежняя метрика энергии «выше полосы источника» его не замечала.
+    // В источнике две одинаковые по уровню частоты: 110 Гц и 0.55*SR/rate.
+    // Вторая заворачивается на 0.45*SR. Сравниваем энергии непосредственно в
+    // сигнале Granular, а не только в отдельном ридере.
+    std::printf ("\n--- Завёрнутый тон на высоких и дробных pitch-rate ---\n");
+    {
+        constexpr double sr = 48000.0;
+        constexpr int N = 2048, windows = 24;
+        double worstDb = -300.0;
+        bool finite = true;
+        for (double rate : { 16.0, 24.0, 32.0, 48.0, 64.0 })
+        {
+            SampleBank b;
+            b.shots.push_back (makeStationaryShot (sr, 4.0, 0.55 * sr / rate));
+            GranularEngine e;
+            e.setBank (&b); e.setSampleRate (sr); e.start (93, 1.0f);
+            EngineParams p;
+            p.p[0] = 0.4f; p.p[1] = 0.45f; p.p[2] = 1.0f; p.p[3] = 0.0f;
+            p.tuneSemis = (float) (12.0 * std::log2 (rate / 16.0)); p.level = 1.0f;
+            e.prepare (p);
+            for (int i = 0; i < 24000; ++i) (void) e.render (p);
+            double lowEnergy = 0.0, aliasEnergy = 0.0;
+            for (int win = 0; win < windows; ++win)
+            {
+                double ls = 0.0, lc = 0.0, hs = 0.0, hc = 0.0;
+                for (int i = 0; i < N; ++i)
+                {
+                    const float v = e.render (p);
+                    finite = finite && std::isfinite (v);
+                    const double w = 0.5 - 0.5 * std::cos (kTwoPi * i / (N - 1));
+                    const double loPh = kTwoPi * 110.0 * rate * i / sr;
+                    const double hiPh = kTwoPi * 0.45 * i;
+                    ls += w * v * std::sin (loPh); lc += w * v * std::cos (loPh);
+                    hs += w * v * std::sin (hiPh); hc += w * v * std::cos (hiPh);
+                }
+                lowEnergy += ls * ls + lc * lc;
+                aliasEnergy += hs * hs + hc * hc;
+            }
+            const double db = 10.0 * std::log10 (std::max (1.0e-30, aliasEnergy)
+                                                  / std::max (1.0e-30, lowEnergy));
+            finite = finite && lowEnergy > 1.0e-8 && std::isfinite (db);
+            worstDb = std::max (worstDb, db);
+            std::printf ("   rate %.0f: завёрнутый тон относительно основы %.1f дБ\n", rate, db);
+        }
+        suite::check (finite && worstDb < -35.0,
+                      "завёрнутый тон подавлен при целом и дробном pitch-rate",
+                      suite::num (worstDb, 1) + " дБ (худший случай)");
     }
 
     fails = suite::gFailures - before;

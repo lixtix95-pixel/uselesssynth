@@ -107,6 +107,11 @@ build/render_demo_granular: tools/render_demo_granular.cpp src/engines/granular.
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(INC) tools/render_demo_granular.cpp -o $@
 
+# Диагностический float WAV напрямую из движка; без нормировки/лимитера.
+build/render_granular_raw: tools/render_granular_raw.cpp src/engines/granular.h src/engines/mip_reader.h src/engines/sinc_interp.h src/content/sample_bank.h src/engines/halfband.h src/core/*.h
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) $(INC) tools/render_granular_raw.cpp -o $@
+
 build/render_demo_sample: tools/render_demo_sample.cpp src/engines/sample.h src/engines/halfband.h src/content/sample_bank.h src/core/*.h
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(INC) tools/render_demo_sample.cpp -o $@
@@ -116,7 +121,7 @@ build/render_demo: tools/render_demo.cpp src/engines/wavetable.h src/engines/hal
 	$(CXX) $(CXXFLAGS) $(INC) tools/render_demo.cpp -o $@
 
 test: $(TEST_BINS)
-	@for t in $(TEST_BINS); do echo "== $$t"; ./$$t | tail -3; done
+	@set -e; for t in $(TEST_BINS); do echo "== $$t"; ./$$t; done
 
 demo: $(DEMO_BINS)
 	@for d in $(DEMO_BINS); do ./$$d; done

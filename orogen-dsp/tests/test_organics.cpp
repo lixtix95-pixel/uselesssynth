@@ -8,6 +8,26 @@
 
 using namespace orogen;
 
+namespace orogen {
+struct OrganicsTestProbe
+{
+    static float position (const OrganicsEngine& e) noexcept { return e.pos; }
+    static float loopEnd (const OrganicsEngine& e) noexcept { return e.loopEndPos; }
+    static float expectedWrappedPosition (const OrganicsEngine& e, float previous) noexcept
+    {
+        const float rate = e.baseRate * (1.0f + e.driftAmt * 0.006f * std::sin (e.driftPhase));
+        const float length = e.loopEndPos - e.loopStartPos;
+        const float wanted = e.loopWide ? std::max (256.0f, length * 0.5f)
+                                        : std::max (64.0f, e.loopPeriod);
+        const float fade = std::min (wanted, length * 0.5f);
+        const float cycle = length - fade;
+        float overshoot = previous + rate - e.loopEndPos;
+        if (overshoot >= cycle) overshoot = std::fmod (overshoot, cycle);
+        return e.loopStartPos + fade + overshoot;
+    }
+};
+}
+
 // Алиасинг для Organics: слой воздуха — шум, но он ограничен ФНЧ (6 кГц),
 // а источник — сэмпл с полосой до 4 кГц при питч-рейте 1. Значит всё выше
 // 12 кГц (с учётом питч-рейта) — ошибка движка: образы интерполятора,
@@ -212,6 +232,92 @@ int main()
                          bank.shots[(size_t) table].name.c_str(), mean, ripple * 100.0);
             suite::check (ripple < 0.65, "петля не пульсирует", suite::num (ripple * 100.0, 1) + " %");
         }
+    }
+
+    // После выравнивания общих MIP-уровней обнаружилось, что вторая ветвь
+    // кроссфейда читала отрицательную позицию (то есть снова хвост), а при
+    // завороте отбрасывался остаток дробного шага. Проверяем отдельно
+    // координату и выход без шума/тела на нотах с многократным заворотом.
+    std::printf ("\n--- Склейка петли при дрейфе и дробном шаге ---\n");
+    {
+        OrganicsEngine e;
+        e.setBank (&bank); e.setSampleRate (48000.0); e.start (81, 1.0f);
+        EngineParams p;
+        p.table = 2; p.p[0] = 0.0f; p.p[1] = 0.0f; p.p[2] = 1.0f; p.p[3] = 0.2f; p.level = 1.0f;
+        e.prepare (p);
+        int wraps = 0, bad = 0;
+        double worstError = 0.0;
+        for (int i = 0; i < 48000 * 2; ++i)
+        {
+            const float previous = OrganicsTestProbe::position (e);
+            if (! std::isfinite (e.render (p))) ++bad;
+            const float next = OrganicsTestProbe::position (e);
+            if (next < previous)
+            {
+                ++wraps;
+                const float expected = OrganicsTestProbe::expectedWrappedPosition (e, previous);
+                worstError = std::max (worstError, std::fabs ((double) next - expected));
+            }
+        }
+        std::printf ("   заворотов %d, ошибка остатка %.6f отсч., NaN %d\n", wraps, worstError, bad);
+        suite::check (wraps >= 7 && worstError < 1.0e-4 && bad == 0,
+                      "остаток дробного шага сохраняется при завороте");
+        double worstDb = -300.0;
+        for (float drift : { 0.0f, 0.25f, 1.0f })
+        {
+            OrganicsEngine a;
+            a.setBank (&bank);
+            p.p[2] = drift;
+            const double db = organicsAliasDb (a, p, 81, 48000.0);
+            worstDb = std::max (worstDb, db);
+            std::printf ("   drift %.2f: внеполосная энергия %.1f дБ\n", drift, db);
+        }
+        suite::check (worstDb < -75.0,
+                      "кроссфейд ведёт в начало петли без заворота в хвост",
+                      suite::num (worstDb, 1) + " дБ (без воздуха и тела)");
+    }
+
+    // Общий банк теперь корректно строится для записи короче 10-мс окна
+    // огибающей. Проверяем и Organics, чтобы отсутствие/короткая огибающая
+    // не вела к чтению до начала или за конец env, а короткая петля — к
+    // нулевому периоду и уходу позиции за запись.
+    std::printf ("\n--- Короткие источники общего банка и Organics ---\n");
+    {
+        int bad = 0, outside = 0, silent = 0;
+        for (int millis : { 5, 20, 40 })
+        {
+            SampleBank shortBank;
+            OneShot shot;
+            shot.name = "short"; shot.rootNote = 45; shot.levels.resize (1);
+            shot.levels[0].resize ((size_t) (48 * millis));
+            for (size_t i = 0; i < shot.levels[0].size(); ++i)
+                shot.levels[0][i] = (float) (0.3 * std::sin (kTwoPi * 110.0 * i / 48000.0));
+            buildMipLevels (shot, 48000.0);
+            const size_t envN = shot.env.size();
+            shortBank.shots.push_back (std::move (shot));
+            for (int note : { 60, 127 })
+            {
+                OrganicsEngine e;
+                e.setBank (&shortBank); e.setSampleRate (48000.0); e.start (note, 1.0f);
+                EngineParams p;
+                p.p[0] = 0.2f; p.p[1] = 0.1f; p.p[2] = 0.25f; p.p[3] = 0.2f; p.level = 1.0f;
+                e.prepare (p);
+                double energy = 0.0;
+                for (int i = 0; i < 12000; ++i)
+                {
+                    const float x = e.render (p);
+                    if (! std::isfinite (x)) ++bad;
+                    energy += (double) x * x;
+                    const float pos = OrganicsTestProbe::position (e);
+                    if (pos < 0.0f || pos >= OrganicsTestProbe::loopEnd (e)) ++outside;
+                }
+                if (energy < 1.0e-12) ++silent;
+            }
+            std::printf ("   %d мс: кадров огибающей %zu\n", millis, envN);
+        }
+        std::printf ("   NaN/Inf %d, выходов из петли %d, тихих случаев %d\n", bad, outside, silent);
+        suite::check (bad == 0 && outside == 0 && silent == 0,
+                      "короткая огибающая и кратная прокрутка петли безопасны");
     }
 
     fails = suite::gFailures - before;

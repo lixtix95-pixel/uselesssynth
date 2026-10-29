@@ -1082,6 +1082,39 @@ int main()
         }
     }
 
+    // Независимый дефект выходного FX-лимитера: если значение пересекало
+    // 0.98, старая ветвь мгновенно перескакивала с 0.98 примерно на 0.775.
+    // Тестируем непрерывность и стереопару напрямую, не снижая уровень
+    // сырого движка и не используя лимитер для маскировки его дефектов.
+    std::printf ("\n--- 19. Выходной лимитер: непрерывность и стереосвязь ---\n");
+    {
+        constexpr float ceiling = 0.98f;
+        float beforeL = 0.97999f, beforeR = -0.489995f;
+        float afterL = 0.98001f, afterR = -0.490005f;
+        Dynamics::limit (beforeL, beforeR, ceiling);
+        Dynamics::limit (afterL, afterR, ceiling);
+        const float jump = std::fabs (afterL - beforeL);
+        std::printf ("   0.97999 -> %.8f, 0.98001 -> %.8f; скачок %.8f\n",
+                     beforeL, afterL, jump);
+        check (std::fabs (beforeL - 0.97999f) < 1.0e-6f && jump < 3.0e-5f,
+               "пересечение порога не создаёт разрыв", num (jump, 8));
+
+        bool valid = true;
+        float worstRatio = 0.0f, highest = 0.0f;
+        for (float in : { -3.0f, -1.3f, -0.98f, -0.2f, 0.2f, 0.98f, 1.3f, 3.0f })
+        {
+            float l = in, r = -0.37f * in;
+            Dynamics::limit (l, r, ceiling);
+            highest = std::max (highest, std::max (std::fabs (l), std::fabs (r)));
+            worstRatio = std::max (worstRatio, std::fabs (r + 0.37f * l));
+            valid = valid && std::isfinite (l) && std::isfinite (r);
+            if (std::fabs (in) <= ceiling) valid = valid && l == in && r == -0.37f * in;
+        }
+        std::printf ("   макс. пик %.8f, ошибка стереосвязи %.8f\n", highest, worstRatio);
+        check (valid && highest <= ceiling + 1.0e-6f && worstRatio < 1.0e-6f,
+               "ниже порога прозрачен; выше сохраняет стереосвязь и потолок");
+    }
+
     std::printf ("\n=================================================\n");
     if (suite::gFailures == 0) std::printf ("ВСЕ ТЕСТЫ ПРОЙДЕНЫ (провалов: 0)\n");
     else std::printf ("ПРОВАЛОВ: %d\n", suite::gFailures);

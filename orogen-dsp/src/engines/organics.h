@@ -63,6 +63,13 @@ public:
     {
         if (bank == nullptr || bank->shots.empty()) return;
         const OneShot& s = bank->shots[(size_t) clamp (p.table, 0, (int) bank->shots.size() - 1)];
+        // MIP sinc требует достаточно данных; неподготовленный/слишком короткий
+        // источник безопасно даёт тишину, а не чтение вне буфера.
+        if (s.levels.empty() || s.lens.empty() || s.lens[0] < SincKernel::kTaps + 8)
+        {
+            shot = nullptr;
+            return;
+        }
         shot = &s;
 
         baseRate = (float) std::pow (2.0, ((double) note - (double) s.rootNote + (double) p.tuneSemis) / 12.0);
@@ -83,19 +90,23 @@ public:
         // с длинным (половинным) кроссфейдом даёт ровный уровень; на высоких
         // нотах, где такая петля короче 0.3 с, кроссфейд сужается до периода,
         // чтобы не плодить боковые полосы (метрика алиасинга).
-        const int winN = std::max (4, (int) s.env.size() / 4);
-        const int bestStart = std::min ((int) s.env.size() - 1, s.loopStart / std::max (1, s.envStep));
+        const int envN = (int) s.env.size();
+        const int winN = std::min (envN, std::max (4, envN / 4));
+        const int bestStart = clamp (s.loopStart / std::max (1, s.envStep), 0, std::max (0, envN - winN));
         loopPeriod = (float) std::max (32, (int) std::lround (sampleRate / std::max (20.0, (double) midiToHz (s.rootNote))));
 
-        const float usable = (float) s.lens[0] - 64.0f;
+        const float usable = std::max (16.0f, (float) s.lens[0] - 64.0f);
         loopStartPos = 0.0f;
-        loopEndPos   = std::floor (usable / loopPeriod) * loopPeriod;
+        const float quantizedEnd = std::floor (usable / loopPeriod) * loopPeriod;
+        // Запись может быть короче периода: нулевую петлю строить нельзя.
+        loopEndPos = quantizedEnd > 0.0f ? quantizedEnd : usable;
         const float loopOutSec = (loopEndPos - loopStartPos) / std::max (1.0e-3f, baseRate) / (float) sampleRate;
         loopWide = loopOutSec >= 0.3f;
 
         double acc = 0.0; int cnt = 0;
         for (int i = bestStart; i < bestStart + winN; ++i) { acc += (double) s.env[(size_t) i] * s.env[(size_t) i]; ++cnt; }
-        const float loopRms = cnt > 0 ? (float) std::sqrt (acc / (double) cnt) : 0.0f;
+        // Если запись короче окна огибающей, банк уже сохранил RMS всего файла.
+        const float loopRms = cnt > 0 ? (float) std::sqrt (acc / (double) cnt) : s.bodyRms;
         // потолок 12x: у «стеклянного» удара хвост тише тела на 20 дБ, и
         // при прежнем потолке 4x он оставался на 12 дБ тише остальных тембров
         srcScale = clamp (0.25f / std::max (1.0e-4f, loopRms), 0.25f, 12.0f);
@@ -153,8 +164,12 @@ public:
         // (Wood Knock) заворот «в начало» давал повторный удар каждые полсекунды
         // — тот самый «пулемёт».
         const float loopStart = loopStartPos, loopEnd = loopEndPos;
-        const float fade = loopWide ? std::max (256.0f, (loopEnd - loopStart) * 0.5f)
-                                    : std::max (64.0f, loopPeriod);
+        const float loopLength = loopEnd - loopStart;
+        const float wantedFade = loopWide ? std::max (256.0f, loopLength * 0.5f)
+                                         : std::max (64.0f, loopPeriod);
+        // На короткой записи fade не может занимать всю петлю: тогда период
+        // после склейки становится нулевым и позиция улетает за её конец.
+        const float fade = std::min (wantedFade, loopLength * 0.5f);
         float src = mip.read (pos);
         if (pos >= loopEnd - fade)
         {
@@ -163,13 +178,26 @@ public:
             const float w = (pos - (loopEnd - fade)) / fade;
             const float wa = 0.5f + 0.5f * fastCosTbl (w * 0.5f);
             const float wb = 0.5f - 0.5f * fastCosTbl (w * 0.5f);
-            src = src * wa + mip.read (pos - (loopEnd - loopStart)) * wb;
+            // Вторая ветвь идёт от начала петли к loopStart + fade.
+            // Отрицательная позиция pos-loopEnd раньше заворачивалась обратно
+            // в ХВОСТ у MipReader, а затем скачком перескакивала к началу.
+            const float nextPos = loopStart + (pos - (loopEnd - fade));
+            src = src * wa + mip.read (nextPos) * wb;
         }
         pos += rate;
-        if (pos >= loopEnd) pos = loopStart + fade;
+        if (pos >= loopEnd)
+        {
+            // Остаток шага сохраняем; на короткой петле один шаг может
+            // перескочить несколько оборотов. Обычный случай обходится без fmod.
+            float overshoot = pos - loopEnd;
+            const float cycle = loopLength - fade;
+            if (overshoot >= cycle) overshoot = std::fmod (overshoot, cycle);
+            pos = loopStart + fade + overshoot;
+        }
 
-        // огибающая записи — по ней ведём воздух и снимаем сигнал в тишине
-        const float env = shot->envAt (pos);
+        // У источника короче окна 10 мс огибающей нет: его RMS уже вычислен
+        // при сборке банка, вместо фиктивной единицы используем это значение.
+        const float env = shot->env.empty() ? shot->bodyRms : shot->envAt (pos);
 
         // Компенсация огибающей внутри петли.
         //
@@ -237,6 +265,7 @@ public:
     }
 
 private:
+    friend struct OrganicsTestProbe;
     struct Body
     {
         float freq = 300.0f, q = 10.0f, gain = 1.0f;

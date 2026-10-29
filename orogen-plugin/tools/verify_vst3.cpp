@@ -142,7 +142,11 @@ int main (int argc, char** argv)
         Graphics g (img);
         ed->paintEntireComponent (g, true);
         check (img.getWidth() == 1280, "редактор отрисовывается в изображение");
+        // editorBeingDeleted снимает указатель у процессора, но не удаляет
+        // сам объект. Иначе таймер и PreviewWorker продолжают обращаться к
+        // уже уничтоженному VST3-инстансу при следующем проходе message loop.
         inst->editorBeingDeleted (ed);
+        delete ed;
     }
 
     // --- звук ---
@@ -185,6 +189,63 @@ int main (int argc, char** argv)
     check (peak < 1.0f, "нет клиппинга", String::fromUTF8 ("пик ") + String (peak, 3));
 
     inst->releaseResources();
+    inst.reset();
+
+    // Отдельный инстанс VST3: Granular с минимальной плотностью через реальные
+    // параметры хоста и MIDI. ROBIN даёт 1024 отсчёта задержки даже при mix=0,
+    // поэтому измеряем общую задержку и остаток после неё раздельно.
+    std::printf ("\n--- Granular через VST3-хост ---\n");
+    String granularError;
+    auto granular = format->createInstanceFromDescription (d, 48000.0, 128, granularError);
+    check (granular != nullptr, "VST3-инстанс Granular создаётся", granularError);
+    if (granular != nullptr)
+    {
+        granular->prepareToPlay (48000.0, 128);
+        const auto gp = granular->getParameters();
+        int missing = 0;
+        const auto setNamed = [&] (const String& name, float value) {
+            for (auto* p : gp)
+                if (p->getName (64) == name) { p->setValueNotifyingHost (value); return; }
+            ++missing;
+            std::printf ("   не найден параметр: %s\n", name.toRawUTF8());
+        };
+        setNamed ("sA_Engine", 0.5f);          // 4 / 8 = Granular из девяти
+        setNamed ("sA_On", 1.0f);
+        for (const char* n : { "sB_On", "sC_On", "sD_On", "sE_On", "sF_On", "sG_On", "sH_On" }) setNamed (n, 0.0f);
+        setNamed ("Patch Mode", 0.0f); setNamed ("Arp On", 0.0f);
+        setNamed ("sA_P1", 0.35f); setNamed ("sA_P2", 0.45f);
+        setNamed ("sA_P3", 0.0f); setNamed ("sA_P4", 0.0f);
+        setNamed ("sA_Table", 0.0f); setNamed ("sA_Attack", 0.0f);
+        for (const char* n : { "Drive", "Chorus Mix", "Delay Mix", "Reverb Mix", "Plate Mix",
+                               "Material Mix", "Spectre Mix", "Glitch Mix", "Robin Mix", "Comb Mix" })
+            setNamed (n, 0.0f);
+        setNamed ("Comp Ratio", 0.0f); setNamed ("Comp Makeup", 0.0f);
+        MessageManager::getInstance()->runDispatchLoopUntil (200);
+        check (missing == 0, "параметры Granular и FX доступны VST3-хосту", String (missing) + String::fromUTF8 (" пропусков"));
+
+        const int reported = granular->getLatencySamples();
+        MidiBuffer event, none;
+        event.addEvent (MidiMessage::noteOn (1, 60, 0.8f), 0);
+        AudioBuffer<float> block (2, 128);
+        int first = -1, nonFinite = 0;
+        for (int b = 0; b < 120; ++b)
+        {
+            block.clear();
+            granular->processBlock (block, b == 0 ? event : none);
+            for (int i = 0; i < 128; ++i)
+            {
+                const float v = block.getSample (0, i);
+                if (! std::isfinite (v)) ++nonFinite;
+                if (first < 0 && std::fabs (v) > 1.0e-5f) first = b * 128 + i;
+            }
+        }
+        std::printf ("   первый отсчёт %d, latency %d, остаток %.3f мс, NaN %d\n",
+                     first, reported, first >= reported ? (first - reported) / 48.0 : -1.0, nonFinite);
+        check (reported == 1024 && first >= reported && first - reported < 960 && nonFinite == 0,
+               "Granular начинает звучать без 250-мс паузы",
+               "latency " + String (reported) + ", onset " + String (first));
+        granular->releaseResources();
+    }
 
     std::printf ("\n=== %s (провалов: %d)\n", failures == 0 ? "ПЛАГИН ПРОЙДЕН" : "ЕСТЬ ПРОВАЛЫ", failures);
     return failures == 0 ? 0 : 1;
