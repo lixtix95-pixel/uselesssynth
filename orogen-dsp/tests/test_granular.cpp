@@ -171,7 +171,7 @@ static OneShot makeStationaryShot (double sr, double seconds, double overtoneHz 
 // содержит равные амплитуды; 24 окна усредняют случайные фазы зёрен. Верхний
 // тон задаётся в частотах выхода, а измеряемая частота может быть его alias.
 static std::pair<double, double> twoToneGranularDb (double rate, double inputToneAtOutputHz,
-                                                    double measuredToneHz)
+                                                    double measuredToneHz, float reverse = 0.0f)
 {
     constexpr double sr = 48000.0, fundamentalHz = 30.0;
     constexpr int N = 2048, windows = 24;
@@ -183,6 +183,7 @@ static std::pair<double, double> twoToneGranularDb (double rate, double inputTon
     p.p[0] = 0.4f; p.p[1] = 0.45f; p.p[2] = 1.0f; p.p[3] = 0.0f;
     p.tuneSemis = (float) (12.0 * std::log2 (rate / 16.0)); p.level = 1.0f;
     p.detune = 0.0f;  // частоты анализа заданы ТОЧНО для этого rate
+    p.grainReverse = reverse;
     e.prepare (p);
     for (int i = 0; i < 24000; ++i) (void) e.render (p);
     double fundamentalPower = 0.0, tonePower = 0.0;
@@ -1019,19 +1020,21 @@ int main()
     // фактический pitch. Тестируем и фабричные 2 с, и длинный источник.
     std::printf ("\n--- Точность курса зерна при позднем Position ---\n");
     {
-        auto measureCents = [] (SampleBank& b, double sr, int note) {
+        auto measureCents = [] (SampleBank& b, double sr, int note, bool reverse = false) {
             GranularEngine e; e.setBank (&b); e.setSampleRate (sr); e.start (note, 1.0f);
             EngineParams p;
             p.p[0] = 0.95f; p.p[1] = 1.0f; p.p[2] = 0.0f; p.p[3] = 0.0f;
-            p.detune = 0.0f; p.level = 1.0f; e.prepare (p); (void) e.render (p);
+            p.detune = 0.0f; p.level = 1.0f; p.grainReverse = reverse ? 1.0f : 0.0f;
+            e.prepare (p); (void) e.render (p);
             const auto first = GranularTestProbe::firstCursor (e);
             for (int i = 0; i < 2000; ++i) (void) e.render (p);
             const auto last = GranularTestProbe::firstCursor (e);
-            if (first[1] <= 0.0 || last[1] <= 0.0) return 1.0e6;
+            if ((reverse && (first[1] >= 0.0 || last[1] >= 0.0))
+                || (! reverse && (first[1] <= 0.0 || last[1] <= 0.0))) return 1.0e6;
             const double actual = (last[0] - first[0]) / 2000.0;
-            return actual > 0.0 ? 1200.0 * std::log2 (actual / first[1]) : 1.0e6;
+            return actual * first[1] > 0.0 ? 1200.0 * std::log2 (actual / first[1]) : 1.0e6;
         };
-        double worstFactory = 0.0;
+        double worstFactory = 0.0, worstReverseFactory = 0.0;
         int factoryCases = 0;
         for (double sr : { 44100.0, 48000.0, 96000.0 })
         {
@@ -1039,6 +1042,7 @@ int main()
             for (int note : { 37, 38, 39, 46, 60 })
             {
                 worstFactory = std::max (worstFactory, std::fabs (measureCents (b, sr, note)));
+                worstReverseFactory = std::max (worstReverseFactory, std::fabs (measureCents (b, sr, note, true)));
                 ++factoryCases;
             }
         }
@@ -1046,16 +1050,25 @@ int main()
         suite::check (factoryCases == 15 && worstFactory < 0.02,
                       "фактическая скорость соответствует pitch в фабричном источнике",
                       suite::num (worstFactory, 6) + " цента");
+        suite::check (factoryCases == 15 && worstReverseFactory < 0.02,
+                      "обратный курс сохраняет pitch на 44.1–96 кГц",
+                      suite::num (worstReverseFactory, 6) + " цента");
 
         constexpr double sr = 96000.0, toneHz = 8000.0;
         SampleBank longBank;
         longBank.shots.push_back (makeStationaryShot (sr, 26.0, 0.0, toneHz));
-        double worstLong = 0.0;
+        double worstLong = 0.0, worstReverseLong = 0.0;
         for (int note : { 36, 37, 38, 46 })
+        {
             worstLong = std::max (worstLong, std::fabs (measureCents (longBank, sr, note)));
-        std::printf ("   26 с / 96 кГц: худшая ошибка %.6f цента\n", worstLong);
+            worstReverseLong = std::max (worstReverseLong, std::fabs (measureCents (longBank, sr, note, true)));
+        }
+        std::printf ("   26 с / 96 кГц: худшая ошибка %.6f / %.6f цента (прямо / реверс)\n",
+                     worstLong, worstReverseLong);
         suite::check (worstLong < 0.02, "длинная запись не расстраивает зерно",
                       suite::num (worstLong, 6) + " цента");
+        suite::check (worstReverseLong < 0.02, "длинная запись не расстраивает обратное зерно",
+                      suite::num (worstReverseLong, 6) + " цента");
 
         // Независимая проверка интерполятора на заданных double-координатах:
         // идеальный тон известен аналитически. Низкая ошибка короткого начала
@@ -1107,6 +1120,28 @@ int main()
         suite::check (crosses > 100 && std::fabs (pitchError) < 0.05,
                       "измеренная частота полного зерна не зависит от позиции",
                       suite::num (pitchError, 6) + " цента");
+
+        GranularEngine reverseEngine;
+        reverseEngine.setBank (&longBank); reverseEngine.setSampleRate (sr); reverseEngine.start (36, 1.0f);
+        p.grainReverse = 1.0f; reverseEngine.prepare (p);
+        firstCross = lastCross = 0.0; crosses = 0; previous = 0.0f;
+        for (int i = 0; i < (int) (0.18 * sr); ++i)
+        {
+            const float value = reverseEngine.render (p);
+            if (i > (int) (0.02 * sr) && previous < 0.0f && value >= 0.0f)
+            {
+                const double cross = i - 1.0 + (double) (-previous) / (double) (value - previous);
+                if (crosses++ == 0) firstCross = cross;
+                lastCross = cross;
+            }
+            previous = value;
+        }
+        const double reverseHz = crosses > 1 ? (crosses - 1) * sr / (lastCross - firstCross) : 0.0;
+        const double reverseError = reverseHz > 0.0 ? 1200.0 * std::log2 (reverseHz / expected) : 1.0e6;
+        std::printf ("   выход reverse: %.6f Гц / эталон %.6f Гц, ошибка %+.6f цента\n",
+                     reverseHz, expected, reverseError);
+        suite::check (crosses > 100 && std::fabs (reverseError) < 0.05,
+                      "измеренная частота обратного зерна точна", suite::num (reverseError, 6) + " цента");
     }
 
     std::printf ("\n--- Дробный pitch: полоса 14.4 кГц и alias у Найквиста ---\n");
@@ -1128,6 +1163,23 @@ int main()
         suite::check (worstAlias < -60.0 && minReference > 100.0,
                       "alias у Найквиста остаётся подавлен",
                       "худший " + suite::num (worstAlias, 2) + " дБ");
+    }
+    std::printf ("\n--- Reverse: полоса 14.4 кГц и alias у Найквиста ---\n");
+    {
+        double worstBandError = 0.0, worstAlias = -200.0, minReference = 1.0e30;
+        for (double rate : { 17.6, 20.0, 24.0, 48.0, 150.0 })
+        {
+            const auto band = twoToneGranularDb (rate, 14400.0, 14400.0, 1.0f);
+            const auto alias = twoToneGranularDb (rate, 24240.0, 23760.0, 1.0f);
+            worstBandError = std::max (worstBandError, std::fabs (band.first));
+            worstAlias = std::max (worstAlias, alias.first);
+            minReference = std::min (minReference, std::min (band.second, alias.second));
+            std::printf ("   reverse |rate| %.1f: полоса %.2f дБ, alias %.2f дБ\n", rate, band.first, alias.first);
+        }
+        suite::check (worstBandError < 3.5 && minReference > 100.0,
+                      "14.4 кГц сохраняется и при реверсе", "макс. |Δ| " + suite::num (worstBandError, 2) + " дБ");
+        suite::check (worstAlias < -60.0 && minReference > 100.0,
+                      "alias у Найквиста подавлен и при реверсе", "худший " + suite::num (worstAlias, 2) + " дБ");
     }
 
     // Тон выше НИКВИСТА после изменения питча заворачивается внутрь слышимой

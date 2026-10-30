@@ -20,6 +20,7 @@ struct EngineParams
     float detune   = 0.3f;                        // 0..1 -> разброс в центах, свой на голос
     int   table    = 0;                           // выбор контента (таблица/источник/тело)
     bool  on       = true;
+    float grainReverse = 0.0f;                    // Granular: вероятность реверса нового зерна, 0..1
 };
 
 class EngineBase

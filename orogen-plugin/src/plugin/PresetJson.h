@@ -36,6 +36,7 @@ inline juce::var slotToVar (const SlotPatch& s)
     o->setProperty ("pan", s.params.pan);
     o->setProperty ("tune", s.params.tuneSemis);
     o->setProperty ("detune", s.params.detune);
+    o->setProperty ("grainReverse", s.params.grainReverse);
     o->setProperty ("table", s.params.table);
     o->setProperty ("attack", s.attack); o->setProperty ("decay", s.decay);
     o->setProperty ("sustain", s.sustain); o->setProperty ("release", s.release);
@@ -62,6 +63,7 @@ inline void slotFromVar (const juce::var& v, SlotPatch& s)
     s.params.pan    = f ("pan", 0.0f);
     s.params.tuneSemis = f ("tune", 0.0f);
     s.params.detune = f ("detune", 0.3f);
+    s.params.grainReverse = f ("grainReverse", 0.0f);
     s.params.table  = (int) o->getProperty ("table");
     s.attack  = f ("attack", 0.005f); s.decay  = f ("decay", 0.30f);
     s.sustain = f ("sustain", 0.85f); s.release = f ("release", 0.35f);

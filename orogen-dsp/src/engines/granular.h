@@ -65,6 +65,7 @@ public:
         needSnap = true;
         active = true;
         rng = Rng { 0x51F3A7u };
+        directionRng = Rng { 0xB79D31u }; // не влияет на RNG позиции и питча
     }
 
     void stop() override
@@ -94,6 +95,9 @@ public:
         const float sizeT  = clamp (p.p[1], 0.0f, 1.0f);
         const float densT  = clamp (p.p[2], 0.0f, 1.0f);
         spread             = clamp (p.p[3], 0.0f, 1.0f);
+        // Направление выбирается только при рождении зерна: автоматизация
+        // не изменяет курс и считыватель уже играющих зёрен.
+        reverseChance      = clamp (p.grainReverse, 0.0f, 1.0f);
 
         // размер: 8 .. 220 мс (в секундах)
         sizeSec = 0.008f + sizeT * 0.212f;
@@ -141,7 +145,12 @@ public:
 
             g.pos   += g.rate;
             g.phase += 1.0f / g.dur;
-            if (g.phase >= 1.0f) g.active = false;
+            // Накопление float-фазы может закончиться на несколько отсчётов
+            // позже расчётной dur (например, при 96 кГц). Не даём следующему
+            // sinc-чтению перейти край MIP и завернуться на другой конец:
+            // штатное воспроизведение и окно при этом не меняются.
+            if (g.phase >= 1.0f || (g.rate < 0.0f ? g.pos < g.readLimit : g.pos >= g.readLimit))
+                g.active = false;
         }
 
         // Нормировка зафиксирована при запуске каждого зерна. Уже звучащее
@@ -163,6 +172,7 @@ private:
         // после 2 с точность шага уже даёт до ~14 центов ошибки, на длинных
         // источниках — полутоны. Rate остаётся float, но суммируется в double.
         double pos = 0.0;
+        double readLimit = 0.0; // безопасный край sinc в направлении чтения
         float rate = 1.0f, phase = 0.0f, amp = 0.0f, dur = 3840.0f;
         bool  active = false;
     };
@@ -215,8 +225,20 @@ private:
         if (positionInRange > startRange) positionInRange = foldedRange - positionInRange;
         const float pos = safeBegin + positionInRange;
 
-        g->pos   = pos;
-        g->rate  = rate;
+        // MIP и обе границы выбраны по положительной |rate|. Реверс читает
+        // тот же безопасный интервал с верхнего края в обратную сторону;
+        // sinc получает double-координату, а скорость получает только знак.
+        // При 0%/100% отдельный RNG не требуется; при промежуточной вероятности
+        // он не расходует генератор Spread/Position и не меняет их поведение.
+        const bool reverse = reverseChance >= 1.0f
+                          || (reverseChance > 0.0f && directionRng.nextFloat() < reverseChance);
+        const float readSpan = g->dur * rate;
+        g->pos   = reverse ? (double) pos + (double) readSpan : (double) pos;
+        g->rate  = reverse ? -rate : rate;
+        // Sinc читает half-1 отсчётов слева и half справа. Правая граница
+        // исключительная, левая включительная; invScaleA — степень двойки.
+        g->readLimit = (double) (reverse ? half - 1 : g->mip.lenA - half)
+                     / (double) g->mip.invScaleA;
         g->phase = 0.0f;
 
         // Учитываем энергию ВСЕГО фактически читаемого участка, взвешенную
@@ -229,10 +251,14 @@ private:
         // возвращает условную единицу, а не RMS; из-за неё разница в один
         // отсчёт на границе 10 мс меняла gain зерна до 12 дБ. Для короткой
         // записи используем заранее рассчитанный RMS целого источника.
-        float local = shot->env.empty() ? bodyRms : shot->envAt (pos);
+        // В реверсе первая проба берётся с верхнего края. Проверяем и нижний:
+        // тихий старт не должен усилить громкую атаку на противоположном
+        // конце в несколько раз. Прямой путь остаётся побайтно прежним.
+        float local = shot->env.empty() ? bodyRms : shot->envAt (reverse ? (float) g->pos : pos);
+        if (reverse && ! shot->env.empty()) local = std::max (local, shot->envAt (pos));
+        // Взвешивание Hann² обходит ячейки в порядке фактического чтения.
         if (! shot->env.empty() && shot->envStep > 0)
         {
-            const float readSpan = g->dur * rate;
             // Фабричные источники: прежние точечные пробы через половину
             // ячейки. На очень длинном проходе 256 точек могут пропустить
             // одиночную атаку, поэтому каждая из тех же 256 фазовых секций
@@ -248,13 +274,15 @@ private:
                 double energy;
                 if (integrate)
                 {
-                    const double from = (double) pos + (double) readSpan * (double) i / probes;
-                    const double to = (double) pos + (double) readSpan * (double) (i + 1) / probes;
+                    const int section = reverse ? probes - 1 - i : i;
+                    const double from = (double) pos + (double) readSpan * (double) section / probes;
+                    const double to = (double) pos + (double) readSpan * (double) (section + 1) / probes;
                     energy = shot->meanEnvEnergy (from, to);
                 }
                 else
                 {
-                    const float env = shot->envAt (pos + phase * readSpan);
+                    const float samplePhase = reverse ? 1.0f - phase : phase;
+                    const float env = shot->envAt (pos + samplePhase * readSpan);
                     energy = (double) env * env;
                 }
                 const double weight = (double) window * window;
@@ -298,9 +326,10 @@ private:
     // в инструменте каждый note-on подставляет собственное значение голоса.
     float  noteRandom = 0.5f;
     float  baseRate = 1.0f, spread = 0.0f, sizeSec = 0.08f, density = 20.0f, bodyRms = 1.0f;
+    float  reverseChance = 0.0f;
     float  spawnAcc = 0.0f, dcX = 0.0f, dcY = 0.0f, dcCoef = 0.999f;
     SmoothedValue posSm, sizeSm, gainSm;
-    Rng rng { 0x51F3A7u };
+    Rng rng { 0x51F3A7u }, directionRng { 0xB79D31u };
 };
 
 } // namespace orogen

@@ -321,6 +321,14 @@ inline juce::AudioProcessorValueTreeState::ParameterLayout makeLayout()
     for (int i = kOriginalFxParamCount; i < fn; ++i)
         addFloat (String ("fx_") + ft[i].id, ft[i].name, ft[i].min, ft[i].max, ft[i].def, ft[i].step);
 
+    // Новые параметры только после всех 298 прежних ID; slotParamTable и
+    // порядок автоматизации старых проектов остаются неизменными.
+    for (int s = 0; s < kNumSlots; ++s)
+    {
+        const String pre = slotPrefix (s);
+        addFloat (pre + "grainReverse", pre + "Grain Reverse", 0.0f, 1.0f, 0.0f, 0.001f);
+    }
+
     return layout;
 }
 

@@ -16,7 +16,7 @@
 
 using namespace juce;
 
-static constexpr int kNumApvtsParams = 298;   // см. Params.h / test_plugin
+static constexpr int kNumApvtsParams = 306;   // см. Params.h / test_plugin
 
 static int failures = 0;
 static void check (bool ok, const String& what, const String& detail = {})
@@ -103,7 +103,7 @@ int main (int argc, char** argv)
     for (const char* probe : { "sA_Level", "sA_Cutoff", "sA_Filter", "sA_Engine",
                                "Reverb Mix", "Comb Hz A", "Master", "mod1_Amount",
                                "Arp On", "lfo1_Rate", "Plate Pre Filter", "Plate Input Diff 1",
-                               "Plate Input Diff 2", "Plate Output" })
+                               "Plate Input Diff 2", "Plate Output", "sA_Grain Reverse", "sH_Grain Reverse" })
         check (names.count (String (probe)) == 1, String::fromUTF8 ("виден хосту: ") + probe);
 
     // --- состояние: сохранить/загрузить через настоящий VST3-хост ---
@@ -115,11 +115,26 @@ int main (int argc, char** argv)
             if (parameter->getName (64) == plateNames[i]) plateParams[i] = parameter;
     for (int i = 0; i < 4; ++i)
         if (plateParams[i] != nullptr) plateParams[i]->setValueNotifyingHost (plateValues[i]);
+    AudioProcessorParameter* reverseParams[8] {};
+    int reverseDefaults = 0;
+    for (int i = 0; i < 8; ++i)
+    {
+        const String name = "s" + String::charToString ((juce_wchar) ('A' + i)) + "_Grain Reverse";
+        for (auto* parameter : params) if (parameter->getName (64) == name) reverseParams[i] = parameter;
+        if (reverseParams[i] != nullptr)
+        {
+            if (std::fabs (reverseParams[i]->getValue()) < 1.0e-6f) ++reverseDefaults;
+            reverseParams[i]->setValueNotifyingHost (0.1f * (float) (i + 1));
+        }
+    }
+    check (reverseDefaults == 8, "8 параметров Reverse видны хосту и по умолчанию равны 0", String (reverseDefaults) + "/8");
     MemoryBlock state;
     inst->getStateInformation (state);
     check (state.getSize() > 0, "состояние сериализуется", String (state.getSize()) + String::fromUTF8 (" байт"));
     for (auto* parameter : plateParams)
         if (parameter != nullptr) parameter->setValueNotifyingHost (0.05f);
+    for (auto* parameter : reverseParams)
+        if (parameter != nullptr) parameter->setValueNotifyingHost (0.0f);
     inst->setStateInformation (state.getData(), (int) state.getSize());
     float maxStateDiff = 0.0f;
     int foundPlate = 0;
@@ -131,6 +146,47 @@ int main (int argc, char** argv)
         }
     check (foundPlate == 4 && maxStateDiff < 0.002f,
            "4 параметра Plate переживают VST3 host state", String (maxStateDiff, 6));
+    float maxReverseDiff = 0.0f;
+    int foundReverse = 0;
+    for (int i = 0; i < 8; ++i)
+        if (reverseParams[i] != nullptr)
+        {
+            ++foundReverse;
+            maxReverseDiff = std::max (maxReverseDiff, std::fabs (reverseParams[i]->getValue() - 0.1f * (float) (i + 1)));
+        }
+    check (foundReverse == 8 && maxReverseDiff < 0.002f,
+           "8 параметров Reverse переживают VST3 host state", String (maxReverseDiff, 6));
+
+    // При наличии предыдущего настоящего VST3 проверяем не только синтетически
+    // удалённые XML-узлы, но и реальное состояние, которое сериализовал хост.
+    if (argc > 3)
+    {
+        OwnedArray<PluginDescription> oldTypes;
+        format->findAllTypesForFile (oldTypes, File (argv[3]).getFullPathName());
+        String oldError;
+        auto old = ! oldTypes.isEmpty() ? format->createInstanceFromDescription (*oldTypes[0], 48000.0, 128, oldError)
+                                      : std::unique_ptr<AudioPluginInstance>();
+        check (old != nullptr, "предыдущий VST3 загружается для проверки старой сессии", oldError);
+        if (old != nullptr)
+        {
+            AudioProcessorParameter* oldP1 = nullptr;
+            for (auto* p : old->getParameters()) if (p->getName (64) == "sA_P1") oldP1 = p;
+            if (oldP1 != nullptr) oldP1->setValueNotifyingHost (0.713f);
+            MemoryBlock oldState;
+            old->getStateInformation (oldState);
+            for (auto* p : reverseParams) if (p != nullptr) p->setValueNotifyingHost (0.9f);
+            inst->setStateInformation (oldState.getData(), (int) oldState.getSize());
+            int zeros = 0;
+            for (auto* p : reverseParams) if (p != nullptr && std::fabs (p->getValue()) < 1.0e-6f) ++zeros;
+            AudioProcessorParameter* restoredP1 = nullptr;
+            for (auto* p : params) if (p->getName (64) == "sA_P1") restoredP1 = p;
+            check (oldState.getSize() > 0 && oldP1 != nullptr && restoredP1 != nullptr
+                   && std::fabs (restoredP1->getValue() - 0.713f) < 0.002f && zeros == 8,
+                   "реальная сессия предыдущего VST3 сохраняет старый P1 и сбрасывает Reverse",
+                   String (zeros) + "/8, P1=" + (restoredP1 != nullptr ? String (restoredP1->getValue(), 4) : "нет"));
+            inst->setStateInformation (state.getData(), (int) state.getSize());
+        }
+    }
 
     // --- редактор ---
     check (inst->hasEditor(), "есть редактор");
@@ -290,6 +346,76 @@ int main (int argc, char** argv)
         granular->releaseResources();
     }
     granular.reset();
+
+    // Два реальных VST3-инстанса, одна и та же удержанная нота. Меняется
+    // только host-параметр Reverse; сравниваем сигнал после ROBIN latency.
+    std::printf ("\n--- Reverse через VST3-хост на удержанной ноте ---\n");
+    String err0, err1;
+    auto reference = format->createInstanceFromDescription (d, 48000.0, 128, err0);
+    auto reversed = format->createInstanceFromDescription (d, 48000.0, 128, err1);
+    check (reference != nullptr && reversed != nullptr, "оба VST3-инстанса Reverse созданы", err0 + " " + err1);
+    if (reference != nullptr && reversed != nullptr)
+    {
+        int missing = 0;
+        auto setHost = [&] (AudioPluginInstance& instance, const String& name, float value) {
+            for (auto* parameter : instance.getParameters())
+                if (parameter->getName (64) == name) { parameter->setValueNotifyingHost (value); return; }
+            ++missing; std::printf ("   не найден параметр: %s\n", name.toRawUTF8());
+        };
+        for (auto* instance : { reference.get(), reversed.get() })
+        {
+            instance->prepareToPlay (48000.0, 128);
+            setHost (*instance, "sA_Engine", 0.5f); setHost (*instance, "sA_On", 1.0f);
+            for (const char* name : { "sB_On", "sC_On", "sD_On", "sE_On", "sF_On", "sG_On", "sH_On" })
+                setHost (*instance, name, 0.0f);
+            setHost (*instance, "Patch Mode", 0.0f); setHost (*instance, "Arp On", 0.0f);
+            setHost (*instance, "sA_P1", 0.35f); setHost (*instance, "sA_P2", 0.45f);
+            setHost (*instance, "sA_P3", 0.7f); setHost (*instance, "sA_P4", 0.3f);
+            setHost (*instance, "sA_Table", 0.0f); setHost (*instance, "sA_Detune", 0.0f);
+            setHost (*instance, "sA_Grain Reverse", 0.0f); setHost (*instance, "sA_Attack", 0.0f);
+            setHost (*instance, "sA_Sustain", 1.0f); setHost (*instance, "sA_Tail", 0.0f);
+            for (const char* name : { "Drive", "Chorus Mix", "Delay Mix", "Reverb Mix", "Plate Mix",
+                                      "Material Mix", "Spectre Mix", "Glitch Mix", "Robin Mix", "Comb Mix" })
+                setHost (*instance, name, 0.0f);
+            setHost (*instance, "Comp Ratio", 0.0f); setHost (*instance, "Comp Makeup", 0.0f);
+        }
+        MessageManager::getInstance()->runDispatchLoopUntil (250);
+        AudioBuffer<float> a (2, 128), b (2, 128);
+        MidiBuffer noteA, noteB, noneA, noneB;
+        noteA.addEvent (MidiMessage::noteOn (1, 60, 0.8f), 0);
+        noteB.addEvent (MidiMessage::noteOn (1, 60, 0.8f), 0);
+        float beforeMax = 0.0f;
+        for (int block = 0; block < 80; ++block)
+        {
+            a.clear(); b.clear();
+            reference->processBlock (a, block == 0 ? noteA : noneA);
+            reversed->processBlock (b, block == 0 ? noteB : noneB);
+            for (int i = 0; i < 128; ++i)
+                beforeMax = std::max (beforeMax, std::fabs (a.getSample (0, i) - b.getSample (0, i)));
+        }
+        setHost (*reversed, "sA_Grain Reverse", 1.0f);
+        double difference = 0.0, energy = 0.0; int bad = 0, n = 0;
+        for (int block = 0; block < 500; ++block)
+        {
+            a.clear(); b.clear(); reference->processBlock (a, noneA); reversed->processBlock (b, noneB);
+            if (block < 16) continue;
+            for (int i = 0; i < 128; ++i)
+            {
+                const float x = a.getSample (0, i), y = b.getSample (0, i);
+                if (! std::isfinite (x) || ! std::isfinite (y)) ++bad;
+                const double diff = (double) x - y;
+                difference += diff * diff; energy += (double) x * x; ++n;
+            }
+        }
+        const double relative = std::sqrt (difference / std::max (1.0e-20, energy));
+        const double referenceRms = std::sqrt (energy / std::max (1, n));
+        std::printf ("   до изменения max |Δ| %.9f; после ΔRMS/RMS %.6f, RMS %.6f, NaN %d\n",
+                     beforeMax, relative, referenceRms, bad);
+        check (missing == 0 && beforeMax < 1.0e-6f && relative > 0.1 && referenceRms > 0.001 && bad == 0,
+               "автоматизация Reverse через VST3 меняет звук без повторного note-on", String (relative, 6));
+        reference->releaseResources(); reversed->releaseResources();
+    }
+    reference.reset(); reversed.reset();
 
     // Фабричный Choir через реальный VST3. Это отдельный замер выхода,
     // а не обещание headroom для произвольных патчей и не замена сырому WAV.

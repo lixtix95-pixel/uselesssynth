@@ -110,6 +110,7 @@ private:
         std::atomic<float>* type = nullptr;
         std::atomic<float>* on = nullptr;
         std::atomic<float>* filter = nullptr;
+        std::atomic<float>* grainReverse = nullptr; // добавлен в конец layout, вне старой таблицы
         std::vector<std::atomic<float>*> f;     // по порядку slotParamTable
     };
 

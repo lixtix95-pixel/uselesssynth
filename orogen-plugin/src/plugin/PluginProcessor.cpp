@@ -93,6 +93,7 @@ void OrogenProcessor::cachePointers()
         r.type   = apvts.getRawParameterValue (pre + "type");
         r.on     = apvts.getRawParameterValue (pre + "on");
         r.filter = apvts.getRawParameterValue (pre + "filter");
+        r.grainReverse = apvts.getRawParameterValue (pre + "grainReverse");
         r.f.clear();
         for (int i = 0; i < n; ++i)
             r.f.push_back (apvts.getRawParameterValue (pre + st[i].id));
@@ -164,7 +165,7 @@ void OrogenProcessor::cachePointers()
     for (int i = 0; i < kNumSlots; ++i)
     {
         const auto& r = slotRefs[(size_t) i];
-        if (r.type == nullptr || r.on == nullptr || r.filter == nullptr)
+        if (r.type == nullptr || r.on == nullptr || r.filter == nullptr || r.grainReverse == nullptr)
             std::fprintf (stderr, "OROGEN: не найден параметр слота %d\n", i);
         for (size_t k = 0; k < r.f.size(); ++k)
             if (r.f[k] == nullptr)
@@ -195,6 +196,7 @@ std::uint64_t OrogenProcessor::hashParams() const noexcept
         if (r.type)   mix (r.type->load());
         if (r.on)     mix (r.on->load());
         if (r.filter) mix (r.filter->load());
+        if (r.grainReverse) mix (r.grainReverse->load());
         for (auto* f : r.f) if (f) mix (f->load());
     }
     for (auto* g : globRefs) if (g) mix (g->load());
@@ -309,6 +311,7 @@ void OrogenProcessor::collectPatch (Patch& p, FxChain::Settings& fx) const noexc
         sp.params.pan        = r.f[(size_t) kPan]->load();
         sp.params.tuneSemis  = r.f[(size_t) kTune]->load();
         sp.params.detune     = r.f[(size_t) kDetune]->load();
+        sp.params.grainReverse = r.grainReverse->load();
         sp.params.p[0] = r.f[(size_t) kP0]->load();
         sp.params.p[1] = r.f[(size_t) kP1]->load();
         sp.params.p[2] = r.f[(size_t) kP2]->load();
@@ -462,6 +465,7 @@ void OrogenProcessor::applyToParams (const Patch& p, const FxChain::Settings& fx
         set (pre + "pan", sp.params.pan);
         set (pre + "tune", sp.params.tuneSemis);
         set (pre + "detune", sp.params.detune);
+        set (pre + "grainReverse", sp.params.grainReverse);
         for (int k = 0; k < 4; ++k)
             set (pre + "p" + juce::String (k), sp.params.p[k]);
         set (pre + "table", (float) sp.params.table);
@@ -790,14 +794,12 @@ void OrogenProcessor::setStateInformation (const void* data, int sizeInBytes)
     auto state = juce::ValueTree::fromXml (*xml);
     if (! state.isValid()) return;
 
-    // В состояниях до этих четырёх параметров записи отсутствуют. JUCE при
-    // replaceState иначе сохраняет ТЕКУЩЕЕ значение отсутствующего параметра,
-    // а не его default. Старый проект должен звучать как раньше даже при
-    // загрузке поверх уже отредактированного экземпляра.
-    for (const char* id : { "fx_platePreFilter", "fx_plateInputDiff1",
-                            "fx_plateInputDiff2", "fx_plateOutput" })
+    // JUCE при replaceState сохраняет ТЕКУЩЕЕ значение отсутствующего
+    // параметра, а не default. Дополним старые сессии значениями по умолчанию
+    // даже если их загружают поверх уже изменённого экземпляра плагина.
+    const auto restoreMissingDefault = [this, &state] (const juce::String& id)
     {
-        if (state.getChildWithProperty ("id", id).isValid()) continue;
+        if (state.getChildWithProperty ("id", id).isValid()) return;
         if (auto* parameter = apvts.getParameter (id))
         {
             juce::ValueTree entry ("PARAM");
@@ -805,7 +807,12 @@ void OrogenProcessor::setStateInformation (const void* data, int sizeInBytes)
             entry.setProperty ("value", parameter->convertFrom0to1 (parameter->getDefaultValue()), nullptr);
             state.appendChild (entry, nullptr);
         }
-    }
+    };
+    for (const char* id : { "fx_platePreFilter", "fx_plateInputDiff1",
+                            "fx_plateInputDiff2", "fx_plateOutput" })
+        restoreMissingDefault (id);
+    for (int s = 0; s < kNumSlots; ++s)
+        restoreMissingDefault (slotPrefix (s) + "grainReverse");
 
     apvts.replaceState (state);
     collectPatch (patch, fxSettings);

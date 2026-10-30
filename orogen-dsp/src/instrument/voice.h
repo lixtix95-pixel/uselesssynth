@@ -391,6 +391,7 @@ private:
         for (int k = 0; k < 4; ++k) if (std::fabs (a.p[k] - b.p[k]) > 1.0e-4f) return false;
         return std::fabs (a.tuneSemis - b.tuneSemis) < 1.0e-3f
             && std::fabs (a.detune - b.detune) < 1.0e-4f
+            && std::fabs (a.grainReverse - b.grainReverse) < 1.0e-4f
             && std::fabs (a.level - b.level) < 1.0e-3f;
     }
 

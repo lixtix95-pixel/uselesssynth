@@ -7,7 +7,7 @@ INC      := -Isrc
 MONOJUICE_OBJ := build/monojuice_chorus.o build/monojuice_adapter.o
 
 TEST_BINS := build/test_wavetable build/test_fm build/test_harmonic build/test_sample \
-             build/test_granular build/test_modal build/test_resynth build/test_organics \
+             build/test_granular build/test_granular_reverse build/test_modal build/test_resynth build/test_organics \
              build/test_instrument build/test_fx build/test_chop
 DEMO_BINS := build/render_demo build/render_demo_sample build/render_demo_granular build/render_demo_modal \
              build/render_demo_resynth build/render_demo_organics build/render_demo_synth build/render_demo_instrument \
@@ -46,6 +46,10 @@ build/test_modal: tests/test_modal.cpp tests/engine_suite.h src/engines/modal.h 
 build/test_granular: tests/test_granular.cpp tests/engine_suite.h src/engines/granular.h src/engines/engine.h src/engines/mip_reader.h src/engines/sinc_interp.h src/content/sample_bank.h src/engines/halfband.h src/core/*.h
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(INC) tests/test_granular.cpp -o $@
+
+build/test_granular_reverse: tests/test_granular_reverse.cpp tests/engine_suite.h src/engines/granular.h src/engines/engine.h src/engines/mip_reader.h src/engines/sinc_interp.h src/content/sample_bank.h src/engines/halfband.h src/core/*.h
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) $(INC) tests/test_granular_reverse.cpp -o $@
 
 # Отдельно от CPU-бенчмарка: санитайзеры заметно замедляют горячий цикл.
 build/test_granular_safety_asan: tests/test_granular_safety.cpp src/engines/granular.h src/engines/engine.h src/engines/mip_reader.h src/engines/sinc_interp.h src/engines/halfband.h src/content/sample_bank.h src/core/*.h
@@ -128,6 +132,14 @@ build/render_demo_granular: tools/render_demo_granular.cpp src/engines/granular.
 build/render_granular_raw: tools/render_granular_raw.cpp src/engines/granular.h src/engines/engine.h src/engines/mip_reader.h src/engines/sinc_interp.h src/content/sample_bank.h src/engines/halfband.h src/core/*.h
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(INC) tools/render_granular_raw.cpp -o $@
+
+build/render_granular_reverse: tools/render_granular_reverse.cpp src/engines/granular.h src/engines/engine.h src/engines/mip_reader.h src/engines/sinc_interp.h src/content/sample_bank.h src/engines/halfband.h src/core/*.h
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) $(INC) tools/render_granular_reverse.cpp -o $@
+
+build/bench_granular_reverse: tools/bench_granular_reverse.cpp src/engines/granular.h src/engines/engine.h src/engines/mip_reader.h src/engines/sinc_interp.h src/content/sample_bank.h src/engines/halfband.h src/core/*.h
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) $(INC) tools/bench_granular_reverse.cpp -o $@
 
 build/render_granular_transient: tools/render_granular_transient.cpp src/engines/granular.h src/engines/engine.h src/engines/mip_reader.h src/engines/sinc_interp.h src/content/sample_bank.h src/engines/halfband.h src/core/*.h
 	@mkdir -p build

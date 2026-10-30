@@ -714,7 +714,7 @@ private:
 
 //============================================================================
 // Оверлей параметров: 5 вкладок из UiParamMap.h, в каждой — секции карточками.
-// Так у всех 298 параметров есть место в интерфейсе, а не плоский список.
+// Так у всех 306 параметров есть место в интерфейсе, а не плоский список.
 //============================================================================
 class OrogenEditor::ParamsPage : public juce::Component
 {
@@ -971,7 +971,7 @@ private:
                     e.section = sec.title;
                     e.name = name;
                     e.id = id;
-                    // sA_p0…sH_p3 и общий table показывают смысл для
+                    // Макросы, Table и Grain Reverse показывают смысл для
                     // движка именно ЭТОГО слота, не выбранного глобально.
                     if (id.length() >= 5 && id[0] == 's' && id[1] >= 'A' && id[1] <= 'H' && id[2] == '_')
                     {
@@ -980,10 +980,10 @@ private:
                             e.slot = (int) (id[1] - 'A');
                             e.macro = (int) (id[4] - '0');
                         }
-                        else if (id.substring (3) == "table")
+                        else if (id.substring (3) == "table" || id.substring (3) == "grainReverse")
                         {
                             e.slot = (int) (id[1] - 'A');
-                            e.macro = -1; // выбор источника
+                            e.macro = id.substring (3) == "table" ? -1 : -2;
                         }
                     }
 
@@ -1043,9 +1043,10 @@ private:
             {
                 if (e.slot < 0 || ! changed[(size_t) e.slot] || e.ctl == nullptr) continue;
                 const int type = engineTypes[(size_t) e.slot];
-                const juce::String label = e.name + "  ·  "
-                                         + (e.macro >= 0 ? engineMacroName (type, e.macro)
-                                                         : engineSourceControlName (type));
+                const juce::String meaning = e.macro >= 0 ? engineMacroName (type, e.macro)
+                    : e.macro == -2 ? (type == (int) EngineType::Granular ? "PROBABILITY 0-1" : "UNUSED")
+                                    : engineSourceControlName (type);
+                const juce::String label = e.name + "  ·  " + meaning;
                 e.ctl->getProperties().set ("contextLabel", label);
                 repaint (e.captionRect);
             }
@@ -1376,6 +1377,7 @@ static std::uint64_t previewPatchHash (const Patch& patch, int selectedSlot)
         mix ((std::uint32_t) slot.params.table);
         for (float v : slot.params.p) mf (v);
         mf (slot.params.level); mf (slot.params.pan); mf (slot.params.tuneSemis); mf (slot.params.detune);
+        mf (slot.params.grainReverse);
         mf (slot.attack); mf (slot.decay); mf (slot.sustain); mf (slot.release); mf (slot.tail);
         mf (slot.cutoff); mf (slot.res); mix ((std::uint32_t) slot.loNote); mix ((std::uint32_t) slot.hiNote);
     }

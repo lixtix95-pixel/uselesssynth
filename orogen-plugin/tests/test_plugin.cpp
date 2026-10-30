@@ -208,7 +208,7 @@ static void testEditorControlLifetime()
     int alive = 0;
     for (const auto& ref : refs) if (ref.getComponent() != nullptr) ++alive;
     std::printf ("   после закрытия осталось %d из %zu\n", alive, refs.size());
-    check (refs.size() == 298 && alive == 0,
+    check (refs.size() == 306 && alive == 0,
            "закрытие редактора уничтожает все контролы PARAMS",
            juce::String (alive) + "/" + juce::String ((int) refs.size()));
 }
@@ -262,6 +262,28 @@ static void testGuiRegressions()
                 if (da.getPixelColour (x, y) != db.getPixelColour (x, y)) ++count;
         return count;
     };
+
+    // Таймер превью обязан учитывать именно новый параметр, без forced rebuild.
+    for (int i = 0; i < 8; ++i) setP (p, slotPrefix (i) + "on", i == 0 ? 1.0f : 0.0f);
+    setP (p, "gl_mode", 0.0f); setP (p, "sA_type", 4.0f);
+    setP (p, "sA_table", 0.0f); setP (p, "sA_level", 0.8f);
+    setP (p, "sA_p0", 0.35f); setP (p, "sA_p1", 0.45f); setP (p, "sA_p2", 0.8f);
+    setP (p, "sA_p3", 0.2f); setP (p, "sA_grainReverse", 0.0f);
+    const bool previewForwardReady = refresh();
+    const auto previewForward = editor->previewWave();
+    setP (p, "sA_grainReverse", 1.0f);
+    double reversePreviewDelta = 0.0;
+    const double reversePreviewStart = juce::Time::getMillisecondCounterHiRes();
+    while (juce::Time::getMillisecondCounterHiRes() - reversePreviewStart < 3000.0)
+    {
+        juce::MessageManager::getInstance()->runDispatchLoopUntil (50);
+        reversePreviewDelta = diffWave (previewForward, editor->previewWave());
+        if (reversePreviewDelta > 0.02 && ! editor->isPreviewPending()) break;
+    }
+    check (previewForwardReady && ! previewForward.empty() && reversePreviewDelta > 0.02
+           && ! editor->isPreviewPending(),
+           "таймер обновляет превью при автоматизации Grain Reverse", num (reversePreviewDelta, 4));
+    setP (p, "sA_grainReverse", 0.0f);
 
     // Отдельные воспроизводимые движки A и B, вместо 50 % всего диапазона
     // восьми слотов (0.5 было бы между D и E, а не между A и B).
@@ -784,6 +806,8 @@ static void testGuiRegressions()
     auto* bP1 = overlay != nullptr ? findSlider (*overlay, "sB_p0") : nullptr;
     auto* aTable = overlay != nullptr ? findSlider (*overlay, "sA_table") : nullptr;
     auto* bTable = overlay != nullptr ? findSlider (*overlay, "sB_table") : nullptr;
+    auto* aReverse = overlay != nullptr ? findSlider (*overlay, "sA_grainReverse") : nullptr;
+    auto* bReverse = overlay != nullptr ? findSlider (*overlay, "sB_grainReverse") : nullptr;
     const auto labelOf = [] (juce::Slider* s)
     {
         return s != nullptr ? s->getProperties().getWithDefault ("contextLabel", "").toString()
@@ -791,6 +815,7 @@ static void testGuiRegressions()
     };
     const auto aLabel = labelOf (aP1), bLabel = labelOf (bP1);
     const auto unusedTable = labelOf (aTable), sourceTable = labelOf (bTable);
+    const auto unusedReverse = labelOf (aReverse), granularReverse = labelOf (bReverse);
     setP (p, "sB_type", 5.0f);
     juce::MessageManager::getInstance()->runDispatchLoopUntil (120);
     const auto modelTable = labelOf (bTable);
@@ -802,6 +827,34 @@ static void testGuiRegressions()
     check (unusedTable.contains ("UNUSED") && sourceTable.contains ("SOURCE 0-7")
            && modelTable.contains ("MODEL 0-7") && labelOf (bTable).contains ("LOOP 0-2"),
            "общий Table в оверлее честно показывает реальную функцию или UNUSED");
+    check (unusedReverse.contains ("UNUSED") && granularReverse.contains ("PROBABILITY")
+           && labelOf (bReverse).contains ("UNUSED"),
+           "Grain Reverse помечен доступным только у Granular при смене движка");
+
+    int visibleReverse = 0, boundReverse = 0;
+    for (int s = 0; s < 8; ++s)
+    {
+        editor->showPage (201 + s); // SLOT A–H
+        const auto id = slotPrefix (s) + "grainReverse";
+        auto* slider = overlay != nullptr ? findSlider (*overlay, id) : nullptr;
+        const float value = 0.1f * (float) (s + 1);
+        if (slider != nullptr && effectivelyVisible (*slider, overlay))
+        {
+            ++visibleReverse;
+            slider->setValue (value, juce::sendNotificationSync);
+            auto* raw = p.apvts.getRawParameterValue (id);
+            if (raw != nullptr && std::fabs (raw->load() - value) < 1.0e-4f) ++boundReverse;
+        }
+    }
+    Patch afterReverse; FxChain::Settings unusedAfterReverse;
+    p.collectPatch (afterReverse, unusedAfterReverse);
+    bool collectedReverse = true;
+    for (int s = 0; s < 8; ++s)
+        collectedReverse = collectedReverse && std::fabs (afterReverse.slots[s].params.grainReverse - 0.1f * (float) (s + 1)) < 1.0e-4f;
+    check (visibleReverse == 8 && boundReverse == 8 && collectedReverse,
+           "восемь регуляторов Reverse доступны в секциях SLOT и связаны с DSP",
+           juce::String (visibleReverse) + "/8 видимы, " + juce::String (boundReverse) + "/8 связаны");
+    for (int s = 0; s < 8; ++s) setP (p, slotPrefix (s) + "grainReverse", 0.0f);
 
     // Все четыре новых параметра представлены живыми SliderAttachment.
     const auto tabs = buildUiTabs();
@@ -1072,6 +1125,63 @@ static void testGranularProcessorRegression()
     check (diffRms > 1.0e-4, "автоматизация Density действительно меняет звук", num (diffRms, 6));
 }
 
+// Через настоящий APVTS и удержанную ноту: изменение только Reverse должно
+// пройти hashParams -> collectPatch -> Voice::paramsEqual -> новые зёрна.
+static void testGranularReverseProcessor()
+{
+    std::printf ("\n--- Granular Reverse через AudioProcessor и MIDI ---\n");
+    OrogenProcessor changed, reference;
+    for (auto* pr : { &changed, &reference })
+    {
+        pr->setPlayConfigDetails (0, 2, 48000.0, 128); pr->prepareToPlay (48000.0, 128);
+        pr->setCurrentProgram (0); soloSlot (*pr, 0, 4);
+        setP (*pr, "gl_mode", 0.0f); setP (*pr, "gl_gain", 0.7f); setP (*pr, "gl_master", 0.8f);
+        setP (*pr, "arpOn", 0.0f); setP (*pr, "lfo1_amount", 0.0f); setP (*pr, "lfo2_amount", 0.0f);
+        for (int k = 1; k <= 8; ++k) setP (*pr, "mod" + juce::String (k) + "_amt", 0.0f);
+        setP (*pr, "sA_level", 0.8f); setP (*pr, "sA_table", 0.0f); setP (*pr, "sA_detune", 0.0f);
+        setP (*pr, "sA_p0", 0.35f); setP (*pr, "sA_p1", 0.45f);
+        setP (*pr, "sA_p2", 0.7f); setP (*pr, "sA_p3", 0.3f);
+        setP (*pr, "sA_grainReverse", 0.0f);
+        setP (*pr, "sA_attack", 0.001f); setP (*pr, "sA_sustain", 1.0f);
+        setP (*pr, "sA_tail", 0.0f); setP (*pr, "sA_cutoff", 1.0f); setP (*pr, "sA_res", 0.0f);
+        for (const char* id : { "fx_drive", "fx_chorusMix", "fx_delayMix", "fx_reverbMix", "fx_plateMix",
+                                "fx_materialMix", "fx_spectreMix", "fx_glitchMix", "fx_robinMix", "fx_combMix" })
+            setP (*pr, id, 0.0f);
+        setP (*pr, "fx_compRatio", 1.0f); setP (*pr, "fx_compMakeup", 0.0f);
+    }
+    juce::MessageManager::getInstance()->runDispatchLoopUntil (160);
+    juce::AudioBuffer<float> a (2, 128), b (2, 128);
+    juce::MidiBuffer noteA, noteB, emptyA, emptyB;
+    noteA.addEvent (juce::MidiMessage::noteOn (1, 60, 0.8f), 0);
+    noteB.addEvent (juce::MidiMessage::noteOn (1, 60, 0.8f), 0);
+    for (int block = 0; block < 80; ++block)
+    {
+        changed.processBlock (a, block == 0 ? noteA : emptyA);
+        reference.processBlock (b, block == 0 ? noteB : emptyB);
+    }
+    setP (changed, "sA_grainReverse", 1.0f);
+    double difference = 0.0, referenceEnergy = 0.0;
+    int bad = 0, n = 0;
+    for (int block = 0; block < 500; ++block)
+    {
+        changed.processBlock (a, emptyA); reference.processBlock (b, emptyB);
+        if (block < 16) continue; // ROBIN latency и переход зерна
+        for (int i = 0; i < 128; ++i)
+        {
+            const float x = a.getSample (0, i), y = b.getSample (0, i);
+            if (! std::isfinite (x) || ! std::isfinite (y)) ++bad;
+            const double d = (double) x - y;
+            difference += d * d; referenceEnergy += (double) y * y; ++n;
+        }
+    }
+    const double relative = std::sqrt (difference / std::max (1.0e-20, referenceEnergy));
+    const double referenceRms = std::sqrt (referenceEnergy / std::max (1, n));
+    std::printf ("   Reverse 0 -> 100%% на удержанной ноте: ΔRMS/RMS %.6f, эталон %.6f, NaN %d\n",
+                 relative, referenceRms, bad);
+    check (bad == 0 && referenceRms > 1.0e-3 && relative > 0.1,
+           "APVTS Reverse меняет звук через MIDI без повторного Note On", num (relative, 6));
+}
+
 // Заводской Sub Bass на 96 кГц: проверяем реальную частоту на выходе
 // процессора/MIDI после задержки ROBIN, а не только внутреннюю позицию зерна.
 static void testGranularPitchProcessorRegression()
@@ -1233,6 +1343,7 @@ int main (int argc, char** argv)
     if (argc > 1 && juce::String (argv[1]) == "--granular-only")
     {
         testGranularProcessorRegression();
+        testGranularReverseProcessor();
         juce::DeletedAtShutdown::deleteAll();
         juce::MessageManager::deleteInstance();
         std::printf ("\nGranular AudioProcessor: провалов %d\n", failures);
@@ -1254,7 +1365,7 @@ int main (int argc, char** argv)
         OrogenProcessor p;
         const int count = p.getParameters().size();
         std::printf ("   параметров: %d, программ: %d\n", count, p.getNumPrograms());
-        check (count == 298, "все параметры объявлены", num (count, 0));
+        check (count == 306, "все параметры объявлены", num (count, 0));
 
         // Снимок последовательности ID rev21 до добавления Plate. Хэшируем
         // первые 294 ID с '\\n' между ними: даже перестановка не пройдёт.
@@ -1271,6 +1382,26 @@ int main (int argc, char** argv)
         }
         check (legacyIdsPresent && legacyHash == 0x92b97459d55b24e1ull,
                "порядок и ID первых 294 параметров сохранены");
+        // Следующие 4 ID Plate тоже существовали до этого изменения.
+        for (int i = 294; i < 298 && i < count; ++i)
+        {
+            auto* prm = dynamic_cast<juce::AudioProcessorParameterWithID*> (p.getParameters()[i]);
+            if (prm == nullptr) { legacyIdsPresent = false; break; }
+            const auto id = prm->paramID + "\n";
+            for (const unsigned char* b = (const unsigned char*) id.toRawUTF8(); *b != 0; ++b)
+                legacyHash = (legacyHash ^ *b) * 1099511628211ull;
+        }
+        check (count >= 298 && legacyIdsPresent && legacyHash == 0x93f40b47085118c4ull,
+               "порядок и ID всех 298 старых параметров сохранены");
+        bool reverseIds = count == 306;
+        for (int s = 0; s < 8 && count == 306; ++s)
+        {
+            const auto expected = slotPrefix (s) + "grainReverse";
+            auto* prm = dynamic_cast<juce::RangedAudioParameter*> (p.getParameters()[298 + s]);
+            reverseIds = reverseIds && prm != nullptr && prm->getParameterID() == expected
+                         && std::fabs (prm->getDefaultValue()) < 1.0e-7f;
+        }
+        check (reverseIds, "8 ID Grain Reverse добавлены в конец с default 0");
 
         juce::StringArray ids;
         bool allHaveId = true;
@@ -1607,6 +1738,8 @@ int main (int argc, char** argv)
     {
         OrogenProcessor p;
         p.setCurrentProgram (1);
+        for (int s = 0; s < 8; ++s)
+            setP (p, slotPrefix (s) + "grainReverse", 0.1f * (float) (s + 1));
 
         const auto file = juce::File::getSpecialLocation (juce::File::tempDirectory)
                               .getChildFile ("orogen_test.orogenpreset");
@@ -1625,9 +1758,10 @@ int main (int argc, char** argv)
         {
             same = same && (a.slots[s].type == b.slots[s].type)
                         && (std::fabs (a.slots[s].attack - b.slots[s].attack) < 1.0e-4f)
-                        && (std::fabs (a.slots[s].params.p[0] - b.slots[s].params.p[0]) < 1.0e-4f);
+                        && (std::fabs (a.slots[s].params.p[0] - b.slots[s].params.p[0]) < 1.0e-4f)
+                        && (std::fabs (a.slots[s].params.grainReverse - b.slots[s].params.grainReverse) < 1.0e-4f);
         }
-        check (same, "патч идентичен после чтения из файла");
+        check (same, "патч и Grain Reverse всех 8 слотов идентичны после чтения из JSON");
         check (std::fabs (fa.reverbMix - fb.reverbMix) < 1.0e-4f, "эффекты идентичны",
                num (fb.reverbMix, 4));
 
@@ -1649,6 +1783,10 @@ int main (int argc, char** argv)
                && std::fabs (fc.plateInputDiff2 - 0.82f) < 1.0e-4f
                && std::fabs (fc.plateOutput - 1.36f) < 1.0e-4f,
                "четыре новых регулятора Plate переживают состояние сессии");
+        bool stateReverse = true;
+        for (int s = 0; s < 8; ++s)
+            stateReverse = stateReverse && std::fabs (c.slots[s].params.grainReverse - 0.1f * (float) (s + 1)) < 1.0e-4f;
+        check (stateReverse, "Grain Reverse всех 8 слотов переживает состояние сессии");
 
         // Эмуляция состояния старой версии: удалить четыре PARAM-узла и
         // загрузить ПОВЕРХ не-дефолтных значений (новый пустой инстанс не
@@ -1660,6 +1798,12 @@ int main (int argc, char** argv)
             auto node = legacy.getChildWithProperty ("id", id);
             if (node.isValid()) { legacy.removeChild (node, nullptr); ++removed; }
         }
+        int removedReverse = 0;
+        for (int s = 0; s < 8; ++s)
+        {
+            auto node = legacy.getChildWithProperty ("id", slotPrefix (s) + "grainReverse");
+            if (node.isValid()) { legacy.removeChild (node, nullptr); ++removedReverse; }
+        }
         juce::MemoryBlock oldBlob;
         if (auto xml = legacy.createXml()) juce::AudioProcessor::copyXmlToBinary (*xml, oldBlob);
         r.setStateInformation (oldBlob.getData(), (int) oldBlob.getSize());
@@ -1669,19 +1813,31 @@ int main (int argc, char** argv)
                && std::fabs (fc.plateInputDiff2 - 0.625f) < 1.0e-4f
                && std::fabs (fc.plateOutput - 0.60f) < 1.0e-4f,
                "старая сессия получает прежние фиксированные значения Plate");
+        bool oldSessionReverse = removedReverse == 8;
+        for (const auto& s : c.slots) oldSessionReverse = oldSessionReverse && s.params.grainReverse == 0.0f;
+        check (oldSessionReverse, "старая сессия сбрасывает все 8 Reverse в 0 поверх изменённого состояния");
 
         // То же правило для JSON-пресета старой версии.
         auto oldPreset = presetToVar ("old", patchInit(), FxChain::Settings());
         auto* fxObject = oldPreset.getDynamicObject()->getProperty ("fx").getDynamicObject();
         for (const char* id : { "platePreFilter", "plateInputDiff1", "plateInputDiff2", "plateOutput" })
             fxObject->removeProperty (id);
+        auto* patchObject = oldPreset.getDynamicObject()->getProperty ("patch").getDynamicObject();
+        auto* oldSlots = patchObject != nullptr ? patchObject->getProperty ("slots").getArray() : nullptr;
+        if (oldSlots != nullptr)
+            for (auto& s : *oldSlots)
+                if (auto* object = s.getDynamicObject()) object->removeProperty ("grainReverse");
         Patch oldPatch; FxChain::Settings oldFx; juce::String oldName;
+        for (auto& s : oldPatch.slots) s.params.grainReverse = 1.0f;
         const bool loaded = presetFromVar (oldPreset, oldPatch, oldFx, oldName);
         check (loaded && std::fabs (oldFx.platePreFilter - 0.85f) < 1.0e-4f
                && std::fabs (oldFx.plateInputDiff1 - 0.75f) < 1.0e-4f
                && std::fabs (oldFx.plateInputDiff2 - 0.625f) < 1.0e-4f
                && std::fabs (oldFx.plateOutput - 0.60f) < 1.0e-4f,
                "старый JSON-пресет получает прежние коэффициенты Plate");
+        bool oldJsonReverse = loaded && oldSlots != nullptr && oldSlots->size() == 8;
+        for (const auto& s : oldPatch.slots) oldJsonReverse = oldJsonReverse && s.params.grainReverse == 0.0f;
+        check (oldJsonReverse, "старый JSON без Reverse получает 0 во всех слотах");
     }
 
     // ---------------------------------------------------------------- 4
@@ -1991,8 +2147,8 @@ int main (int argc, char** argv)
         check (dupes == 0, "в карте нет повторов", num ((double) dupes, 0));
         check (missing.isEmpty(), "каждый параметр APVTS есть в карте", num ((double) missing.size(), 0));
         check (extra.isEmpty(), "в карте нет несуществующих параметров", num ((double) extra.size(), 0));
-        check (mapIds.size() == apvtsIds.size() && apvtsIds.size() == 298,
-               "покрытие 298/298", juce::String (mapIds.size()) + " / " + juce::String (apvtsIds.size()));
+        check (mapIds.size() == apvtsIds.size() && apvtsIds.size() == 306,
+               "покрытие 306/306", juce::String (mapIds.size()) + " / " + juce::String (apvtsIds.size()));
 
         // --- управление в оверлее реально создаётся для каждого параметра ---
         juce::AudioProcessorEditor* ed = p.createEditor();
@@ -2083,8 +2239,8 @@ int main (int argc, char** argv)
             int seenAll = 0;
             if (auto* overlay = ore->paramsOverlay())
                 seenAll = countBoundControls (*overlay, tabs[0]);
-            // вкладка SLOT: 8 слотов × 21 параметр
-            check (seenAll == 168, "страница ALL вкладки SLOT показывает все 168",
+            // вкладка SLOT: 8 слотов × 22 параметра
+            check (seenAll == 176, "страница ALL вкладки SLOT показывает все 176",
                    num ((double) seenAll, 0));
 
             // снимок оверлея — заодно проверяем, что он отрисовывается
@@ -3435,6 +3591,7 @@ int main (int argc, char** argv)
     testGuiRegressions();
     testEditorControlLifetime();
     testGranularProcessorRegression();
+    testGranularReverseProcessor();
     testGranularPitchProcessorRegression();
     testDelayProcessorRegression();
     juce::DeletedAtShutdown::deleteAll();
