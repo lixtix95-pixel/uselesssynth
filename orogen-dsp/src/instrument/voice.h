@@ -28,12 +28,15 @@ public:
     {
         sampleRate = sr;
         retireBin = retireBinToUse;
+        // Таблица для плавной equal-power панорамы прогревается не в render().
+        (void) fastCosTbl (0.0f);
         for (int i = 0; i < kSlots; ++i)
         {
             env[(size_t) i].setSampleRate (sr);
             filter[(size_t) i].prepare (sr);        // буфер гребёнки — здесь, не в аудио-потоке
             gainSm[(size_t) i].reset (sr, 8.0);
-            panL[(size_t) i] = panR[(size_t) i] = 0.0f;
+            panSm[(size_t) i].reset (sr, 8.0);
+            panL[(size_t) i] = panR[(size_t) i] = lastPan[(size_t) i] = 0.0f;
         }
         controlCounter = 0;
         active = false;
@@ -122,6 +125,7 @@ public:
             env[(size_t) i].setSampleRate (sr);
             filter[(size_t) i].prepare (sr);        // буфер гребёнки — здесь, не в аудио-потоке
             gainSm[(size_t) i].reset (sr, 8.0);
+            panSm[(size_t) i].reset (sr, 8.0);
             if (engines[(size_t) i]) engines[(size_t) i]->setSampleRate (sr);
             if (pending[(size_t) i]) pending[(size_t) i]->setSampleRate (sr);
         }
@@ -172,6 +176,8 @@ public:
             const float w = slotWeight (p, i, morphNow, midiNote);
             gainSm[(size_t) i].snap (w * s.params.level * velocityGain);
             const float pan = clamp (s.params.pan, -1.0f, 1.0f) * clamp (p.width, 0.0f, 1.0f);
+            panSm[(size_t) i].snap (pan);
+            lastPan[(size_t) i] = pan;
             panL[(size_t) i] = std::cos ((pan + 1.0f) * 0.25f * (float) kPi);
             panR[(size_t) i] = std::sin ((pan + 1.0f) * 0.25f * (float) kPi);
             if (w > 1.0e-5f) startSlot (p, i);
@@ -237,15 +243,22 @@ public:
                 amp = 0.0f;
             }
 
-            // слот с нулевым весом (морф/сплит) вообще не считаем, но конверт
-            // продолжаем продвигать — иначе при возврате веса будет щелчок
-            const float weightNow = gainSm[(size_t) i].getCurrent();
-            const bool alive = slotStarted[(size_t) i]
-                            && (amp > 0.0f || env[(size_t) i].isActive())
+            // Тихий, но ещё удержанный слот остаётся частью голоса. Продвигаем
+            // его сглаженный вес ДО проверки: иначе вес, зафиксированный в 0,
+            // никогда не достигает нового target при Morph/Level. Движок с
+            // нулевым весом можно не рендерить, но нельзя stop(): после
+            // повторного включения на той же ноте он обязан продолжить работу.
+            const bool envelopeAlive = slotStarted[(size_t) i]
+                                    && (amp > 0.0f || env[(size_t) i].isActive());
+            if (envelopeAlive) any = true;
+            const float weightNow = envelopeAlive ? gainSm[(size_t) i].next()
+                                                   : gainSm[(size_t) i].getCurrent();
+            const bool alive = envelopeAlive
                             && (weightNow > 1.0e-5f || tailLeft[(size_t) i] > 0.0f);
             if (! alive)
             {
-                if (slotRunning[(size_t) i]) { e->stop(); slotRunning[(size_t) i] = false; }
+                if (! envelopeAlive && slotRunning[(size_t) i]) e->stop();
+                slotRunning[(size_t) i] = false;
                 continue;
             }
             slotRunning[(size_t) i] = true;
@@ -258,9 +271,20 @@ public:
             if (amp <= 0.0f) { any = true; continue; }
             any = true;
 
-            const float g = gainSm[(size_t) i].next() * amp;
+            const float g = weightNow * amp;
             float y = filter[(size_t) i].process (sig * g, filterModelFromInt (p.slots[i].filterType));
             slotMeter[(size_t) i] = std::max (slotMeter[(size_t) i], std::fabs (y));
+            const float pan = panSm[(size_t) i].next();
+            if (pan != lastPan[(size_t) i])
+            {
+                // Угол, а не два независимых коэффициента: мощность на пути
+                // L→R остаётся постоянной. При неподвижной ручке sin/cos не
+                // считаются заново; во время перехода — только прогретая LUT.
+                const float phase = (pan + 1.0f) * 0.125f;
+                panL[(size_t) i] = fastCosTbl (phase);
+                panR[(size_t) i] = fastCosTbl (0.25f - phase);
+                lastPan[(size_t) i] = pan;
+            }
             l += y * panL[(size_t) i];
             r += y * panR[(size_t) i];
         }
@@ -390,6 +414,7 @@ private:
         filter[(size_t) i].reset();
         tailLeft[(size_t) i] = s.tail;
         lastAmp[(size_t) i] = 0.0f;
+        e->setNoteRandom (noteRandom);
         e->start (targetNote, velocityGain);
         EngineParams ep = slotParams (p, i);
         e->prepare (ep);
@@ -491,12 +516,11 @@ private:
             const float resNow = clamp (s.res + std::fabs (modCutoff) * 0.2f + modRes, 0.0f, 0.95f);
             filter[(size_t) i].setParams (SlotPatch::cutoffHz (cut), resNow);
 
-            if (modPan != 0.0f)
-            {
-                const float pan = clamp (s.params.pan + modPan, -1.0f, 1.0f) * clamp (p.width, 0.0f, 1.0f);
-                panL[(size_t) i] = std::cos ((pan + 1.0f) * 0.25f * (float) kPi);
-                panR[(size_t) i] = std::sin ((pan + 1.0f) * 0.25f * (float) kPi);
-            }
+            // Pan/Width и нулевое значение модуляции тоже должны обновлять
+            // цель: раньше удержанная нота застревала в прежней панораме.
+            const float pan = clamp (s.params.pan + modPan, -1.0f, 1.0f)
+                            * clamp (p.width, 0.0f, 1.0f);
+            panSm[(size_t) i].setTarget (pan);
 
             // prepare() у движков — тяжёлый (степени, MIP-уровни, пересчёт мод).
             // Вызываем его только когда параметры реально изменились: без этого
@@ -528,8 +552,8 @@ private:
     EngineRetireBin* retireBin = nullptr;
     std::array<Adsr, kSlots> env;
     std::array<SlotFilter, kSlots> filter;
-    std::array<SmoothedValue, kSlots> gainSm;
-    std::array<float, kSlots> panL {}, panR {};
+    std::array<SmoothedValue, kSlots> gainSm, panSm;
+    std::array<float, kSlots> panL {}, panR {}, lastPan {};
     std::array<float, kSlots> tailLeft {}, lastAmp {}, slotMeter {};
     std::array<bool, kSlots> slotRunning {}, slotStarted {};
     std::array<EngineParams, kSlots> lastParams {};

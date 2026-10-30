@@ -45,6 +45,37 @@ namespace
     constexpr int kChipTotal = (int) (sizeof (kChips) / sizeof (kChips[0]));
     constexpr int kChipsPerPage = 5;
 
+    int lfoPreviewCycles (float rate)
+    {
+        return juce::jlimit (1, 6, juce::roundToInt (rate * 0.6f) + 1);
+    }
+
+    // Это схема формы, а не фаза какой-либо из полифонических нот. Треугольник
+    // совпадает с формулой Voice; S&H держит значение весь цикл, а не создаёт
+    // фиктивные быстрые ступеньки внутри него.
+    float lfoPreviewValue (int shape, float cycles)
+    {
+        const float whole = std::floor (cycles);
+        const float phase = cycles - whole;
+        if (shape == 0) return std::sin (phase * juce::MathConstants<float>::twoPi);
+        if (shape == 1) return 4.0f * std::abs (phase - 0.5f) - 1.0f;
+        Rng r (0x5eedu);
+        float held = 0.0f;
+        for (int i = 0; i < (int) whole; ++i) held = r.nextBipolar();
+        return held;
+    }
+
+    struct VisualHash
+    {
+        std::uint64_t value = 1469598103934665603ull;
+        void add (float v) noexcept
+        {
+            std::uint32_t bits = 0;
+            std::memcpy (&bits, &v, sizeof (bits));
+            value = (value ^ bits) * 1099511628211ull;
+        }
+    };
+
     juce::Rectangle<float> chipPagerRect() { return { 886.0f, 578.0f, 78.0f, 16.0f }; }
     // сам дисплей с волной: раньше только показывал, теперь и тянется
     juce::Rectangle<float> displayRect() { return { 248.0f, 66.0f, 736.0f, 214.0f }; }
@@ -248,6 +279,12 @@ public:
         s->setTextBoxStyle (juce::Slider::NoTextBox, true, 0, 0);
         s->getProperties().set ("big", false);
         s->getProperties().set ("paramId", id);
+        // Число рисуется родителем под ручкой, не самим Slider. Его надо
+        // инвалидировать и при автоматизации хоста, не только при hover.
+        s->onValueChange = [this, s] {
+            const auto r = s->getBounds();
+            repaint (r.getX() - 4, r.getBottom(), r.getWidth() + 8, 10);
+        };
         addAndMakeVisible (s);
         knobAtts.push_back (std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
             proc.apvts, id, *s));
@@ -1426,6 +1463,9 @@ void OrogenEditor::buildCentre()
     {
         auto* k = new Bound();
         k->setup (juce::Slider::RotaryHorizontalVerticalDrag, true);
+        k->slider.onValueChange = [this, i] {
+            repaint (R (262.0f + 200.0f * (float) i + 112.0f, 520.0f, 84.0f, 14.0f));
+        };
         addAndMakeVisible (k->slider);
         centreKnobs.add (k);
 
@@ -1448,10 +1488,15 @@ void OrogenEditor::buildBottom()
         { "lfo1_rate", "lfo1_amount", "LFO 1 RATE" }
     };
 
+    int pairIndex = 0;
     for (const auto& pr : pairs)
     {
+        const int i = pairIndex++;
         auto* k = new Bound();
         k->setup (juce::Slider::RotaryHorizontalVerticalDrag, true);
+        k->slider.onValueChange = [this, i] {
+            repaint (R (86.0f + 170.0f * (float) i + 116.0f, 690.0f, 48.0f, 12.0f));
+        };
         addAndMakeVisible (k->slider);
         k->bind (proc.apvts, pr.knob);
         bottomKnobs.add (k);
@@ -1867,6 +1912,9 @@ float OrogenEditor::animationPhase() const
 void OrogenEditor::setAnimationPhase (double seconds)
 {
     animSeconds = seconds;
+    const float rate = juce::jmax (0.0f, pv ("lfo1_rate"));
+    const double phase = seconds * (double) rate / (double) lfoPreviewCycles (rate);
+    lfoPreviewPhase = phase - std::floor (phase);
     // фаза живёт в редакторе, но рисуют её и дочерние компоненты — раздаём всем,
     // иначе кадр снаружи (тест, render_ui) будет статичным
     // при выключенных анимациях детям отдаётся нулевая фаза: кадр замирает
@@ -1999,6 +2047,54 @@ float OrogenEditor::animPhaseFor (double speed, double offset) const
     return (float) f;
 }
 
+void OrogenEditor::repaintChangedValues()
+{
+    // Эти изображения рисует родитель, а не связанные Slider/ComboBox.
+    // Опрос только на message thread; при неизменных значениях нет ни полного
+    // repaint, ни работы в аудиопотоке. Работает и при выключенной анимации.
+    auto changed = [this] (std::uint64_t next, std::uint64_t& previous) {
+        const bool different = ! visualHashesValid || next != previous;
+        previous = next;
+        return different;
+    };
+    for (int i = 0; i < kNumSlots; ++i)
+    {
+        VisualHash h;
+        const auto prefix = slotPrefix (i);
+        h.add (pv (prefix + "on")); h.add (pv (prefix + "type")); h.add (pv (prefix + "level"));
+        if (changed (h.value, railVisualHashes[(size_t) i]))
+            repaint (R (16.0f, 66.0f + 70.0f * (float) i, 216.0f, 62.0f));
+    }
+
+    VisualHash lane;
+    lane.add ((float) selectedSlot);
+    for (const auto* id : { "lfo1_rate", "lfo1_amount", "lfo1_shape" }) lane.add (pv (id));
+    for (int r = 1; r <= 8; ++r) lane.add (pv ("mod" + juce::String (r) + "_amt"));
+    for (const auto* field : { "attack", "decay", "sustain", "release" }) lane.add (pv (slotId (field)));
+    if (changed (lane.value, laneVisualHash))
+    {
+        repaint (R (248.0f, 290.0f, 736.0f, 178.0f));
+        repaint (R (988.0f, 24.0f, 100.0f, 16.0f));
+    }
+
+    VisualHash chip;
+    for (const auto& def : kChips) chip.add (pv (def.id));
+    if (changed (chip.value, chipVisualHash)) repaint (R (248.0f, 570.0f, 736.0f, 70.0f));
+
+    VisualHash pad;
+    pad.add (pv ("gl_morph")); pad.add (pv ("gl_glide"));
+    if (changed (pad.value, padVisualHash) && vectorPad != nullptr) vectorPad->repaint();
+
+    // Выключенный выбранный слот тоже имеет подпись источника/фильтра;
+    // previewPatchHash специально игнорирует его звуковые параметры.
+    VisualHash display;
+    display.add ((float) selectedSlot);
+    for (const auto* field : { "on", "type", "table", "filter" }) display.add (pv (slotId (field)));
+    display.add (pv ("gl_mode")); display.add (pv ("gl_morph"));
+    if (changed (display.value, displayVisualHash)) repaint (R (248.0f, 66.0f, 736.0f, 214.0f));
+    visualHashesValid = true;
+}
+
 void OrogenEditor::timerCallback()
 {
     // время считаем по часам, а не по числу тиков: при просадках кадров
@@ -2012,6 +2108,11 @@ void OrogenEditor::timerCallback()
     if (animOn && dt > 0.0)
     {
         animSeconds += dt;
+        // Интегрируем мгновенную скорость: изменение Rate не переносит
+        // playhead в позицию, вычисленную из всего прошедшего времени.
+        const float rate = juce::jmax (0.0f, pv ("lfo1_rate"));
+        lfoPreviewPhase += dt * (double) rate / (double) lfoPreviewCycles (rate);
+        lfoPreviewPhase -= std::floor (lfoPreviewPhase);
         for (auto* c : columns) c->setAnimPhase ((float) animSeconds);
         if (vectorPad != nullptr) vectorPad->setAnimPhase ((float) animSeconds);
         for (auto* b : sectionButtons) b->setAnimPhase ((float) animSeconds);
@@ -2032,6 +2133,10 @@ void OrogenEditor::timerCallback()
         sm += (target - sm) * (dt > 0.0 ? (float) juce::jmin (1.0, dt / 0.12) : 0.2f);
         if (std::abs (sm - slotLevels[(size_t) i]) > 0.2f) { slotLevels[(size_t) i] = sm; changed = true; }
     }
+
+    // Статические графики, чипы, рейл и pad обновляются от параметров даже
+    // при выключенной анимации; только изменившиеся области помечаются dirty.
+    repaintChangedValues();
 
     // Имена макросов реагируют и на выбор мышью, и на автоматизацию хоста,
     // в том числе когда анимации отключены.
@@ -2361,19 +2466,14 @@ void OrogenEditor::paintModEditor (juce::Graphics& g)
         const int shape = pi ("lfo1_shape");
         const float amount = pv ("lfo1_amount");
         const float rate = pv ("lfo1_rate");
-        const int cycles = juce::jlimit (1, 6, juce::roundToInt (rate * 0.6f) + 1);
+        const int cycles = lfoPreviewCycles (rate);
 
         juce::Path curve;
         const int N = 400;
         for (int i = 0; i <= N; ++i)
         {
             const float t = (float) i / (float) N;
-            const float ph = t * juce::MathConstants<float>::twoPi * (float) cycles;
-            float v = 0.0f;
-            if (shape == 0)      v = std::sin (ph);
-            else if (shape == 1) v = 2.0f * std::abs (2.0f * (float) (ph / juce::MathConstants<float>::twoPi
-                                                                    - std::floor (ph / juce::MathConstants<float>::twoPi + 0.5f))) - 1.0f;
-            else                 v = ((int) (ph * 3.0f) % 5) / 2.0f - 1.0f;
+            const float v = lfoPreviewValue (shape, t * (float) cycles);
 
             const float x = lane.getX() + t * lane.getWidth();
             const float y = lane.getCentreY() - v * (0.15f + 0.85f * amount) * lane.getHeight() * 0.46f;
@@ -2392,18 +2492,12 @@ void OrogenEditor::paintModEditor (juce::Graphics& g)
             g.fillEllipse (x - 2.0f, lane.getCentreY() - 2.0f, 4.0f, 4.0f);
         }
 
-        // playhead: точка, бегущая по кривой с частотой, взятой из параметра
-        // lfo1_rate. Это визуализация частоты (та же шкала, что у cycles выше),
-        // а не «декоративная точка»: остановишь LFO — остановится и она.
+        // Схематический playhead движется со скоростью LFO в Гц. Он не
+        // обещает совпадения с фазой конкретного полифонического голоса.
         if (animOn)
         {
-            const float t = animPhaseFor (0.25 + 1.75 * (double) rate);
-            const float ph = t * juce::MathConstants<float>::twoPi * (float) cycles;
-            float v = 0.0f;
-            if (shape == 0)      v = std::sin (ph);
-            else if (shape == 1) v = 2.0f * std::abs (2.0f * (float) (ph / juce::MathConstants<float>::twoPi
-                                                                    - std::floor (ph / juce::MathConstants<float>::twoPi + 0.5f))) - 1.0f;
-            else                 v = ((int) (ph * 3.0f) % 5) / 2.0f - 1.0f;
+            const float t = (float) lfoPreviewPhase;
+            const float v = lfoPreviewValue (shape, t * (float) cycles);
 
             const float px = lane.getX() + t * lane.getWidth();
             const float py = lane.getCentreY() - v * (0.15f + 0.85f * amount) * lane.getHeight() * 0.46f;

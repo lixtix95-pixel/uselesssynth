@@ -9,13 +9,16 @@
 ```bash
 # VST3-обёртка (JUCE 8) лежит рядом: ../orogen-plugin, см. PLUGIN.md
 make test     # 11 наборов: 9 движков + инструмент + FX; выход при первой ошибке
+make asan-granular  # отдельная автоматизация Granular под ASan/UBSan; GCC/Clang
 make demo     # 11 офлайн-рендеров в audio/*.wav + спектрограммы
 make build/render_demo_fx && ./build/render_demo_fx       # audio/fx_demo.wav (34 с)
 make build/render_demo_comb && ./build/render_demo_comb   # audio/comb_chorus_demo.wav (24 с)
 ```
 
 Требуется g++ ≥ 10 (C++17) и GNU make. Никаких внешних зависимостей.
-Последний полный прогон: 11/11 наборов, **310 OK / 0 FAIL**. Старый `make test`
+Последний полный прогон 30.10.2026: 11/11 наборов, **324 OK / 0 FAIL**.
+Отдельный ASan/UBSan-стенд Granular: 240 сценариев, 3013 зёрен, без ошибок.
+Старый `make test`
 мог скрыть код ошибки из-за `| tail`; теперь код ненулевого завершения сохраняется
 и дальнейшие тесты не запускаются. Данные и ограничения текущего Granular —
 `ENGINE-05-granular.md`; список ниже частично сохраняет исторические замеры.
@@ -49,7 +52,7 @@ LICENSE         GPL-3.0 (весь проект), NOTICE.md — что чьё
 | 2 | FM | **готов**: алиасинг −67.8 дБ, 0.10 % CPU/голос, 6 пресетов | [ENGINE-02-fm.md](ENGINE-02-fm.md) |
 | 3 | Harmonic | **готов**: алиасинг −87.6 дБ, 64 партиала, 0.93 % CPU/голос | [ENGINE-03-harmonic.md](ENGINE-03-harmonic.md) |
 | 4 | Sample | общий MIP до 11 уровней; текущий стенд 14/14, полная доводка отдельно | [ENGINE-04-sample.md](ENGINE-04-sample.md) |
-| 5 | Granular | текущий стенд 29/29, исправлены атака, границы, Density и дробный pitch; есть ограничения | [ENGINE-05-granular.md](ENGINE-05-granular.md) |
+| 5 | Granular | текущий стенд 33/33, исправлены атака, границы, Density, Detune, Level и дробный pitch; есть ограничения | [ENGINE-05-granular.md](ENGINE-05-granular.md) |
 | 6 | Modal | **готов**: алиасинг −92.9 дБ, T60 0.25…12 с, 0.38 % CPU/голос | [ENGINE-06-modal.md](ENGINE-06-modal.md) |
 | 7 | Resynth | **готов**: алиасинг −73.6 дБ, stretch 0.25…4× независим от питча, 1.19 % CPU/голос | [ENGINE-07-resynth.md](ENGINE-07-resynth.md) |
 | 8 | Organics | исправлены склейка и короткий источник; остальные перепады требуют отдельной доводки | [ENGINE-08-organics.md](ENGINE-08-organics.md) |

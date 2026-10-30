@@ -37,12 +37,20 @@ public:
         sampleRate = sr;
         posSm.setTime (sr, 45.0);
         sizeSm.setTime (sr, 60.0);
+        gainSm.setTime (sr, 5.0);
         // Создание lookup-таблиц не должно попадать на первую ноту и первый
         // render(). setSampleRate вызывается при подготовке/создании движка,
         // вне горячего аудиоцикла; далее эти таблицы только читаются.
         (void) sincKernel();
         (void) grainSincKernel();
         (void) fastCosTbl (0.0f);
+    }
+
+    // Отдельный медленный detune на ноту; Spread по-прежнему случайный для
+    // каждого зерна. Voice передаёт свой детерминированный bipolar Random.
+    void setNoteRandom (float value) noexcept override
+    {
+        noteRandom = clamp (value, -1.0f, 1.0f);
     }
 
     void start (int midiNote, float velocity) override
@@ -71,7 +79,12 @@ public:
         const OneShot& s = bank->shots[(size_t) clamp (p.table, 0, (int) bank->shots.size() - 1)];
         shot = &s;
 
-        baseRate = (float) std::pow (2.0, ((double) note - (double) s.rootNote + (double) p.tuneSemis) / 12.0);
+        // Detune = до ±10 центов для конкретной ноты; при 0 звук и
+        // планировщик идентичны прежнему коду. Новая высота назначается
+        // только новым зёрнам: активные сохраняют свои безопасные MIP/границы.
+        const double cents = 10.0 * (double) noteRandom * (double) clamp (p.detune, 0.0f, 1.0f);
+        baseRate = (float) std::pow (2.0, ((double) note - (double) s.rootNote
+                                          + (double) p.tuneSemis + cents / 100.0) / 12.0);
         bodyRms = std::max (1.0e-4f, bodyLevel (s));
 
         // p[0] — позиция чтения по записи, p[1] — размер зерна, p[2] — плотность, p[3] — спред
@@ -87,10 +100,16 @@ public:
         // плотность: 4 .. 90 зёрен/с
         density = 4.0f + densT * 86.0f;
 
-        if (needSnap) { posSm.snap (posT); sizeSm.snap (sizeSec); needSnap = false; }
-        else          { posSm.setTarget (posT); sizeSm.setTarget (sizeSec); }
-
-        gain = kGainTrim * (0.4f + 0.6f * clamp (p.level, 0.0f, 1.0f));
+        const float gainT = kGainTrim * (0.4f + 0.6f * clamp (p.level, 0.0f, 1.0f));
+        if (needSnap)
+        {
+            posSm.snap (posT); sizeSm.snap (sizeSec); gainSm.snap (gainT);
+            needSnap = false;
+        }
+        else
+        {
+            posSm.setTarget (posT); sizeSm.setTarget (sizeSec); gainSm.setTarget (gainT);
+        }
         dcCoef = (float) std::exp (-kTwoPi * 6.0 / sampleRate);
     }
 
@@ -127,7 +146,7 @@ public:
 
         // Нормировка зафиксирована при запуске каждого зерна. Уже звучащее
         // окно не получает мгновенный скачок при автоматизации Density.
-        const float out = sum * gain;
+        const float out = sum * gainSm.next();
         const float y = out - dcX + dcCoef * dcY;
         dcX = out; dcY = y;
         return y;
@@ -229,9 +248,12 @@ private:
     float  vel = 1.0f;
     bool   active = false, needSnap = true;
 
+    // Для автономного Granular без Voice — воспроизводимое ненулевое значение;
+    // в инструменте каждый note-on подставляет собственное значение голоса.
+    float  noteRandom = 0.5f;
     float  baseRate = 1.0f, spread = 0.0f, sizeSec = 0.08f, density = 20.0f, bodyRms = 1.0f;
-    float  spawnAcc = 0.0f, gain = 0.5f, dcX = 0.0f, dcY = 0.0f, dcCoef = 0.999f;
-    SmoothedValue posSm, sizeSm;
+    float  spawnAcc = 0.0f, dcX = 0.0f, dcY = 0.0f, dcCoef = 0.999f;
+    SmoothedValue posSm, sizeSm, gainSm;
     Rng rng { 0x51F3A7u };
 };
 

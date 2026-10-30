@@ -1137,6 +1137,174 @@ int main()
                num (cLow, 0) + " → " + num (cHigh, 0) + " Гц");
     }
 
+    // Динамические параметры проверяются на одном и том же удержанном голосе,
+    // напрямую до FX: задержка ROBIN и хвост ревербератора не должны скрывать
+    // потерянный слот или отсутствие реакции на панораму.
+    std::printf ("\n--- Удержанная нота: Morph, Level, Pan и Width ---\n");
+    {
+        EngineBank bank;
+        bank.build (48000.0);
+        auto patch = [] {
+            Patch p;
+            for (auto& slot : p.slots)
+            {
+                slot.on = false;
+                slot.tail = 0.0f;
+                slot.sustain = 1.0f;
+            }
+            p.slots[0].on = true;
+            p.slots[0].type = EngineType::Wavetable;
+            p.slots[0].params.detune = 0.0f;
+            return p;
+        };
+        auto start = [&bank] (Voice& v, const Patch& p) {
+            v.init (bank, 48000.0);
+            v.stageSlots (p, bank);
+            v.applyPendingEngines();
+            v.start (p, 60, 1.0f, 60.0f, 7);
+        };
+        auto window = [] (Voice& v, const Patch& p, int n) {
+            double l2 = 0.0, r2 = 0.0;
+            bool finite = true;
+            for (int i = 0; i < n; ++i)
+            {
+                float l = 0.0f, r = 0.0f;
+                (void) v.render (p, l, r);
+                if (i >= n / 2) { l2 += (double) l * l; r2 += (double) r * r; }
+                finite = finite && std::isfinite (l) && std::isfinite (r);
+            }
+            return std::array<double, 3> { std::sqrt (l2 / (n - n / 2)),
+                                           std::sqrt (r2 / (n - n / 2)), finite ? 1.0 : 0.0 };
+        };
+
+        Patch morph = patch();
+        morph.mode = PatchMode::Morph;
+        morph.slots[1].on = true;
+        morph.slots[1].type = EngineType::FM;
+        morph.slots[1].params.detune = 0.0f;
+        Voice m;
+        start (m, morph);
+        const auto first = window (m, morph, 12000);
+        morph.morph = 1.0f / 7.0f;
+        const auto second = window (m, morph, 12000);
+        morph.morph = 0.0f;
+        const auto again = window (m, morph, 12000);
+        std::printf ("   Morph A -> B -> A (tail 0): RMS %.6f / %.6f / %.6f, активен %d\n",
+                     first[0], second[0], again[0], (int) m.isActive());
+        check (first[0] > 0.005 && second[0] > 0.005 && again[0] > 0.005 && m.isActive(),
+               "слоты с нулевым хвостом включаются и возвращаются на одной ноте");
+
+        Patch quiet = patch();
+        quiet.slots[0].params.level = 0.0f;
+        Voice q;
+        start (q, quiet);
+        const auto muted = window (q, quiet, 2400);
+        const bool held = q.isActive();
+        quiet.slots[0].params.level = 1.0f;
+        const auto raised = window (q, quiet, 12000);
+        std::printf ("   Level 0 -> 1: RMS %.6f -> %.6f, удержана %d\n",
+                     muted[0], raised[0], (int) held);
+        check (held && muted[0] < 1.0e-7 && raised[0] > 0.005,
+               "полностью тихая удержанная нота оживает при автоматизации Level");
+        quiet.slots[0].params.level = 0.0f;
+        q.noteOff();
+        (void) window (q, quiet, 48000);
+        check (! q.isActive(), "тихий голос освобождается после note-off");
+
+        // Номер ноты передаётся движку через setNoteRandom: без Detune два
+        // одинаковых голоса совпадают, с Detune получают собственную высоту.
+        auto serialDifference = [&] (float detune) {
+            Patch gp = patch();
+            gp.slots[0].type = EngineType::Granular;
+            gp.slots[0].params.detune = detune;
+            gp.slots[0].params.p[1] = 0.45f;
+            gp.slots[0].params.p[2] = 1.0f;
+            gp.slots[0].params.p[3] = 0.0f;
+            Voice a, b;
+            for (auto* voice : { &a, &b })
+            {
+                voice->init (bank, 48000.0);
+                voice->stageSlots (gp, bank);
+                voice->applyPendingEngines();
+            }
+            a.start (gp, 60, 1.0f, 60.0f, 1);
+            b.start (gp, 60, 1.0f, 60.0f, 2);
+            double delta = 0.0, energy = 0.0;
+            for (int i = 0; i < 24000; ++i)
+            {
+                float al = 0.0f, ar = 0.0f, bl = 0.0f, br = 0.0f;
+                a.render (gp, al, ar); b.render (gp, bl, br);
+                delta += ((double) al - bl) * ((double) al - bl);
+                energy += (double) al * al;
+            }
+            return std::sqrt (delta / std::max (1.0e-20, energy));
+        };
+        const double noDetune = serialDifference (0.0f), withDetune = serialDifference (1.0f);
+        std::printf ("   два голоса Granular, относительная ΔRMS: Detune 0 %.6f / 1 %.6f\n",
+                     noDetune, withDetune);
+        check (noDetune < 1.0e-6 && withDetune > 0.01,
+               "Detune использует разное значение Random у разных note-on");
+
+        Patch panRef = patch(), panChanged = patch();
+        panRef.slots[0].params.pan = panChanged.slots[0].params.pan = -1.0f;
+        Voice refVoice, smoothVoice;
+        start (refVoice, panRef); start (smoothVoice, panChanged);
+        float last = 0.0f;
+        for (int i = 0; i < 24064; ++i) // точная граница control block 128
+        {
+            float l = 0.0f, r = 0.0f, x = 0.0f, y = 0.0f;
+            refVoice.render (panRef, l, r); smoothVoice.render (panChanged, x, y);
+            last = l;
+        }
+        for (int block = 0; block < 40 && std::fabs (last) < 0.1f; ++block)
+            for (int i = 0; i < 128; ++i)
+            {
+                float l = 0.0f, r = 0.0f, x = 0.0f, y = 0.0f;
+                refVoice.render (panRef, l, r); smoothVoice.render (panChanged, x, y);
+                last = l;
+            }
+        panChanged.slots[0].params.pan = 1.0f;
+        float rl = 0.0f, rr = 0.0f, sl = 0.0f, sr = 0.0f;
+        refVoice.render (panRef, rl, rr); smoothVoice.render (panChanged, sl, sr);
+        const double panFirst = std::max (std::fabs ((double) sl - rl), std::fabs ((double) sr - rr))
+                              / std::max (1.0e-8, std::fabs ((double) rl));
+        std::printf ("   первый отсчёт Pan -1 -> +1: относительное отличие %.6f\n", panFirst);
+        check (std::fabs (rl) > 0.05f && panFirst < 0.02,
+               "смена панорамы не переставляет сигнал скачком за один отсчёт", num (panFirst, 6));
+
+        Patch pan = patch();
+        pan.slots[0].params.pan = -1.0f;
+        Voice v;
+        start (v, pan);
+        const auto left = window (v, pan, 12000);
+        pan.slots[0].params.pan = 1.0f;
+        const auto right = window (v, pan, 12000);
+        pan.width = 0.0f;
+        const auto centre = window (v, pan, 12000);
+        std::printf ("   Pan -1 -> 1, Width 1 -> 0: L/R %.5f/%.5f -> %.5f/%.5f -> %.5f/%.5f\n",
+                     left[0], left[1], right[0], right[1], centre[0], centre[1]);
+        check (left[0] > 0.01 && left[1] < left[0] * 0.01
+               && right[1] > 0.01 && right[0] < right[1] * 0.01,
+               "панорама автоматизируется на удержанной ноте");
+        check (centre[0] > 0.01 && std::fabs (centre[0] - centre[1]) < centre[0] * 0.01,
+               "автоматизация Width возвращает панораму к центру");
+
+        pan.width = 1.0f;
+        pan.slots[0].params.pan = 0.0f;
+        pan.routes[0].source = ModSource::ModWheel;
+        pan.routes[0].dest = ModDest::Pan;
+        pan.routes[0].amount = 1.0f;
+        pan.modWheel = 1.0f;
+        const auto modded = window (v, pan, 12000);
+        pan.modWheel = 0.0f;
+        const auto returned = window (v, pan, 12000);
+        std::printf ("   мод-матрица Pan 1 -> 0: L/R %.5f/%.5f -> %.5f/%.5f\n",
+                     modded[0], modded[1], returned[0], returned[1]);
+        check (modded[1] > 0.01 && modded[0] < modded[1] * 0.01
+               && returned[0] > 0.01 && std::fabs (returned[0] - returned[1]) < returned[0] * 0.01,
+               "Pan возвращается к базовому положению при снятии модуляции");
+    }
+
     std::printf ("\n=================================================\n");
     if (suite::gFailures == 0) std::printf ("ВСЕ ТЕСТЫ ПРОЙДЕНЫ (провалов: 0)\n");
     else std::printf ("ПРОВАЛОВ: %d\n", suite::gFailures);

@@ -11,6 +11,7 @@
 #if ! defined (_WIN32)
 #include <execinfo.h>
 #endif
+#include <cstdlib>
 
 static void crashTrace (int sig)
 {
@@ -509,7 +510,108 @@ static void testGuiRegressions()
                num (levelOn, 2) + " → " + num (levelOff, 2));
     }
 
+    // Реальная точка playhead сравнивается по пикселям с кадром без анимации.
+    // При изменении скорости фаза не должна перескакивать, а по неподвижной
+    // скорости за 0.25 с должен пройти именно четверть цикла LFO.
+    {
+        auto headX = [] (const juce::Image& baseImage, const juce::Image& movingImage)
+        {
+            double weight = 0.0, weightedX = 0.0;
+            for (int y = 352; y < 405; ++y)
+                for (int x = 262; x < 970; ++x)
+                {
+                    const double d = (double) movingImage.getPixelAt (x, y).getBrightness()
+                                   - (double) baseImage.getPixelAt (x, y).getBrightness();
+                    if (d > 0.01) { weight += d; weightedX += d * x; }
+                }
+            return weight > 0.5 ? weightedX / weight : -1.0;
+        };
+        setP (p, "lfo1_shape", 0.0f);
+        setP (p, "lfo1_amount", 0.8f);
+        setP (p, "lfo1_rate", 0.05f);
+        editor->setAnimationsEnabled (false);
+        const auto lowBase = capture (*editor);
+        editor->setAnimationsEnabled (true);
+        editor->setAnimationPhase (12.345);
+        const auto lowOn = capture (*editor);
+        const double x1 = headX (lowBase, lowOn);
+        setP (p, "lfo1_rate", 0.1f);
+        editor->setAnimationsEnabled (false);
+        const auto highBase = capture (*editor);
+        editor->setAnimationsEnabled (true);
+        const auto highOn = capture (*editor);
+        const double x2 = headX (highBase, highOn);
+        std::printf ("   playhead при смене Rate: x %.2f -> %.2f px\n", x1, x2);
+        check (x1 >= 0.0 && x2 >= 0.0 && std::fabs (x1 - x2) < 3.0,
+               "автоматизация LFO Rate не перескакивает фазу анимации",
+               num (std::fabs (x1 - x2), 2) + " px");
+
+        setP (p, "lfo1_rate", 1.0f); // два цикла на дорожке, 1 Гц в DSP
+        editor->setAnimationsEnabled (false);
+        const auto oneHzBase = capture (*editor);
+        editor->setAnimationsEnabled (true);
+        editor->setAnimationPhase (0.2);
+        const double startX = headX (oneHzBase, capture (*editor));
+        editor->setAnimationPhase (0.45);
+        const double endX = headX (oneHzBase, capture (*editor));
+        std::printf ("   playhead 1 Гц за 0.25 с: %.2f px по дорожке\n", endX - startX);
+        check (startX >= 0.0 && endX - startX > 78.0 && endX - startX < 100.0,
+               "скорость playhead соответствует параметру LFO 1 Гц");
+    }
+
+    // В отличие от paintEntireComponent(), снимок НАТИВНОГО окна показывает
+    // только реально перерисованные области. Так ловим устаревшие значения,
+    // графики и чипы при автоматизации и выключенных анимациях.
+   #if JUCE_LINUX || JUCE_BSD
+    if (std::getenv ("OROGEN_GUI_NATIVE") != nullptr)
+    {
+        editor->setAnimationsEnabled (false);
+        editor->showPage (0);
+        setP (p, "sA_cutoff", 0.10f);
+        setP (p, "fx_drive", 0.0f);
+        setP (p, "lfo1_amount", 0.0f);
+        setP (p, "gl_morph", 0.1f);
+        setP (p, "sB_on", 0.0f);
+        setP (p, "sB_type", 0.0f);
+        editor->addToDesktop (0);
+        editor->setTopLeftPosition (0, 0);
+        editor->setVisible (true);
+        juce::MessageManager::getInstance()->runDispatchLoopUntil (2200);
+        auto native = [&] {
+            return editor->getPeer() != nullptr
+                ? juce::createSnapshotOfNativeWindow (editor->getPeer()->getNativeHandle())
+                : juce::Image();
+        };
+        auto nativeChange = [&] (const juce::String& id, float value, juce::Rectangle<int> region) {
+            const auto beforeNative = native();
+            const auto beforeFresh = capture (*editor);
+            setP (p, id, value);
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (300);
+            const auto afterNative = native();
+            const auto afterFresh = capture (*editor);
+            if (! beforeNative.isValid() || ! afterNative.isValid()) return std::array<int, 2> { -1, -1 };
+            return std::array<int, 2> { diffRegion (beforeNative, afterNative, region),
+                                        diffRegion (beforeFresh, afterFresh, region) };
+        };
+        const auto label = nativeChange ("sA_cutoff", 0.90f, { 374, 520, 84, 14 });
+        const auto chip = nativeChange ("fx_drive", 0.80f, { 254, 598, 120, 34 });
+        const auto lfo = nativeChange ("lfo1_amount", 0.90f, { 262, 356, 708, 44 });
+        const auto rail = nativeChange ("sB_type", 4.0f, { 16, 136, 216, 62 });
+        const auto pad = nativeChange ("gl_morph", 0.80f, { 1108, 646, 156, 138 });
+        std::printf ("   native/fresh px: значение %d/%d, FX %d/%d, LFO %d/%d, слот B %d/%d, pad %d/%d\n",
+                     label[0], label[1], chip[0], chip[1], lfo[0], lfo[1], rail[0], rail[1], pad[0], pad[1]);
+        check (label[1] > 5 && label[0] > 5, "значение центральной ручки перерисовывается в настоящем окне");
+        check (chip[1] > 20 && chip[0] > 20, "автоматизация FX обновляет чип при выключенных анимациях");
+        check (lfo[1] > 20 && lfo[0] > 20, "автоматизация LFO обновляет график при выключенных анимациях");
+        check (rail[1] > 20 && rail[0] > 20, "автоматизация типа выключенного слота обновляет рейл");
+        check (pad[1] > 20 && pad[0] > 20, "автоматизация Morph обновляет векторный блок");
+        editor->removeFromDesktop();
+    }
+    else std::printf ("   native-window тесты пропущены: нужен оконный менеджер и OROGEN_GUI_NATIVE=1\n");
+   #endif
+
     // Fade секций оверлея: доступность контролов не зависит от эффекта.
+    editor->setAnimationsEnabled (true);
     editor->showPage (100);
     editor->showPage (200);        // ALL вкладки 0
     auto* overlay = editor->paramsOverlay();
@@ -754,6 +856,7 @@ static void testGranularProcessorRegression()
         setP (*pr, "lfo1_amount", 0.0f); setP (*pr, "lfo2_amount", 0.0f);
         for (int k = 1; k <= 8; ++k) setP (*pr, "mod" + juce::String (k) + "_amt", 0.0f);
         setP (*pr, "sA_level", 0.8f); setP (*pr, "sA_table", 0.0f);
+        setP (*pr, "sA_detune", 0.0f);
         setP (*pr, "sA_p0", 0.35f); setP (*pr, "sA_p1", 0.45f);
         setP (*pr, "sA_p2", 0.0f); setP (*pr, "sA_p3", 0.0f);
         setP (*pr, "sA_attack", 0.001f); setP (*pr, "sA_sustain", 1.0f);
@@ -790,6 +893,46 @@ static void testGranularProcessorRegression()
     check (latency == 1024 && first >= latency && first - latency < 960 && bad == 0,
            "при минимальной Density атака доходит через плагин без 250-мс паузы",
            num (onsetMs, 3) + " мс, latency " + juce::String (latency));
+
+    // Оба процессора начали одну и ту же ноту с Detune = 0 и Spread = 0.
+    // Меняем только APVTS-параметр первого, не отправляя повторный note-on.
+    setP (changed, "sA_detune", 1.0f);
+    double detuneDelta = 0.0, detuneReference = 0.0;
+    for (int block = 0; block < 200; ++block)
+    {
+        changed.processBlock (a, empty); reference.processBlock (b, empty);
+        if (block < 16) continue; // исключить ROBIN latency
+        for (int i = 0; i < 128; ++i)
+        {
+            const double x = a.getSample (0, i), y = b.getSample (0, i), d = x - y;
+            detuneDelta += d * d; detuneReference += y * y;
+        }
+    }
+    const double detuneRelative = std::sqrt (detuneDelta / std::max (1.0e-20, detuneReference));
+    std::printf ("   APVTS Detune 0 -> 1 на удержанной ноте: относительная ΔRMS %.6f\n", detuneRelative);
+    check (detuneRelative > 0.01, "Detune Granular действует через плагин и MIDI", num (detuneRelative, 6));
+
+    // Вернуть оба детерминированных планировщика к тем же параметрам и дать
+    // затухнуть старым зёрнам и DC-блокеру, прежде чем измерять Density.
+    setP (changed, "sA_detune", 0.0f);
+    for (int block = 0; block < 320; ++block)
+    {
+        changed.processBlock (a, empty); reference.processBlock (b, empty);
+    }
+    // При 4 зёрнах/с есть настоящие паузы. Ищем начало следующего зерна,
+    // чтобы проверка после latency не оказалась в нулевом участке и не
+    // объявила тишину доказательством отсутствия щелчка.
+    bool gapSeen = false, onsetSeen = false;
+    for (int block = 0; block < 300 && ! onsetSeen; ++block)
+    {
+        changed.processBlock (a, empty); reference.processBlock (b, empty);
+        double energy = 0.0;
+        for (int i = 0; i < 128; ++i) energy += (double) b.getSample (0, i) * b.getSample (0, i);
+        const double blockRms = std::sqrt (energy / 128.0);
+        if (blockRms < 1.0e-4) gapSeen = true;
+        if (gapSeen && blockRms > 0.005) onsetSeen = true;
+    }
+    check (gapSeen && onsetSeen, "для Density найдено звучащее зерно после паузы");
 
     setP (changed, "sA_p2", 1.0f);
     float earlyDiff = 0.0f;

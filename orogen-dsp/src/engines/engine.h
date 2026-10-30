@@ -29,6 +29,9 @@ public:
 
     virtual const char* name() const = 0;
     virtual void setSampleRate (double sr) = 0;
+    // Устойчивое значение ±1 для данной ноты/голоса. По умолчанию движки,
+    // которым это не нужно, его игнорируют; параметр не является ID хоста.
+    virtual void setNoteRandom (float) noexcept {}
     virtual void start (int midiNote, float velocity) = 0;
     virtual void prepare (const EngineParams& p) = 0;
     virtual float render (const EngineParams& p) = 0;

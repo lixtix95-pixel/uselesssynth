@@ -109,6 +109,7 @@ private:
     class PreviewWorker;     // владеет DSP-голосом вне message/audio thread
 
     void timerCallback() override;
+    void repaintChangedValues();
     void takePreviewResult();
     void buildRail();
     void buildCentre();
@@ -206,8 +207,12 @@ private:
     double prevStampMs = 0.0, prevRenderMs = 0.0;
 
     double animSeconds = 0.0;         // время анимации, с
+    double lfoPreviewPhase = 0.0;     // фазу интегрируем, а не умножаем на новую частоту
     double lastTimerMs = 0.0;
     bool   animOn = true;
+    bool visualHashesValid = false;
+    std::array<std::uint64_t, 8> railVisualHashes {};
+    std::uint64_t laneVisualHash = 0, chipVisualHash = 0, padVisualHash = 0, displayVisualHash = 0;
     std::array<float, 8> slotLevelsSmooth { };
     float animPhaseFor (double speed, double offset = 0.0) const;   // 0…1
 

@@ -168,7 +168,8 @@ public:
     }
 
     void setTime (float sec)  { timeSec = clamp (sec, 0.02f, 2.0f); }
-    void setFeedback (float f){ fb = clamp (f, 0.0f, 0.92f); }
+    // Диапазон совпадает с параметром хоста (0…0.95); петля остаётся < 1.
+    void setFeedback (float f){ fb = clamp (f, 0.0f, 0.95f); }
     void setMix (float m)     { mix = clamp (m, 0.0f, 1.0f); }
 
     inline void process (float& l, float& r) noexcept

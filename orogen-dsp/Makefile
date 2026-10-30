@@ -43,9 +43,18 @@ build/test_modal: tests/test_modal.cpp tests/engine_suite.h src/engines/modal.h 
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(INC) tests/test_modal.cpp -o $@
 
-build/test_granular: tests/test_granular.cpp tests/engine_suite.h src/engines/granular.h src/engines/mip_reader.h src/engines/sinc_interp.h src/content/sample_bank.h src/engines/halfband.h
+build/test_granular: tests/test_granular.cpp tests/engine_suite.h src/engines/granular.h src/engines/engine.h src/engines/mip_reader.h src/engines/sinc_interp.h src/content/sample_bank.h src/engines/halfband.h src/core/*.h
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(INC) tests/test_granular.cpp -o $@
+
+# Отдельно от CPU-бенчмарка: санитайзеры заметно замедляют горячий цикл.
+build/test_granular_safety_asan: tests/test_granular_safety.cpp src/engines/granular.h src/engines/engine.h src/engines/mip_reader.h src/engines/sinc_interp.h src/engines/halfband.h src/content/sample_bank.h src/core/*.h
+	@mkdir -p build
+	$(CXX) -O1 -g1 -std=c++17 -fsanitize=address,undefined -fno-omit-frame-pointer $(INC) tests/test_granular_safety.cpp -o $@
+
+.PHONY: asan-granular
+asan-granular: build/test_granular_safety_asan
+	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 ./build/test_granular_safety_asan
 
 build/render_demo_fx: tools/render_demo_fx.cpp src/instrument/*.h src/core/*.h third_party/monojuice/dsp/*.h $(MONOJUICE_OBJ)
 	@mkdir -p build
@@ -103,12 +112,12 @@ build/render_demo_modal: tools/render_demo_modal.cpp src/engines/modal.h src/eng
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(INC) tools/render_demo_modal.cpp -o $@
 
-build/render_demo_granular: tools/render_demo_granular.cpp src/engines/granular.h src/engines/mip_reader.h src/engines/sinc_interp.h src/content/sample_bank.h src/engines/halfband.h src/core/*.h
+build/render_demo_granular: tools/render_demo_granular.cpp src/engines/granular.h src/engines/engine.h src/engines/mip_reader.h src/engines/sinc_interp.h src/content/sample_bank.h src/engines/halfband.h src/core/*.h
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(INC) tools/render_demo_granular.cpp -o $@
 
 # Диагностический float WAV напрямую из движка; без нормировки/лимитера.
-build/render_granular_raw: tools/render_granular_raw.cpp src/engines/granular.h src/engines/mip_reader.h src/engines/sinc_interp.h src/content/sample_bank.h src/engines/halfband.h src/core/*.h
+build/render_granular_raw: tools/render_granular_raw.cpp src/engines/granular.h src/engines/engine.h src/engines/mip_reader.h src/engines/sinc_interp.h src/content/sample_bank.h src/engines/halfband.h src/core/*.h
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(INC) tools/render_granular_raw.cpp -o $@
 

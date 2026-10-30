@@ -15,6 +15,11 @@ namespace orogen {
 // соседние зёрна могут замаскировать заворот на начало записи.
 struct GranularTestProbe
 {
+    static float rate (const GranularEngine& e, int i)
+    {
+        return e.grains[i].active ? e.grains[i].rate : 0.0f;
+    }
+
     struct Stats
     {
         int spawned = 0, unsafe = 0, wrappedReads = 0, kernelWrapReads = 0;
@@ -161,6 +166,7 @@ static std::pair<double, double> twoToneGranularDb (double rate, double inputTon
     EngineParams p;
     p.p[0] = 0.4f; p.p[1] = 0.45f; p.p[2] = 1.0f; p.p[3] = 0.0f;
     p.tuneSemis = (float) (12.0 * std::log2 (rate / 16.0)); p.level = 1.0f;
+    p.detune = 0.0f;  // частоты анализа заданы ТОЧНО для этого rate
     e.prepare (p);
     for (int i = 0; i < 24000; ++i) (void) e.render (p);
     double fundamentalPower = 0.0, tonePower = 0.0;
@@ -234,6 +240,110 @@ int main()
 
     const int before = suite::gFailures;
     int fails = suite::run (cfg);
+
+    // Detune — общий параметр слота, а не синоним макроса Spread. Сравниваем
+    // два идентичных рендера с Spread = 0, чтобы обнаружить мёртвую ручку.
+    std::printf ("\n--- Detune и автоматизация уровня Granular ---\n");
+    {
+        GranularEngine a, b;
+        a.setBank (&probeBank); b.setBank (&probeBank);
+        a.setSampleRate (48000.0); b.setSampleRate (48000.0);
+        a.start (60, 1.0f); b.start (60, 1.0f);
+        EngineParams p, q;
+        p.p[0] = q.p[0] = 0.35f; p.p[1] = q.p[1] = 0.5f;
+        p.p[2] = q.p[2] = 0.8f; p.p[3] = q.p[3] = 0.0f;
+        p.detune = 0.0f; q.detune = 1.0f;
+        a.prepare (p); b.prepare (q);
+        double dif = 0.0, ref = 0.0;
+        for (int i = 0; i < 48000; ++i)
+        {
+            const float x = a.render (p), y = b.render (q);
+            const double d = (double) x - y;
+            dif += d * d; ref += (double) x * x;
+        }
+        const double relative = std::sqrt (dif / std::max (1.0e-20, ref));
+        std::printf ("   Detune 0 -> 1 при Spread 0: относительная ΔRMS %.6f\n", relative);
+        suite::check (relative > 0.01, "Detune действительно изменяет сигнал Granular",
+                      suite::num (relative, 6));
+
+        auto grainRate = [&probeBank] (float noteRandom, float detune) {
+            GranularEngine e;
+            e.setBank (&probeBank); e.setSampleRate (48000.0);
+            e.setNoteRandom (noteRandom); e.start (60, 1.0f);
+            EngineParams ep;
+            ep.detune = detune; ep.p[3] = 0.0f;
+            e.prepare (ep); (void) e.render (ep);
+            return GranularTestProbe::rate (e, 0);
+        };
+        const double centre = grainRate (1.0f, 0.0f);
+        const double plus = grainRate (1.0f, 1.0f);
+        const double minus = grainRate (-1.0f, 1.0f);
+        const double centsPlus = 1200.0 * std::log2 (plus / centre);
+        const double centsMinus = 1200.0 * std::log2 (minus / centre);
+        std::printf ("   две ноты: %.3f / %.3f цента относительно Detune 0\n", centsMinus, centsPlus);
+        suite::check (std::fabs (centsPlus - 10.0) < 0.02 && std::fabs (centsMinus + 10.0) < 0.02,
+                      "Detune задаёт независимое отклонение ±10 центов на голос");
+
+        GranularEngine live;
+        live.setBank (&probeBank); live.setSampleRate (48000.0);
+        live.setNoteRandom (1.0f); live.start (60, 1.0f);
+        EngineParams liveP;
+        liveP.detune = 0.0f; liveP.p[1] = 1.0f; liveP.p[2] = 1.0f; liveP.p[3] = 0.0f;
+        live.prepare (liveP);
+        for (int i = 0; i < 100; ++i) (void) live.render (liveP);
+        const float oldRate = GranularTestProbe::rate (live, 0);
+        liveP.detune = 1.0f;
+        live.prepare (liveP);
+        float newRate = 0.0f;
+        int response = -1;
+        for (int i = 0; i < 2400 && newRate == 0.0f; ++i)
+        {
+            (void) live.render (liveP);
+            newRate = GranularTestProbe::rate (live, 1);
+            if (newRate > 0.0f) response = i + 1;
+        }
+        const float heldRate = GranularTestProbe::rate (live, 0);
+        const double liveCents = newRate > 0.0f ? 1200.0 * std::log2 (newRate / oldRate) : 0.0;
+        std::printf ("   автоматизация: новое зерно через %d отсч., %.3f цента; старое %.8f -> %.8f\n",
+                     response, liveCents, oldRate, heldRate);
+        suite::check (response > 0 && response <= 600 && oldRate > 0.0f
+                      && heldRate == oldRate && std::fabs (liveCents - 10.0) < 0.02,
+                      "удержанное зерно не перескакивает, следующее получает новый Detune");
+
+        GranularEngine control, automated;
+        control.setBank (&probeBank); automated.setBank (&probeBank);
+        control.setSampleRate (48000.0); automated.setSampleRate (48000.0);
+        control.start (60, 1.0f); automated.start (60, 1.0f);
+        p.detune = q.detune = 0.0f; p.level = q.level = 1.0f;
+        control.prepare (p); automated.prepare (q);
+        float prev = 0.0f;
+        for (int i = 0; i < 12000; ++i)
+        {
+            prev = control.render (p);
+            (void) automated.render (q);
+        }
+        for (int i = 0; i < 48000 && std::fabs (prev) < 0.12f; ++i)
+        {
+            prev = control.render (p);
+            (void) automated.render (q);
+        }
+        q.level = 0.0f;
+        automated.prepare (q);
+        const float x = control.render (p), y = automated.render (q);
+        const double firstRatio = std::fabs ((double) x - y) / std::max (1.0e-8, std::fabs ((double) x));
+        double ec = 0.0, ea = 0.0;
+        for (int i = 0; i < 24000; ++i)
+        {
+            const float c = control.render (p), z = automated.render (q);
+            if (i >= 12000) { ec += (double) c * c; ea += (double) z * z; }
+        }
+        const double settled = std::sqrt (ea / std::max (1.0e-20, ec));
+        std::printf ("   Level 1 -> 0: первый относительный скачок %.6f, итоговое отношение RMS %.6f\n",
+                     firstRatio, settled);
+        suite::check (firstRatio < 0.02 && settled > 0.39 && settled < 0.41,
+                      "уровень обновляется без мгновенного скачка и приходит к исходной калибровке",
+                      suite::num (firstRatio, 6) + " / " + suite::num (settled, 6));
+    }
 
     // ------------------------------------------------------------- плотность
     std::printf ("\n--- Уровень не зависит от плотности (нормировка на перекрытие) ---\n");
@@ -737,6 +847,7 @@ int main()
             EngineParams p;
             p.p[0] = 0.4f; p.p[1] = 0.45f; p.p[2] = 1.0f; p.p[3] = 0.0f;
             p.tuneSemis = (float) (12.0 * std::log2 (rate / 16.0)); p.level = 1.0f;
+            p.detune = 0.0f;  // иначе alias сдвинется относительно измерительного бина
             e.prepare (p);
             for (int i = 0; i < 24000; ++i) (void) e.render (p);
             double lowEnergy = 0.0, aliasEnergy = 0.0;

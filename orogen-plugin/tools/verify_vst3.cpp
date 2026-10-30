@@ -9,6 +9,7 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <set>
@@ -213,9 +214,12 @@ int main (int argc, char** argv)
         setNamed ("sA_On", 1.0f);
         for (const char* n : { "sB_On", "sC_On", "sD_On", "sE_On", "sF_On", "sG_On", "sH_On" }) setNamed (n, 0.0f);
         setNamed ("Patch Mode", 0.0f); setNamed ("Arp On", 0.0f);
+        setNamed ("Stereo Width", 1.0f);  // полная панорама голоса
+        setNamed ("Width", 2.0f / 3.0f); // FX width = 1.0 при диапазоне 0…1.5
         setNamed ("sA_P1", 0.35f); setNamed ("sA_P2", 0.45f);
         setNamed ("sA_P3", 0.0f); setNamed ("sA_P4", 0.0f);
         setNamed ("sA_Table", 0.0f); setNamed ("sA_Attack", 0.0f);
+        setNamed ("sA_Sustain", 1.0f); setNamed ("sA_Tail", 0.0f);
         for (const char* n : { "Drive", "Chorus Mix", "Delay Mix", "Reverb Mix", "Plate Mix",
                                "Material Mix", "Spectre Mix", "Glitch Mix", "Robin Mix", "Comb Mix" })
             setNamed (n, 0.0f);
@@ -244,6 +248,45 @@ int main (int argc, char** argv)
         check (reported == 1024 && first >= reported && first - reported < 960 && nonFinite == 0,
                "Granular начинает звучать без 250-мс паузы",
                "latency " + String (reported) + ", onset " + String (first));
+
+        // Панорама и Level меняются на той же ноте, через нормализованные
+        // параметры настоящего VST3-хоста. Последняя половина окна заведомо
+        // выходит за latency 1024 и время сглаживания.
+        auto heldWindow = [&] {
+            double left = 0.0, right = 0.0;
+            int bad = 0;
+            constexpr int blocks = 160;
+            for (int b = 0; b < blocks; ++b)
+            {
+                block.clear();
+                granular->processBlock (block, none);
+                for (int i = 0; i < 128; ++i)
+                {
+                    const double l = block.getSample (0, i), r = block.getSample (1, i);
+                    if (! std::isfinite (l) || ! std::isfinite (r)) ++bad;
+                    if (b >= blocks / 2) { left += l * l; right += r * r; }
+                }
+            }
+            return std::array<double, 3> { std::sqrt (left / (80.0 * 128.0)),
+                                           std::sqrt (right / (80.0 * 128.0)), (double) bad };
+        };
+        setNamed ("sA_Pan", 0.0f);             // −1
+        const auto l = heldWindow();
+        setNamed ("sA_Pan", 1.0f);             // +1
+        const auto r = heldWindow();
+        std::printf ("   Pan -1 -> +1: L/R %.6f/%.6f -> %.6f/%.6f\n", l[0], l[1], r[0], r[1]);
+        check (l[0] > 0.001 && l[1] < l[0] * 0.01 && r[1] > 0.001 && r[0] < r[1] * 0.01
+               && l[2] == 0.0 && r[2] == 0.0,
+               "VST3-хост автоматизирует Pan на удержанной ноте");
+
+        setNamed ("sA_Level", 0.0f);
+        const auto quiet = heldWindow();
+        setNamed ("sA_Level", 1.0f);
+        const auto restored = heldWindow();
+        std::printf ("   Level 0 -> 1, tail 0: R RMS %.8f -> %.6f\n", quiet[1], restored[1]);
+        check (quiet[1] < 1.0e-5 && restored[1] > 0.001 && quiet[2] == 0.0 && restored[2] == 0.0,
+               "VST3 Level возвращает звук без нового note-on");
+        check (missing == 0, "Pan, Level и параметры хвоста доступны хосту", String (missing) + " missing");
         granular->releaseResources();
     }
 

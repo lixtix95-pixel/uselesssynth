@@ -1115,6 +1115,44 @@ int main()
                "ниже порога прозрачен; выше сохраняет стереосвязь и потолок");
     }
 
+    // Верхний диапазон ручки Delay Feedback объявлен в хосте до 0.95.
+    // Сравниваем настоящие импульсные ответы, а не значения параметров.
+    std::printf ("\n--- 20. Delay: полный диапазон Feedback ---\n");
+    {
+        auto renderDelay = [] (float feedback) {
+            PingPongDelay delay;
+            delay.prepare (48000.0);
+            delay.setTime (0.02f);
+            delay.setMix (1.0f);
+            delay.setFeedback (feedback);
+            std::vector<float> out (96000);
+            for (int i = 0; i < (int) out.size(); ++i)
+            {
+                float l = i == 0 ? 0.5f : 0.0f;
+                float r = l;
+                delay.process (l, r);
+                out[(size_t) i] = l + r;
+            }
+            return out;
+        };
+        const auto a = renderDelay (0.92f), b = renderDelay (0.95f), beyond = renderDelay (1.0f);
+        double ea = 0.0, eb = 0.0, ed = 0.0, ec = 0.0;
+        bool finite = true;
+        for (size_t i = 0; i < a.size(); ++i)
+        {
+            const double d = (double) a[i] - b[i], c = (double) beyond[i] - b[i];
+            ed += d * d; ec += c * c;
+            if (i >= 12000) { ea += (double) a[i] * a[i]; eb += (double) b[i] * b[i]; }
+            finite = finite && std::isfinite (a[i]) && std::isfinite (b[i]) && std::isfinite (beyond[i]);
+        }
+        const double delta = std::sqrt (ed / a.size());
+        const double clamped = std::sqrt (ec / a.size());
+        std::printf ("   Feedback 0.92 -> 0.95: ΔRMS %.8f, энергия хвоста %.8g -> %.8g\n", delta, ea, eb);
+        check (delta > 1.0e-5 && eb > ea * 1.10 && finite,
+               "последние 3% Feedback изменяют реальный хвост Delay", num (delta, 8));
+        check (clamped < 1.0e-12, "значения выше 0.95 безопасно ограничены", num (clamped, 12));
+    }
+
     std::printf ("\n=================================================\n");
     if (suite::gFailures == 0) std::printf ("ВСЕ ТЕСТЫ ПРОЙДЕНЫ (провалов: 0)\n");
     else std::printf ("ПРОВАЛОВ: %d\n", suite::gFailures);
