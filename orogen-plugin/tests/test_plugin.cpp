@@ -182,6 +182,37 @@ static juce::StringArray visibleBoundIds (juce::Component& root)
     return ids;
 }
 
+// Контролы PARAMS создаются динамически. Component не владеет детьми:
+// проверяем их физическое уничтожение при закрытии редактора, включая
+// скрытые вкладки и секции, а не только удаление из визуальной иерархии.
+static void testEditorControlLifetime()
+{
+    std::printf ("\n--- Время жизни контролов PARAMS ---\n");
+    OrogenProcessor p;
+    std::vector<juce::Component::SafePointer<juce::Component>> refs;
+    {
+        std::unique_ptr<juce::AudioProcessorEditor> base (p.createEditor());
+        auto* editor = dynamic_cast<OrogenEditor*> (base.get());
+        auto* overlay = editor != nullptr ? editor->paramsOverlay() : nullptr;
+        std::function<void (juce::Component&)> walk = [&] (juce::Component& c)
+        {
+            for (auto* child : c.getChildren())
+            {
+                if (child->getProperties().contains ("paramId")) refs.emplace_back (child);
+                walk (*child);
+            }
+        };
+        if (overlay != nullptr) walk (*overlay);
+        std::printf ("   создано %zu контролов PARAMS\n", refs.size());
+    }
+    int alive = 0;
+    for (const auto& ref : refs) if (ref.getComponent() != nullptr) ++alive;
+    std::printf ("   после закрытия осталось %d из %zu\n", alive, refs.size());
+    check (refs.size() == 298 && alive == 0,
+           "закрытие редактора уничтожает все контролы PARAMS",
+           juce::String (alive) + "/" + juce::String ((int) refs.size()));
+}
+
 // Регрессия GUI: реальные слоты/зоны Morph, не только разница пикселей за
 // счёт надписей. Отдельный режим --gui-only даёт короткий прогон при отладке.
 static void testGuiRegressions()
@@ -1041,6 +1072,64 @@ static void testGranularProcessorRegression()
     check (diffRms > 1.0e-4, "автоматизация Density действительно меняет звук", num (diffRms, 6));
 }
 
+// Заводской Sub Bass на 96 кГц: проверяем реальную частоту на выходе
+// процессора/MIDI после задержки ROBIN, а не только внутреннюю позицию зерна.
+static void testGranularPitchProcessorRegression()
+{
+    std::printf ("\n--- Granular pitch 96 кГц через AudioProcessor и MIDI ---\n");
+    constexpr double sr = 96000.0;
+    OrogenProcessor p;
+    p.setPlayConfigDetails (0, 2, sr, 128); p.prepareToPlay (sr, 128); p.setCurrentProgram (0);
+    soloSlot (p, 0, 4); setP (p, "gl_mode", 0.0f); setP (p, "arpOn", 0.0f);
+    setP (p, "gl_gain", 0.7f); setP (p, "gl_master", 0.8f);
+    setP (p, "lfo1_amount", 0.0f); setP (p, "lfo2_amount", 0.0f);
+    for (int k = 1; k <= 8; ++k) setP (p, "mod" + juce::String (k) + "_amt", 0.0f);
+    setP (p, "sA_table", 7.0f); setP (p, "sA_p0", 0.95f); setP (p, "sA_p1", 1.0f);
+    setP (p, "sA_p2", 0.0f); setP (p, "sA_p3", 0.0f);
+    setP (p, "sA_tune", 0.0f); setP (p, "sA_detune", 0.0f); setP (p, "sA_level", 0.8f);
+    setP (p, "sA_attack", 0.001f); setP (p, "sA_sustain", 1.0f); setP (p, "sA_tail", 0.0f);
+    setP (p, "sA_cutoff", 1.0f); setP (p, "sA_res", 0.0f);
+    for (const char* id : { "fx_drive", "fx_chorusMix", "fx_delayMix", "fx_reverbMix", "fx_plateMix",
+                            "fx_materialMix", "fx_spectreMix", "fx_glitchMix", "fx_robinMix", "fx_combMix" })
+        setP (p, id, 0.0f);
+    setP (p, "fx_compRatio", 1.0f); setP (p, "fx_compMakeup", 0.0f);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil (250);
+    const int latency = p.reportedLatency();
+    juce::MidiBuffer note, empty; note.addEvent (juce::MidiMessage::noteOn (1, 37, 0.8f), 0);
+    juce::AudioBuffer<float> block (2, 128);
+    double first = 0.0, last = 0.0, energy = 0.0;
+    float prev = 0.0f; int n = 0, bad = 0, crossings = 0;
+    for (int b = 0; b < 180; ++b)
+    {
+        empty.clear(); p.processBlock (block, b == 0 ? note : empty);
+        for (int i = 0; i < 128; ++i)
+        {
+            const int at = b * 128 + i;
+            const float x = block.getSample (0, i);
+            if (! std::isfinite (x)) ++bad;
+            if (at >= latency + 3840 && at < latency + 19200)
+            {
+                energy += (double) x * x; ++n;
+                if (prev < 0.0f && x >= 0.0f)
+                {
+                    const double cross = at - 1.0 + (double) (-prev) / (double) (x - prev);
+                    if (crossings++ == 0) first = cross;
+                    last = cross;
+                }
+            }
+            prev = x;
+        }
+    }
+    const double measured = crossings > 1 ? (crossings - 1) * sr / (last - first) : 0.0;
+    const double expected = 110.0 * std::pow (2.0, -8.0 / 12.0);
+    const double cents = measured > 0.0 ? 1200.0 * std::log2 (measured / expected) : 1.0e6;
+    const double rms = std::sqrt (energy / std::max (1, n));
+    std::printf ("   выход %.6f Гц / эталон %.6f Гц = %+.4f цента; latency %d, RMS %.6f, NaN %d\n",
+                 measured, expected, cents, latency, rms, bad);
+    check (latency == 1024 && bad == 0 && crossings >= 8 && rms > 1.0e-4 && std::fabs (cents) < 1.0,
+           "поздний Position не расстраивает MIDI-ноту в AudioProcessor", num (cents, 4) + " cents");
+}
+
 // Проверка Delay через APVTS, MIDI и реальную задержку ROBIN. Два процессора
 // получают одинаковую ноту, различается только автоматизация Delay Time.
 static void testDelayProcessorRegression()
@@ -1123,6 +1212,22 @@ int main (int argc, char** argv)
         juce::DeletedAtShutdown::deleteAll();
         juce::MessageManager::deleteInstance();
         std::printf ("\nDelay AudioProcessor: провалов %d\n", failures);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "--lifetime-only")
+    {
+        testEditorControlLifetime();
+        juce::DeletedAtShutdown::deleteAll();
+        juce::MessageManager::deleteInstance();
+        std::printf ("\nВремя жизни GUI: провалов %d\n", failures);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "--pitch-only")
+    {
+        testGranularPitchProcessorRegression();
+        juce::DeletedAtShutdown::deleteAll();
+        juce::MessageManager::deleteInstance();
+        std::printf ("\nGranular pitch AudioProcessor: провалов %d\n", failures);
         return failures == 0 ? 0 : 1;
     }
     if (argc > 1 && juce::String (argv[1]) == "--granular-only")
@@ -3328,7 +3433,9 @@ int main (int argc, char** argv)
     }
 
     testGuiRegressions();
+    testEditorControlLifetime();
     testGranularProcessorRegression();
+    testGranularPitchProcessorRegression();
     testDelayProcessorRegression();
     juce::DeletedAtShutdown::deleteAll();
     juce::MessageManager::deleteInstance();

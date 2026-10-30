@@ -24,7 +24,15 @@ struct GranularTestProbe
     static std::array<float, 3> firstGrain (const GranularEngine& e)
     {
         for (const auto& g : e.grains)
-            if (g.active) return { g.pos - g.rate, g.dur * g.rate, g.amp };
+            if (g.active) return { (float) (g.pos - g.rate), g.dur * g.rate, g.amp };
+        return {};
+    }
+
+    // Фактическая координата и заданный шаг, без округления пробника в float.
+    static std::array<double, 2> firstCursor (const GranularEngine& e)
+    {
+        for (const auto& g : e.grains)
+            if (g.active) return { (double) g.pos, (double) g.rate };
         return {};
     }
 
@@ -927,6 +935,102 @@ int main()
     // Стоп-полоса важна, но нельзя оплачивать её исчезновением слышимой
     // полосы: проверяем одновременно тон 14.4 кГц и alias тона, который на
     // 1% выше Найквиста (24.24 → 23.76 кГц).
+    // Координата внутри зерна много раз увеличивается на дробный rate.
+    // При float-коплении при высоком абсолютном pos каждый шаг округляется
+    // к сетке 1/128, 1/64 и т. д.; это не случайная ошибка фазы, а неверный
+    // фактический pitch. Тестируем и фабричные 2 с, и длинный источник.
+    std::printf ("\n--- Точность курса зерна при позднем Position ---\n");
+    {
+        auto measureCents = [] (SampleBank& b, double sr, int note) {
+            GranularEngine e; e.setBank (&b); e.setSampleRate (sr); e.start (note, 1.0f);
+            EngineParams p;
+            p.p[0] = 0.95f; p.p[1] = 1.0f; p.p[2] = 0.0f; p.p[3] = 0.0f;
+            p.detune = 0.0f; p.level = 1.0f; e.prepare (p); (void) e.render (p);
+            const auto first = GranularTestProbe::firstCursor (e);
+            for (int i = 0; i < 2000; ++i) (void) e.render (p);
+            const auto last = GranularTestProbe::firstCursor (e);
+            if (first[1] <= 0.0 || last[1] <= 0.0) return 1.0e6;
+            const double actual = (last[0] - first[0]) / 2000.0;
+            return actual > 0.0 ? 1200.0 * std::log2 (actual / first[1]) : 1.0e6;
+        };
+        double worstFactory = 0.0;
+        int factoryCases = 0;
+        for (double sr : { 44100.0, 48000.0, 96000.0 })
+        {
+            SampleBank b; b.shots.push_back (makeStationaryShot (sr, 2.0));
+            for (int note : { 37, 38, 39, 46, 60 })
+            {
+                worstFactory = std::max (worstFactory, std::fabs (measureCents (b, sr, note)));
+                ++factoryCases;
+            }
+        }
+        std::printf ("   2 с / 44.1–96 кГц: %d случаев, худшая ошибка %.6f цента\n", factoryCases, worstFactory);
+        suite::check (factoryCases == 15 && worstFactory < 0.02,
+                      "фактическая скорость соответствует pitch в фабричном источнике",
+                      suite::num (worstFactory, 6) + " цента");
+
+        constexpr double sr = 96000.0, toneHz = 8000.0;
+        SampleBank longBank;
+        longBank.shots.push_back (makeStationaryShot (sr, 26.0, 0.0, toneHz));
+        double worstLong = 0.0;
+        for (int note : { 36, 37, 38, 46 })
+            worstLong = std::max (worstLong, std::fabs (measureCents (longBank, sr, note)));
+        std::printf ("   26 с / 96 кГц: худшая ошибка %.6f цента\n", worstLong);
+        suite::check (worstLong < 0.02, "длинная запись не расстраивает зерно",
+                      suite::num (worstLong, 6) + " цента");
+
+        // Независимая проверка интерполятора на заданных double-координатах:
+        // идеальный тон известен аналитически. Низкая ошибка короткого начала
+        // не должна ухудшаться из-за большой целой части позиции.
+        const auto& shot = longBank.shots[0];
+        MipReader rd; const float rate = (float) std::pow (2.0, -9.0 / 12.0);
+        const bool ready = rd.setupGranular (shot, rate);
+        double rel[2] = {}; int which = 0;
+        for (double seconds : { 0.05, 24.5 })
+        {
+            double squared = 0.0, reference = 0.0;
+            for (int i = 0; i < 8192; ++i)
+            {
+                const double x = seconds * sr + 0.123 + i * (double) rate;
+                const double ideal = 0.30 * std::sin (kTwoPi * toneHz * x / sr);
+                const double d = (double) rd.read (x) - ideal;
+                squared += d * d; reference += ideal * ideal;
+            }
+            rel[which++] = std::sqrt (squared / reference);
+        }
+        std::printf ("   синус 8 кГц: ошибка интерполяции RMS %.8f / %.8f (начало / 24.5 с)\n", rel[0], rel[1]);
+        suite::check (ready && rel[0] < 0.0002 && rel[1] < 0.0002,
+                      "дробная позиция не теряет точность на длинном источнике",
+                      suite::num (rel[0], 8) + " / " + suite::num (rel[1], 8));
+
+        // Полный выход движка: частота измеряется по пересечениям нуля, не по
+        // внутреннему счётчику. Один Hann-зерно, без FX и смены параметров.
+        GranularEngine e; e.setBank (&longBank); e.setSampleRate (sr); e.start (36, 1.0f);
+        EngineParams p;
+        p.p[0] = 0.95f; p.p[1] = 1.0f; p.p[2] = 0.0f; p.p[3] = 0.0f;
+        p.detune = 0.0f; p.level = 1.0f; e.prepare (p);
+        double firstCross = 0.0, lastCross = 0.0; int crosses = 0; float previous = 0.0f;
+        for (int i = 0; i < (int) (0.18 * sr); ++i)
+        {
+            const float value = e.render (p);
+            if (i > (int) (0.02 * sr) && previous < 0.0f && value >= 0.0f)
+            {
+                const double cross = i - 1.0 + (double) (-previous) / (double) (value - previous);
+                if (crosses++ == 0) firstCross = cross;
+                lastCross = cross;
+            }
+            previous = value;
+        }
+        const double measured = crosses > 1 ? (crosses - 1) * sr / (lastCross - firstCross) : 0.0;
+        const double expected = toneHz * (double) rate;
+        const double pitchError = measured > 0.0 ? 1200.0 * std::log2 (measured / expected) : 1.0e6;
+        std::printf ("   выход движка: %.6f Гц / эталон %.6f Гц, ошибка %+.6f цента, переходов %d\n",
+                     measured, expected, pitchError, crosses);
+        suite::check (crosses > 100 && std::fabs (pitchError) < 0.05,
+                      "измеренная частота полного зерна не зависит от позиции",
+                      suite::num (pitchError, 6) + " цента");
+    }
+
     std::printf ("\n--- Дробный pitch: полоса 14.4 кГц и alias у Найквиста ---\n");
     {
         double worstBandError = 0.0, worstAlias = -200.0, minReference = 1.0e30;

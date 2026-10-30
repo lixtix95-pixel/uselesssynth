@@ -87,21 +87,24 @@ struct MipReader
 
     // позиция в шкале исходника; обычный режим допускает петлю с заворотом,
     // Granular гарантирует границы ещё при запуске зерна.
-    inline float read (float posOrig) const noexcept
+    inline float read (double posOrig) const noexcept
     {
         if (grainBin >= 0)
         {
-            const float p = posOrig * invScaleA;
+            // Для Granular сохраняем дробную часть позиции ДО отделения
+            // целого индекса. Преобразование в float всей координаты снова
+            // квантовало бы дробь на крупных/поздних позициях записи.
+            const double p = posOrig * (double) invScaleA;
             const int i1 = (int) p;
-            const float frac = p - (float) i1;
+            const float frac = (float) (p - (double) i1);
             return grainBin == 0 ? sincKernel().apply (dataA, lenA, i1, frac)
                                  : grainSincKernel().apply (dataA, lenA, i1, frac, grainBin);
         }
-        // Вне узкого перехода читаем только один sinc, не оба уровня.
-        if (wA <= 0.001f) return readLevel (dataB, lenB, posOrig * invScaleB);
-        const float sA = readLevel (dataA, lenA, posOrig * invScaleA);
+        // Остальные движки используют прежний float-путь для петли/MIP.
+        if (wA <= 0.001f) return readLevel (dataB, lenB, (float) (posOrig * invScaleB));
+        const float sA = readLevel (dataA, lenA, (float) (posOrig * invScaleA));
         if (wB <= 0.001f) return sA;
-        const float sB = readLevel (dataB, lenB, posOrig * invScaleB);
+        const float sB = readLevel (dataB, lenB, (float) (posOrig * invScaleB));
         return sA * wA + sB * wB;
     }
 

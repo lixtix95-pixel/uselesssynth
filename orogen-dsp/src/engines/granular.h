@@ -159,7 +159,11 @@ private:
     struct Grain
     {
         MipReader mip;
-        float pos = 0.0f, rate = 1.0f, phase = 0.0f, amp = 0.0f, dur = 3840.0f;
+        // Абсолютную координату нельзя многократно наращивать во float:
+        // после 2 с точность шага уже даёт до ~14 центов ошибки, на длинных
+        // источниках — полутоны. Rate остаётся float, но суммируется в double.
+        double pos = 0.0;
+        float rate = 1.0f, phase = 0.0f, amp = 0.0f, dur = 3840.0f;
         bool  active = false;
     };
 

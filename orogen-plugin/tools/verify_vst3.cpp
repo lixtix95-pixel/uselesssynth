@@ -291,6 +291,76 @@ int main (int argc, char** argv)
     }
     granular.reset();
 
+    // Настоящий VST3, 96 кГц, заводской Sub Bass на поздней позиции.
+    // Источник имеет стабильную основную частоту 110 Гц за пределами атаки;
+    // частота на выходе измеряется пересечениями нуля после ROBIN latency.
+    std::printf ("\n--- Высота Granular на 96 кГц через VST3-хост ---\n");
+    String pitchError;
+    auto pitch = format->createInstanceFromDescription (d, 96000.0, 128, pitchError);
+    check (pitch != nullptr, "VST3-инстанс для pitch 96 кГц создаётся", pitchError);
+    if (pitch != nullptr)
+    {
+        pitch->setCurrentProgram (0);
+        pitch->prepareToPlay (96000.0, 128);
+        int missing = 0;
+        const auto set = [&] (const String& name, float value) {
+            for (auto* p : pitch->getParameters())
+                if (p->getName (64) == name) { p->setValueNotifyingHost (value); return; }
+            ++missing; std::printf ("   не найден параметр: %s\n", name.toRawUTF8());
+        };
+        set ("sA_Engine", 0.5f); set ("sA_On", 1.0f);
+        for (const char* n : { "sB_On", "sC_On", "sD_On", "sE_On", "sF_On", "sG_On", "sH_On" }) set (n, 0.0f);
+        set ("sA_Table", 1.0f); set ("sA_P1", 0.95f); set ("sA_P2", 1.0f);
+        set ("sA_P3", 0.0f); set ("sA_P4", 0.0f); set ("sA_Tune", 0.5f); set ("sA_Detune", 0.0f);
+        set ("sA_Level", 0.8f); set ("sA_Attack", 0.0f); set ("sA_Sustain", 1.0f); set ("sA_Tail", 0.0f);
+        set ("sA_Cutoff", 1.0f); set ("sA_Reso", 0.0f); set ("Patch Mode", 0.0f); set ("Arp On", 0.0f);
+        set ("lfo1_Amount", 0.0f); set ("lfo2_Amount", 0.0f);
+        for (int i = 1; i <= 8; ++i) set ("mod" + String (i) + "_Amount", 0.5f);
+        for (const char* n : { "Drive", "Chorus Mix", "Delay Mix", "Reverb Mix", "Plate Mix",
+                               "Material Mix", "Spectre Mix", "Glitch Mix", "Robin Mix", "Comb Mix" }) set (n, 0.0f);
+        set ("Comp Ratio", 0.0f); set ("Comp Makeup", 0.0f);
+        MessageManager::getInstance()->runDispatchLoopUntil (250);
+
+        const int latency = pitch->getLatencySamples();
+        MidiBuffer note, empty; note.addEvent (MidiMessage::noteOn (1, 37, 0.8f), 0);
+        AudioBuffer<float> block (2, 128);
+        double firstCross = 0.0, lastCross = 0.0, energy = 0.0;
+        float prev = 0.0f; int count = 0, bad = 0, crossings = 0;
+        for (int b = 0; b < 180; ++b)
+        {
+            empty.clear(); block.clear();
+            pitch->processBlock (block, b == 0 ? note : empty);
+            for (int i = 0; i < 128; ++i)
+            {
+                const int at = b * 128 + i;
+                const float x = block.getSample (0, i);
+                if (! std::isfinite (x)) ++bad;
+                if (at >= latency + 3840 && at < latency + 19200)
+                {
+                    energy += (double) x * x; ++count;
+                    if (prev < 0.0f && x >= 0.0f)
+                    {
+                        const double crossing = at - 1.0 + (double) (-prev) / (double) (x - prev);
+                        if (crossings++ == 0) firstCross = crossing;
+                        lastCross = crossing;
+                    }
+                }
+                prev = x;
+            }
+        }
+        const double measured = crossings > 1 ? (crossings - 1) * 96000.0 / (lastCross - firstCross) : 0.0;
+        const double target = 110.0 * std::pow (2.0, -8.0 / 12.0);
+        const double cents = measured > 0.0 ? 1200.0 * std::log2 (measured / target) : 1.0e6;
+        const double rms = std::sqrt (energy / std::max (1, count));
+        std::printf ("   выход %.6f Гц / эталон %.6f Гц = %+.4f цента; latency %d, RMS %.6f, NaN %d\n",
+                     measured, target, cents, latency, rms, bad);
+        check (missing == 0 && latency == 1024 && bad == 0 && crossings >= 8 && rms > 1.0e-4
+               && std::fabs (cents) < 1.0,
+               "поздний Position не расстраивает MIDI-ноту через VST3", String (cents, 4) + " cents");
+        pitch->releaseResources();
+    }
+    pitch.reset();
+
     // Внешний хост и два настоящих VST3-инстанса: MIDI, одинаковый звук,
     // меняем только Delay Time. Отсчитываем 1024 сэмпла ROBIN отдельно.
     std::printf ("\n--- Delay Time через VST3-хост ---\n");
@@ -374,6 +444,30 @@ int main (int argc, char** argv)
                "изменение Delay Time слышно после перехода", String (delta, 6));
         delayA->releaseResources(); delayB->releaseResources();
     }
+
+    delayA.reset(); delayB.reset();
+
+    // Реальный повторный цикл выгрузки динамической библиотеки. Оставшиеся
+    // контролы или их таймеры раньше продолжали обращаться в выгруженный код.
+    std::printf ("\n--- Повторное открытие и выгрузка VST3 ---\n");
+    int closed = 0;
+    for (int cycle = 0; cycle < 6; ++cycle)
+    {
+        String cycleError;
+        auto unit = format->createInstanceFromDescription (d, 48000.0, 128, cycleError);
+        if (unit == nullptr) { std::printf ("   ошибка: %s\n", cycleError.toRawUTF8()); break; }
+        auto* editor = unit->createEditorAndMakeActive();
+        if (editor == nullptr) break;
+        MessageManager::getInstance()->runDispatchLoopUntil (50);
+        unit->editorBeingDeleted (editor);
+        delete editor;
+        unit.reset();
+        // Обрабатываем отложенные сообщения и таймеры уже после dlclose.
+        MessageManager::getInstance()->runDispatchLoopUntil (120);
+        ++closed;
+    }
+    check (closed == 6, "шесть циклов редактор → выгрузка → очередь сообщений без падения",
+           String (closed) + "/6");
 
     std::printf ("\n=== %s (провалов: %d)\n", failures == 0 ? "ПЛАГИН ПРОЙДЕН" : "ЕСТЬ ПРОВАЛЫ", failures);
     return failures == 0 ? 0 : 1;

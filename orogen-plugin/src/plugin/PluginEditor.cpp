@@ -1016,7 +1016,11 @@ private:
                         e.ctl = sl;
                     }
 
-                    if (e.ctl != nullptr) e.ctl->getProperties().set ("paramId", id);
+                    if (e.ctl != nullptr)
+                    {
+                        controls.add (e.ctl); // addAndMakeVisible не передаёт владение
+                        e.ctl->getProperties().set ("paramId", id);
+                    }
                     entries.push_back (e);
                 }
             }
@@ -1152,6 +1156,9 @@ private:
         OrogenProcessor& proc;
         juce::String sectionFilter;          // пусто = показывать все секции
         std::array<int, kNumSlots> engineTypes { -1, -1, -1, -1, -1, -1, -1, -1 };
+        // Объявлены до attachments: при разрушении привязки снимаются раньше
+        // самих контролов. Иначе при каждом закрытии оставались 298 объектов.
+        juce::OwnedArray<juce::Component> controls;
         std::vector<Entry> entries;
         std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment>> comboAtts;
         std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>> sliderAtts;
