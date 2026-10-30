@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <utility>
 using namespace orogen;
 namespace orogen {
 struct GranularTestProbe {
@@ -58,6 +59,32 @@ int main() {
                 ++cases;
             }
       }
+    // Длинная запись включает ветку префиксной интеграции огибающей:
+    // 220-мс зерно на ноте 115 проходит > 1.28 с исходных отсчётов.
+    int longGrains=0, longUnsafe=0, longBad=0;
+    {
+        constexpr int sr=48000;
+        OneShot shot; shot.name="long safety"; shot.rootNote=45;
+        shot.levels.resize(1); shot.levels[0].resize((size_t)sr*26);
+        for (int i=0; i<sr*26; ++i)
+            shot.levels[0][(size_t)i]=(float)(0.03*std::sin(kTwoPi*100.0*i/sr));
+        buildMipLevels(shot,sr);
+        SampleBank bank; bank.shots.push_back(std::move(shot));
+        GranularEngine e; e.setBank(&bank); e.setSampleRate(sr); e.start(115,1.0f);
+        EngineParams p; p.p[0]=0.5f; p.p[1]=1.0f; p.p[2]=1.0f; p.p[3]=0.0f;
+        p.detune=0.0f; p.level=1.0f; e.prepare(p);
+        std::array<bool,GranularEngine::kMaxGrains> previous{};
+        for (int i=0; i<sr/4; ++i) {
+            if (!std::isfinite(e.render(p))) ++longBad;
+            GranularTestProbe::inspect(e,previous,longGrains,longUnsafe);
+        }
+        const auto& s=bank.shots[0];
+        for (double a : {-480.0,0.0,480.0,600000.0,1248000.0})
+            for (double length : {1.0,480.0,2400.0,600000.0})
+                if (!std::isfinite(s.meanEnvEnergy(a,a+length))) ++longBad;
+    }
     std::printf("ASan/UBSan: %d cases, %d grains, %d unsafe reads, %d NaN, raw peak %.6f\n",cases,grains,unsafe,bad,peak);
-    return (cases==240 && grains>100 && unsafe==0 && bad==0) ? 0 : 1;
+    std::printf("long source: %d grains, %d unsafe reads, %d NaN/Inf\n",longGrains,longUnsafe,longBad);
+    return (cases==240 && grains>100 && unsafe==0 && bad==0
+            && longGrains>5 && longUnsafe==0 && longBad==0) ? 0 : 1;
 }

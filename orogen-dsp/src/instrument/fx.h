@@ -165,41 +165,85 @@ public:
         bufR.assign ((size_t) maxD, 0.0f);
         write = 0;
         lpL = lpR = 0.0f;
+        fadeLength = std::max (1, (int) (sr * 0.020));
+        requestedDelay = delayA = delayB = (int) (timeSec * (float) sampleRate);
+        fadePosition = 0; fading = false; processed = false;
+        mixSm.reset (sr, 8.0); mixSm.snap (mix);
+        fbSm.reset (sr, 8.0); fbSm.snap (fb);
     }
 
-    void setTime (float sec)  { timeSec = clamp (sec, 0.02f, 2.0f); }
+    void setTime (float sec)
+    {
+        timeSec = clamp (sec, 0.02f, 2.0f);
+        requestedDelay = (int) (timeSec * (float) sampleRate);
+        if (! processed) { delayA = delayB = requestedDelay; fading = false; }
+    }
+
     // Диапазон совпадает с параметром хоста (0…0.95); петля остаётся < 1.
-    void setFeedback (float f){ fb = clamp (f, 0.0f, 0.95f); }
-    void setMix (float m)     { mix = clamp (m, 0.0f, 1.0f); }
+    void setFeedback (float f)
+    {
+        fb = clamp (f, 0.0f, 0.95f);
+        if (! processed) fbSm.snap (fb); else fbSm.setTarget (fb);
+    }
+
+    void setMix (float m)
+    {
+        mix = clamp (m, 0.0f, 1.0f);
+        if (! processed) mixSm.snap (mix); else mixSm.setTarget (mix);
+    }
 
     inline void process (float& l, float& r) noexcept
     {
-        if (mix < 1.0e-4f || bufL.empty()) return;
+        if (bufL.empty()) return;
+        processed = true;
 
-        const int d = (int) (timeSec * (float) sampleRate);
-        int rd = write - d; if (rd < 0) rd += (int) bufL.size();
-        const int rd2 = (rd + d / 2) % (int) bufL.size();
+        // Время линии меняется между двумя головками за 20 мс. Если хост
+        // снова меняет Time во время перехода, запоминаем последнюю цель и
+        // начинаем следующий переход ПОСЛЕ текущего, без резкого перескока.
+        if (! fading && requestedDelay != delayA)
+        {
+            delayB = requestedDelay; fadePosition = 0; fading = true;
+        }
+        const auto read = [this] (int d, float& left, float& right) noexcept {
+            int rd = write - d; if (rd < 0) rd += (int) bufL.size();
+            const int rd2 = (rd + d / 2) % (int) bufL.size();
+            left = bufL[(size_t) rd]; right = bufR[(size_t) rd2];
+        };
+        float dl = 0.0f, dr = 0.0f;
+        read (delayA, dl, dr);
+        if (fading)
+        {
+            float nextL = 0.0f, nextR = 0.0f;
+            read (delayB, nextL, nextR);
+            const float w = (float) fadePosition / (float) fadeLength;
+            dl = lerp (dl, nextL, w); dr = lerp (dr, nextR, w);
+            if (++fadePosition >= fadeLength) { delayA = delayB; fading = false; }
+        }
 
-        const float dl = bufL[(size_t) rd];
-        const float dr = bufR[(size_t) rd2];
-
-        // кросс-обратная связь: левый идёт в правый — это и есть ping-pong
+        // Mix=0 отключает лишь мокрый выход, а не движение линии: иначе вход
+        // терялся, а старое эхо «замораживалось» и оживало после включения.
+        const float wet = mixSm.next(), feedback = fbSm.next();
         lpL += 0.35f * (dr - lpL);
         lpR += 0.35f * (dl - lpR);
-
-        bufL[(size_t) write] = l + lpL * fb;
-        bufR[(size_t) write] = r + lpR * fb;
+        // Экспоненциальный хвост не должен уходить в субнормальные float.
+        if (std::fabs (lpL) < 1.0e-20f) lpL = 0.0f;
+        if (std::fabs (lpR) < 1.0e-20f) lpR = 0.0f;
+        bufL[(size_t) write] = l + lpL * feedback;
+        bufR[(size_t) write] = r + lpR * feedback;
         if (++write >= (int) bufL.size()) write = 0;
 
-        l = l + dl * mix;
-        r = r + dr * mix;
+        l += dl * wet;
+        r += dr * wet;
     }
 
 private:
     std::vector<float> bufL, bufR;
     double sampleRate = 48000.0;
-    int write = 0;
+    int write = 0, requestedDelay = 0, delayA = 0, delayB = 0;
+    int fadeLength = 1, fadePosition = 0;
+    bool fading = false, processed = false;
     float timeSec = 0.33f, fb = 0.4f, mix = 0.0f, lpL = 0.0f, lpR = 0.0f;
+    SmoothedValue mixSm, fbSm;
 };
 
 // 4. Reverb: 4 гребёнки + 2 всепропускающих на канал (Freeverb-схема),

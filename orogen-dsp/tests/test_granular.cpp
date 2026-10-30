@@ -20,6 +20,14 @@ struct GranularTestProbe
         return e.grains[i].active ? e.grains[i].rate : 0.0f;
     }
 
+    // Начало, полный проход и усиление первого активного зерна.
+    static std::array<float, 3> firstGrain (const GranularEngine& e)
+    {
+        for (const auto& g : e.grains)
+            if (g.active) return { g.pos - g.rate, g.dur * g.rate, g.amp };
+        return {};
+    }
+
     struct Stats
     {
         int spawned = 0, unsafe = 0, wrappedReads = 0, kernelWrapReads = 0;
@@ -620,6 +628,119 @@ int main()
                       "Density не делает ступень в текущих зёрнах",
                       suite::num (worstRel * 100.0, 3) + " %, скачок " + suite::num (worstJump, 6)
                       + ", естественный " + suite::num (worstNatural, 6));
+    }
+
+    // Зерно начинается в тихом предударе, а окно накрывает громкую атаку.
+    // Нормировка только по первой 10-мс ячейке ошибочно усиливает ВСЁ зерно
+    // как тихое, хотя большая часть его энергии лежит дальше в источнике.
+    std::printf ("\n--- Нормировка зерна на переходе тихо → громко ---\n");
+    {
+        constexpr int sr = 48000;
+        OneShot shot;
+        shot.name = "rising source"; shot.rootNote = 45;
+        shot.levels.resize (1); shot.levels[0].resize (sr);
+        for (int i = 0; i < sr; ++i)
+        {
+            const double t = (double) i / sr;
+            const double a = t < 0.20 ? 0.06 : (t < 0.23 ? 0.06 + 0.34 * (t - 0.20) / 0.03 : 0.40);
+            shot.levels[0][(size_t) i] = (float) (a * std::sin (kTwoPi * 220.0 * t));
+        }
+        buildMipLevels (shot, sr);
+        SampleBank b; b.shots.push_back (std::move (shot));
+        GranularEngine e; e.setBank (&b); e.setSampleRate (sr); e.start (45, 1.0f);
+        EngineParams p;
+        p.table = 0; p.p[0] = 0.22f; p.p[1] = 0.45f; p.p[2] = 0.0f; p.p[3] = 0.0f;
+        p.detune = 0.0f; p.level = 1.0f; e.prepare (p);
+        (void) e.render (p);
+        const auto grain = GranularTestProbe::firstGrain (e);
+        const auto& source = b.shots[0];
+        double eSum = 0.0, wSum = 0.0;
+        for (int i = 0; i < 512; ++i)
+        {
+            const double phase = (i + 0.5) / 512.0;
+            const double w = 0.5 - 0.5 * std::cos (kTwoPi * phase);
+            const double local = source.envAt (grain[0] + grain[1] * (float) phase);
+            eSum += w * w * local * local; wSum += w * w;
+        }
+        const double spanRms = std::sqrt (eSum / wSum);
+        const double local = source.envAt (grain[0]);
+        const double body = source.bodyRms;
+        const double reference = clamp ((float) (body / std::max (local, spanRms)), 0.25f, 5.0f)
+                               * clamp ((float) (GranularEngine::kBodyTarget / body), 0.05f, 6.0f);
+        const double gainRatio = grain[2] / std::max (1.0e-9, reference);
+        double peak = 0.0, power = 0.0;
+        for (int i = 0; i < sr / 5; ++i)
+        {
+            const float v = e.render (p);
+            peak = std::max (peak, std::fabs ((double) v)); power += (double) v * v;
+        }
+        std::printf ("   старт %.1f мс, локальный RMS %.6f, RMS участка %.6f, усиление %.6f / эталон %.6f\n",
+                     grain[0] * 1000.0 / sr, local, spanRms, grain[2], reference);
+        std::printf ("   пик %.6f, RMS %.6f, отношение усиления к эталону %.3f\n",
+                     peak, std::sqrt (power / (sr / 5)), gainRatio);
+        suite::check (grain[1] > 0.0f && spanRms > 2.0 * local && std::fabs (gainRatio - 1.0) < 0.08,
+                      "нормировка учитывает реальную энергию участка зерна", suite::num (gainRatio, 3));
+        suite::check (peak > 0.10 && peak < 0.90,
+                      "атака не усиливается ошибочно в несколько раз", suite::num (peak, 4));
+    }
+
+    // На длинном источнике 256 точечных проб могут оказаться по обе стороны
+    // от единственной громкой 10-мс ячейки. Строим настоящую запись 30 с,
+    // помещаем всплеск между соседними пробами и сравниваем gain зерна с
+    // независимым интегралом Hann² по всей огибающей.
+    std::printf ("\n--- Длинный источник: короткая атака между пробами ---\n");
+    {
+        constexpr int sr = 48000;
+        OneShot shot; shot.name = "long transient"; shot.rootNote = 45;
+        shot.levels.resize (1); shot.levels[0].resize (sr * 30);
+        for (int i = 0; i < sr * 30; ++i)
+            shot.levels[0][(size_t) i] = (float) (0.03 * std::sin (kTwoPi * 100.0 * i / sr));
+        buildMipLevels (shot, sr);
+        SampleBank b; b.shots.push_back (std::move (shot));
+        GranularEngine e; e.setBank (&b); e.setSampleRate (sr); e.start (115, 1.0f);
+        EngineParams p;
+        p.table = 0; p.p[0] = 0.5f; p.p[1] = 1.0f; p.p[2] = 0.0f; p.p[3] = 0.0f;
+        p.detune = 0.0f; p.level = 1.0f; e.prepare (p); (void) e.render (p);
+        const auto baseline = GranularTestProbe::firstGrain (e);
+        const double a = baseline[0] + baseline[1] * 127.5 / 256.0;
+        const double z = baseline[0] + baseline[1] * 128.5 / 256.0;
+        const int cell = (int) std::floor (0.5 * (a + z) / 480.0);
+        const bool between = cell * 480 > a && (cell + 1) * 480 < z;
+        auto& source = b.shots[0];
+        if (cell >= 0 && (cell + 1) * 480 < (int) source.levels[0].size())
+            for (int i = cell * 480; i < (cell + 1) * 480; ++i)
+                source.levels[0][(size_t) i] = (float) (0.80 * std::sin (kTwoPi * 100.0 * i / sr));
+        buildMipLevels (source, sr);
+        e.start (115, 1.0f); e.prepare (p); (void) e.render (p);
+        const auto grain = GranularTestProbe::firstGrain (e);
+        double sum = 0.0, weight = 0.0;
+        for (int i = 0; i < 262144; ++i)
+        {
+            const double phase = (i + 0.5) / 262144.0;
+            const double w = 0.5 - 0.5 * std::cos (kTwoPi * phase);
+            const double env = source.envAt (grain[0] + grain[1] * (float) phase);
+            sum += w * w * env * env; weight += w * w;
+        }
+        const double rms = std::sqrt (sum / weight), local = source.envAt (grain[0]);
+        const double body = source.bodyRms;
+        const double ideal = clamp ((float) (body / std::max (local, rms)), 0.25f, 5.0f)
+                           * clamp ((float) (GranularEngine::kBodyTarget / body), 0.05f, 6.0f);
+        const double ratio = grain[2] / std::max (1.0e-9, ideal);
+        const double cellEnergy = source.meanEnvEnergy ((double) cell * 480, (double) (cell + 1) * 480);
+        const double expectedCell = (double) source.env[(size_t) cell] * source.env[(size_t) cell];
+        const double lastEnergy = source.meanEnvEnergy ((double) (source.env.size() + 1) * 480,
+                                                        (double) (source.env.size() + 2) * 480);
+        const double expectedLast = (double) source.env.back() * source.env.back();
+        std::printf ("   проход %.3f с, ячейка между пробами %s, RMS %.6f / старт %.6f\n",
+                     grain[1] / sr, between ? "да" : "нет", rms, local);
+        std::printf ("   фактическое усиление %.6f / эталон %.6f = %.5f\n", grain[2], ideal, ratio);
+        suite::check (between && grain[1] > 480.0f * 256.0f && rms > local * 1.25
+                      && std::fabs (ratio - 1.0) < 0.015,
+                      "короткая атака не теряется в длинном проходе", suite::num (ratio, 5));
+        suite::check (source.envEnergyPrefix.size() == source.env.size() + 1
+                      && std::fabs (cellEnergy - expectedCell) < 1.0e-9
+                      && std::fabs (lastEnergy - expectedLast) < 1.0e-9,
+                      "префикс энергии совпадает с ячейкой и продолжением края");
     }
 
     // Одна и та же стационарная запись, но 0.5 с и 4 с: высокая нота вынуждает

@@ -76,6 +76,10 @@ struct OneShot
     // По огибающей амплитуда зерна нормируется к «телу» записи.
     std::vector<float> env;
     int envStep = 480;
+    // Префикс суммы квадратов 10-мс ячеек. Строится с огибающей при загрузке
+    // банка: средняя энергия произвольного отрезка затем считается за O(1),
+    // без аллокаций и без пропуска коротких всплесков на длинных источниках.
+    std::vector<double> envEnergyPrefix;
 
     // Медиана огибающей по первым 60 % (атака и хвост не в счёт), считается
     // ОДИН РАЗ при сборке банка. Раньше она считалась в bodyLevel() на каждый
@@ -90,6 +94,31 @@ struct OneShot
         i = clamp (i, 0, (int) env.size() - 1);
         return env[(size_t) i];
     }
+
+    inline double meanEnvEnergy (double from, double to) const noexcept
+    {
+        if (env.empty()) return 1.0;
+        if (envStep <= 0) return (double) env.front() * env.front();
+        // Внешний код, вручную сформировавший env без computeEnvelope, не
+        // должен читать неинициализированный префикс: остаётся прежняя проба.
+        if (envEnergyPrefix.size() != env.size() + 1 || to <= from)
+        {
+            const double v = envAt ((float) ((from + to) * 0.5));
+            return v * v;
+        }
+        const auto integral = [this] (double x) noexcept {
+            const double first = env.front(), last = env.back();
+            if (x <= 0.0) return x * first * first;
+            const size_t lastIndex = env.size() - 1;
+            if (x >= (double) lastIndex)
+                return envEnergyPrefix[lastIndex] + (x - (double) lastIndex) * last * last;
+            const size_t i = (size_t) x;
+            const double v = env[i];
+            return envEnergyPrefix[i] + (x - (double) i) * v * v;
+        };
+        const double a = from / (double) envStep, b = to / (double) envStep;
+        return std::max (0.0, (integral (b) - integral (a)) / (b - a));
+    }
 };
 
 // тело записи = медиана огибающей по первым 60 % (атака и хвост не в счёт).
@@ -101,6 +130,7 @@ inline void computeEnvelope (OneShot& s, double sr = kSampleRate)
     s.envStep = (int) (sr * 0.01);
     const auto& l0 = s.levels[0];
     s.env.clear();
+    s.envEnergyPrefix.clear();
     if (l0.empty() || s.envStep <= 0) return;
     s.env.reserve (l0.size() / (size_t) s.envStep + 1);
     for (size_t p = 0; p + (size_t) s.envStep <= l0.size(); p += (size_t) s.envStep)
@@ -120,6 +150,10 @@ inline void computeEnvelope (OneShot& s, double sr = kSampleRate)
         s.bodyRms = std::max (1.0e-4f, (float) std::sqrt (acc / std::max<size_t> (1, l0.size())));
         return;
     }
+
+    s.envEnergyPrefix.resize (s.env.size() + 1, 0.0);
+    for (size_t i = 0; i < s.env.size(); ++i)
+        s.envEnergyPrefix[i + 1] = s.envEnergyPrefix[i] + (double) s.env[i] * s.env[i];
 
     // медиана по первым 60 % — один раз, на сборке банка (не в аудио-потоке)
     const size_t n = std::max<size_t> (1, s.env.size() * 3 / 5);

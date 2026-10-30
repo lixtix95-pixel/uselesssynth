@@ -514,25 +514,29 @@ static void testGuiRegressions()
     // При изменении скорости фаза не должна перескакивать, а по неподвижной
     // скорости за 0.25 с должен пройти именно четверть цикла LFO.
     {
-        auto headX = [] (const juce::Image& baseImage, const juce::Image& movingImage)
+        auto headPosition = [] (const juce::Image& baseImage, const juce::Image& movingImage)
         {
-            double weight = 0.0, weightedX = 0.0;
+            double weight = 0.0, weightedX = 0.0, weightedY = 0.0;
             for (int y = 352; y < 405; ++y)
                 for (int x = 262; x < 970; ++x)
                 {
                     const double d = (double) movingImage.getPixelAt (x, y).getBrightness()
                                    - (double) baseImage.getPixelAt (x, y).getBrightness();
-                    if (d > 0.01) { weight += d; weightedX += d * x; }
+                    if (d > 0.01) { weight += d; weightedX += d * x; weightedY += d * y; }
                 }
-            return weight > 0.5 ? weightedX / weight : -1.0;
+            return weight > 0.5 ? std::array<double, 2> { weightedX / weight, weightedY / weight }
+                                : std::array<double, 2> { -1.0, -1.0 };
+        };
+        auto headX = [&headPosition] (const juce::Image& a, const juce::Image& b) {
+            return headPosition (a, b)[0];
         };
         setP (p, "lfo1_shape", 0.0f);
         setP (p, "lfo1_amount", 0.8f);
         setP (p, "lfo1_rate", 0.05f);
         editor->setAnimationsEnabled (false);
+        editor->setAnimationPhase (12.345);
         const auto lowBase = capture (*editor);
         editor->setAnimationsEnabled (true);
-        editor->setAnimationPhase (12.345);
         const auto lowOn = capture (*editor);
         const double x1 = headX (lowBase, lowOn);
         setP (p, "lfo1_rate", 0.1f);
@@ -546,11 +550,72 @@ static void testGuiRegressions()
                "автоматизация LFO Rate не перескакивает фазу анимации",
                num (std::fabs (x1 - x2), 2) + " px");
 
+        // При смене 1→2 видимых циклов X раньше оставался на месте, но сама
+        // кривая пересчитывалась относительно начала дорожки и Y прыгал.
+        // Измеряем точку по пикселям для синуса, треугольника и sample&hold.
+        double worstX = 0.0, worstY = 0.0; int found = 0;
+        for (int shape = 0; shape < 3; ++shape)
+        {
+            setP (p, "lfo1_shape", (float) shape);
+            setP (p, "lfo1_rate", 0.05f); // 1 отображаемый цикл
+            editor->setAnimationsEnabled (false);
+            editor->setAnimationPhase (12.345); // примерно 62% ширины дорожки
+            const auto beforeBase = capture (*editor);
+            editor->setAnimationsEnabled (true);
+            auto before = headPosition (beforeBase, capture (*editor));
+            for (float nextRate : { 2.0f, 10.0f, 0.05f }) // 1 → 2 → 6 → 1 циклов
+            {
+                setP (p, "lfo1_rate", nextRate);
+                editor->setAnimationsEnabled (false);
+                const auto afterBase = capture (*editor);
+                editor->setAnimationsEnabled (true);
+                const auto after = headPosition (afterBase, capture (*editor));
+                if (before[0] >= 0.0 && after[0] >= 0.0)
+                {
+                    ++found;
+                    worstX = std::max (worstX, std::fabs (before[0] - after[0]));
+                    worstY = std::max (worstY, std::fabs (before[1] - after[1]));
+                }
+                std::printf ("   LFO shape %d, Rate -> %.2f: x %.2f -> %.2f, y %.2f -> %.2f\n",
+                             shape, nextRate, before[0], after[0], before[1], after[1]);
+                before = after;
+            }
+        }
+        check (found == 9 && worstX < 3.0 && worstY < 3.0,
+               "при смене масштаба LFO точка не прыгает ни по X, ни по Y",
+               num (worstX, 2) + "/" + num (worstY, 2) + " px, " + juce::String (found) + "/9");
+
+        // S&H: граница экрана после изменения масштаба может оказаться
+        // внутри LFO-цикла, а не на границе ступени. Запускаем точку у правого
+        // края при 4 циклах, переводим на 1 и пересекаем край таймером.
+        // Здесь значение на входе/выходе должно быть одним и тем же.
+        setP (p, "lfo1_shape", 2.0f);
+        setP (p, "lfo1_rate", 5.0f);
+        editor->setAnimationsEnabled (false);
+        editor->setAnimationPhase (0.792); // X ~ 99%; абсолютная фаза ~3.96
+        setP (p, "lfo1_rate", 0.05f);
+        const auto wrapBeforeBase = capture (*editor);
+        editor->setAnimationsEnabled (true);
+        const auto wrapBefore = headPosition (wrapBeforeBase, capture (*editor));
+        juce::MessageManager::getInstance()->runDispatchLoopUntil (350);
+        editor->setAnimationsEnabled (false);
+        const auto wrapAfterBase = capture (*editor);
+        editor->setAnimationsEnabled (true);
+        const auto wrapAfter = headPosition (wrapAfterBase, capture (*editor));
+        std::printf ("   S&H wrap: x %.2f -> %.2f, y %.2f -> %.2f\n",
+                     wrapBefore[0], wrapAfter[0], wrapBefore[1], wrapAfter[1]);
+        check (wrapBefore[0] > 920.0 && wrapAfter[0] > 262.0 && wrapAfter[0] < 310.0
+               && wrapBefore[1] >= 0.0 && wrapAfter[1] >= 0.0
+               && std::fabs (wrapBefore[1] - wrapAfter[1]) < 3.0,
+               "S&H не меняет ступень на границе экрана внутри цикла",
+               num (std::fabs (wrapBefore[1] - wrapAfter[1]), 2) + " px");
+
+        setP (p, "lfo1_shape", 0.0f);
         setP (p, "lfo1_rate", 1.0f); // два цикла на дорожке, 1 Гц в DSP
         editor->setAnimationsEnabled (false);
+        editor->setAnimationPhase (0.2);
         const auto oneHzBase = capture (*editor);
         editor->setAnimationsEnabled (true);
-        editor->setAnimationPhase (0.2);
         const double startX = headX (oneHzBase, capture (*editor));
         editor->setAnimationPhase (0.45);
         const double endX = headX (oneHzBase, capture (*editor));
@@ -976,6 +1041,72 @@ static void testGranularProcessorRegression()
     check (diffRms > 1.0e-4, "автоматизация Density действительно меняет звук", num (diffRms, 6));
 }
 
+// Проверка Delay через APVTS, MIDI и реальную задержку ROBIN. Два процессора
+// получают одинаковую ноту, различается только автоматизация Delay Time.
+static void testDelayProcessorRegression()
+{
+    std::printf ("\n--- 19. Delay Time через AudioProcessor и MIDI ---\n");
+    OrogenProcessor changed, reference;
+    for (auto* pr : { &changed, &reference })
+    {
+        pr->setPlayConfigDetails (0, 2, 48000.0, 128);
+        pr->prepareToPlay (48000.0, 128);
+        pr->setCurrentProgram (0);
+        soloSlot (*pr, 0, 0);                     // Wavetable, один активный слот
+        setP (*pr, "gl_mode", 0.0f); setP (*pr, "gl_gain", 0.7f); setP (*pr, "gl_master", 0.8f);
+        setP (*pr, "arpOn", 0.0f);
+        setP (*pr, "lfo1_amount", 0.0f); setP (*pr, "lfo2_amount", 0.0f);
+        for (int k = 1; k <= 8; ++k) setP (*pr, "mod" + juce::String (k) + "_amt", 0.0f);
+        setP (*pr, "sA_level", 0.8f); setP (*pr, "sA_attack", 0.001f);
+        setP (*pr, "sA_sustain", 1.0f); setP (*pr, "sA_tail", 0.0f);
+        setP (*pr, "sA_cutoff", 1.0f); setP (*pr, "sA_res", 0.0f);
+        for (const char* id : { "fx_drive", "fx_chorusMix", "fx_reverbMix", "fx_plateMix",
+                                "fx_materialMix", "fx_spectreMix", "fx_glitchMix", "fx_robinMix", "fx_combMix" })
+            setP (*pr, id, 0.0f);
+        setP (*pr, "fx_delayMix", 1.0f); setP (*pr, "fx_delayTime", 0.02f); setP (*pr, "fx_delayFb", 0.0f);
+        setP (*pr, "fx_compRatio", 1.0f); setP (*pr, "fx_compMakeup", 0.0f);
+    }
+    juce::MessageManager::getInstance()->runDispatchLoopUntil (160);
+    juce::AudioBuffer<float> a (2, 128), b (2, 128);
+    juce::MidiBuffer note, empty;
+    note.addEvent (juce::MidiMessage::noteOn (1, 60, 0.8f), 0);
+    float priorDiff = 0.0f; double referenceEnergy = 0.0;
+    for (int block = 0; block < 150; ++block)
+    {
+        auto& midi = block == 0 ? note : empty;
+        changed.processBlock (a, midi); reference.processBlock (b, midi);
+        for (int i = 0; i < 128; ++i)
+        {
+            const float x = a.getSample (0, i), y = b.getSample (0, i);
+            priorDiff = std::max (priorDiff, std::fabs (x - y));
+            if (block >= 100) referenceEnergy += (double) y * y;
+        }
+    }
+    const int latency = changed.getLatencySamples();
+    setP (changed, "fx_delayTime", 0.080f);
+    float first = -1.0f; double laterDiff = 0.0; int count = 0, bad = 0;
+    for (int block = 0; block < 60; ++block)
+    {
+        changed.processBlock (a, empty); reference.processBlock (b, empty);
+        for (int i = 0; i < 128; ++i)
+        {
+            const int at = block * 128 + i;
+            const float x = a.getSample (0, i), y = b.getSample (0, i);
+            if (! std::isfinite (x) || ! std::isfinite (y)) ++bad;
+            if (at == latency) first = std::fabs (x - y);
+            if (at >= latency + 2400) { laterDiff += (double) (x - y) * (x - y); ++count; }
+        }
+    }
+    const double refRms = std::sqrt (referenceEnergy / (50.0 * 128.0));
+    const double diffRms = std::sqrt (laterDiff / std::max (1, count));
+    std::printf ("   latency %d, до смены max Δ %.8f; первый после неё Δ %.8f; позднее ΔRMS %.6f, ref RMS %.6f, NaN %d\n",
+                 latency, priorDiff, first, diffRms, refRms, bad);
+    check (latency == 1024 && priorDiff < 1.0e-6f && first >= 0.0f && first < 1.0e-5f && bad == 0,
+           "Time не перескакивает на первом слышимом отсчёте", num (first, 8));
+    check (refRms > 0.001 && count > 0 && diffRms > 1.0e-4,
+           "новое значение Delay Time действительно меняет звук", num (diffRms, 6));
+}
+
 int main (int argc, char** argv)
 {
     // Голова без X11: GUI-инициализация здесь упала бы (нет дисплея), а
@@ -986,6 +1117,14 @@ int main (int argc, char** argv)
     auto* mm = juce::MessageManager::getInstance();
     std::printf ("OROGEN test_plugin: старт\n");
     juce::ignoreUnused (mm);
+    if (argc > 1 && juce::String (argv[1]) == "--delay-only")
+    {
+        testDelayProcessorRegression();
+        juce::DeletedAtShutdown::deleteAll();
+        juce::MessageManager::deleteInstance();
+        std::printf ("\nDelay AudioProcessor: провалов %d\n", failures);
+        return failures == 0 ? 0 : 1;
+    }
     if (argc > 1 && juce::String (argv[1]) == "--granular-only")
     {
         testGranularProcessorRegression();
@@ -3190,6 +3329,7 @@ int main (int argc, char** argv)
 
     testGuiRegressions();
     testGranularProcessorRegression();
+    testDelayProcessorRegression();
     juce::DeletedAtShutdown::deleteAll();
     juce::MessageManager::deleteInstance();
 

@@ -10,6 +10,7 @@
 #include "EngineUi.h"
 #include "content/wavetable_bank.h"
 
+#include <array>
 #include <cmath>
 #include <functional>
 #include <cstring>
@@ -53,16 +54,23 @@ namespace
     // Это схема формы, а не фаза какой-либо из полифонических нот. Треугольник
     // совпадает с формулой Voice; S&H держит значение весь цикл, а не создаёт
     // фиктивные быстрые ступеньки внутри него.
-    float lfoPreviewValue (int shape, float cycles)
+    float lfoPreviewValue (int shape, double cycles)
     {
-        const float whole = std::floor (cycles);
-        const float phase = cycles - whole;
+        const double whole = std::floor (cycles);
+        const float phase = (float) (cycles - whole);
         if (shape == 0) return std::sin (phase * juce::MathConstants<float>::twoPi);
         if (shape == 1) return 4.0f * std::abs (phase - 0.5f) - 1.0f;
-        Rng r (0x5eedu);
-        float held = 0.0f;
-        for (int i = 0; i < (int) whole; ++i) held = r.nextBipolar();
-        return held;
+        // Сохраняем прежнюю последовательность ступеней, но предвычисляем
+        // её один раз и повторяем каждые 4096 циклов. Это допускает и
+        // отрицательный сдвиг без скачка при ограничении offset.
+        static const auto levels = [] {
+            std::array<float, 4096> values {};
+            Rng r (0x5eedu);
+            for (size_t i = 1; i < values.size(); ++i) values[i] = r.nextBipolar();
+            return values;
+        }();
+        const auto cycle = (std::uint32_t) (int) whole & 4095u;
+        return levels[(size_t) cycle];
     }
 
     struct VisualHash
@@ -1913,8 +1921,11 @@ void OrogenEditor::setAnimationPhase (double seconds)
 {
     animSeconds = seconds;
     const float rate = juce::jmax (0.0f, pv ("lfo1_rate"));
-    const double phase = seconds * (double) rate / (double) lfoPreviewCycles (rate);
-    lfoPreviewPhase = phase - std::floor (phase);
+    lfoPreviewCycleCount = lfoPreviewCycles (rate);
+    const double phase = seconds * (double) rate / (double) lfoPreviewCycleCount;
+    const double wraps = std::floor (phase);
+    lfoPreviewOffset = std::remainder (wraps * lfoPreviewCycleCount, 4096.0);
+    lfoPreviewPhase = phase - wraps;
     // фаза живёт в редакторе, но рисуют её и дочерние компоненты — раздаём всем,
     // иначе кадр снаружи (тест, render_ui) будет статичным
     // при выключенных анимациях детям отдаётся нулевая фаза: кадр замирает
@@ -2047,6 +2058,18 @@ float OrogenEditor::animPhaseFor (double speed, double offset) const
     return (float) f;
 }
 
+void OrogenEditor::syncLfoPreviewCycles (int cycles)
+{
+    if (lfoPreviewCycleCount > 0 && cycles != lfoPreviewCycleCount)
+    {
+        // При смене масштаба сохраняем фазу самой кривой в точке playhead,
+        // а не только её X. Иначе точка скачет по вертикали на 26 px.
+        lfoPreviewOffset += lfoPreviewPhase * (double) (lfoPreviewCycleCount - cycles);
+        lfoPreviewOffset = std::remainder (lfoPreviewOffset, 4096.0);
+    }
+    lfoPreviewCycleCount = cycles;
+}
+
 void OrogenEditor::repaintChangedValues()
 {
     // Эти изображения рисует родитель, а не связанные Slider/ComboBox.
@@ -2111,8 +2134,18 @@ void OrogenEditor::timerCallback()
         // Интегрируем мгновенную скорость: изменение Rate не переносит
         // playhead в позицию, вычисленную из всего прошедшего времени.
         const float rate = juce::jmax (0.0f, pv ("lfo1_rate"));
-        lfoPreviewPhase += dt * (double) rate / (double) lfoPreviewCycles (rate);
-        lfoPreviewPhase -= std::floor (lfoPreviewPhase);
+        const int cycles = lfoPreviewCycles (rate);
+        syncLfoPreviewCycles (cycles);
+        lfoPreviewPhase += dt * (double) rate / (double) cycles;
+        const double wraps = std::floor (lfoPreviewPhase);
+        lfoPreviewPhase -= wraps;
+        if (wraps != 0.0)
+        {
+            // Край экрана после смены масштаба может лежать ВНУТРИ ступени
+            // S&H. Продвигаем начало кривой вместе с playhead, а не повторяем
+            // прошлые циклы: иначе точка скачет на другую высоту при wrap.
+            lfoPreviewOffset = std::remainder (lfoPreviewOffset + wraps * cycles, 4096.0);
+        }
         for (auto* c : columns) c->setAnimPhase ((float) animSeconds);
         if (vectorPad != nullptr) vectorPad->setAnimPhase ((float) animSeconds);
         for (auto* b : sectionButtons) b->setAnimPhase ((float) animSeconds);
@@ -2467,13 +2500,14 @@ void OrogenEditor::paintModEditor (juce::Graphics& g)
         const float amount = pv ("lfo1_amount");
         const float rate = pv ("lfo1_rate");
         const int cycles = lfoPreviewCycles (rate);
+        syncLfoPreviewCycles (cycles);
 
         juce::Path curve;
         const int N = 400;
         for (int i = 0; i <= N; ++i)
         {
             const float t = (float) i / (float) N;
-            const float v = lfoPreviewValue (shape, t * (float) cycles);
+            const float v = lfoPreviewValue (shape, (double) t * cycles + lfoPreviewOffset);
 
             const float x = lane.getX() + t * lane.getWidth();
             const float y = lane.getCentreY() - v * (0.15f + 0.85f * amount) * lane.getHeight() * 0.46f;
@@ -2497,7 +2531,7 @@ void OrogenEditor::paintModEditor (juce::Graphics& g)
         if (animOn)
         {
             const float t = (float) lfoPreviewPhase;
-            const float v = lfoPreviewValue (shape, t * (float) cycles);
+            const float v = lfoPreviewValue (shape, lfoPreviewPhase * cycles + lfoPreviewOffset);
 
             const float px = lane.getX() + t * lane.getWidth();
             const float py = lane.getCentreY() - v * (0.15f + 0.85f * amount) * lane.getHeight() * 0.46f;

@@ -56,6 +56,14 @@ build/test_granular_safety_asan: tests/test_granular_safety.cpp src/engines/gran
 asan-granular: build/test_granular_safety_asan
 	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 ./build/test_granular_safety_asan
 
+build/test_delay_safety_asan: tests/test_delay_safety.cpp src/instrument/*.h src/core/*.h third_party/monojuice/dsp/*.h
+	@mkdir -p build
+	$(CXX) -O1 -g1 -std=c++17 -fsanitize=address,undefined -fno-omit-frame-pointer $(INC) tests/test_delay_safety.cpp -o $@
+
+.PHONY: asan-delay
+asan-delay: build/test_delay_safety_asan
+	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 ./build/test_delay_safety_asan
+
 build/render_demo_fx: tools/render_demo_fx.cpp src/instrument/*.h src/core/*.h third_party/monojuice/dsp/*.h $(MONOJUICE_OBJ)
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(INC) tools/render_demo_fx.cpp $(MONOJUICE_OBJ) -o $@
@@ -120,6 +128,10 @@ build/render_demo_granular: tools/render_demo_granular.cpp src/engines/granular.
 build/render_granular_raw: tools/render_granular_raw.cpp src/engines/granular.h src/engines/engine.h src/engines/mip_reader.h src/engines/sinc_interp.h src/content/sample_bank.h src/engines/halfband.h src/core/*.h
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(INC) tools/render_granular_raw.cpp -o $@
+
+build/render_granular_transient: tools/render_granular_transient.cpp src/engines/granular.h src/engines/engine.h src/engines/mip_reader.h src/engines/sinc_interp.h src/content/sample_bank.h src/engines/halfband.h src/core/*.h
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) $(INC) tools/render_granular_transient.cpp -o $@
 
 build/render_demo_sample: tools/render_demo_sample.cpp src/engines/sample.h src/engines/halfband.h src/content/sample_bank.h src/core/*.h
 	@mkdir -p build

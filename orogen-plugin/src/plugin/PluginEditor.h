@@ -109,6 +109,7 @@ private:
     class PreviewWorker;     // владеет DSP-голосом вне message/audio thread
 
     void timerCallback() override;
+    void syncLfoPreviewCycles (int cycles);
     void repaintChangedValues();
     void takePreviewResult();
     void buildRail();
@@ -207,7 +208,9 @@ private:
     double prevStampMs = 0.0, prevRenderMs = 0.0;
 
     double animSeconds = 0.0;         // время анимации, с
-    double lfoPreviewPhase = 0.0;     // фазу интегрируем, а не умножаем на новую частоту
+    double lfoPreviewPhase = 0.0;     // координата playhead на дорожке, 0…1
+    double lfoPreviewOffset = 0.0;    // фаза самой кривой при изменении числа циклов
+    int lfoPreviewCycleCount = 0;
     double lastTimerMs = 0.0;
     bool   animOn = true;
     bool visualHashesValid = false;

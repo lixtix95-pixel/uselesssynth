@@ -1153,6 +1153,128 @@ int main()
         check (clamped < 1.0e-12, "значения выше 0.95 безопасно ограничены", num (clamped, 12));
     }
 
+    // Mix=0 не должен останавливать время или замораживать старый буфер.
+    // Сигнал, пришедший в тихом режиме, должен попасть в delay-линию.
+    std::printf ("\n--- 21. Delay: Mix 0 и время линии ---\n");
+    {
+        PingPongDelay delay;
+        delay.prepare (48000.0); delay.setTime (0.02f); delay.setFeedback (0.0f); delay.setMix (0.0f);
+        auto tick = [&delay] (float in) {
+            float l = in, r = 0.0f; delay.process (l, r); return l;
+        };
+        for (int i = 0; i < 4800; ++i) (void) tick (0.0f);
+        (void) tick (1.0f);                         // импульс при Mix=0
+        for (int i = 0; i < 479; ++i) (void) tick (0.0f);
+        delay.setMix (1.0f);                       // спустя 10 мс, до эха
+        float heard = 0.0f; int heardAt = -1;
+        for (int i = 0; i < 1600; ++i)
+        {
+            const float out = std::fabs (tick (0.0f));
+            if (out > heard) { heard = out; heardAt = i; }
+        }
+        std::printf ("   импульс при Mix 0, отклик после Mix 1: пик %.6f на %d отсчёте\n", heard, heardAt);
+        check (heard > 0.40f && heardAt >= 470 && heardAt <= 490,
+               "выключенный Mix не теряет вход и не замораживает время линии", num (heard, 6));
+
+        PingPongDelay stale;
+        stale.prepare (48000.0); stale.setTime (0.02f); stale.setFeedback (0.95f); stale.setMix (1.0f);
+        auto tickStale = [&stale] (float in) {
+            float l = in, r = 0.0f; stale.process (l, r); return std::max (std::fabs (l), std::fabs (r));
+        };
+        (void) tickStale (1.0f);
+        for (int i = 0; i < 2400; ++i) (void) tickStale (0.0f);
+        stale.setMix (0.0f);
+        for (int i = 0; i < 48000 * 3; ++i) (void) tickStale (0.0f);
+        stale.setMix (1.0f);
+        float oldTail = 0.0f;
+        for (int i = 0; i < 48000; ++i) oldTail = std::max (oldTail, tickStale (0.0f));
+        std::printf ("   старый хвост после 3 с тишины с Mix 0: пик %.8f\n", oldTail);
+        check (oldTail < 1.0e-4f, "не возвращается замороженное эхо после трёх секунд тишины", num (oldTail, 8));
+    }
+
+    // Сравниваем с неизменённой линией на том же отсчёте: естественный наклон
+    // сигнала не принимаем за скачок при изменении Time.
+    std::printf ("\n--- 22. Delay: автоматизация Time без перескока указателя ---\n");
+    {
+        PingPongDelay changed, reference;
+        for (auto* d : { &changed, &reference })
+        {
+            d->prepare (48000.0); d->setTime (0.02f); d->setFeedback (0.0f); d->setMix (1.0f);
+        }
+        auto input = [] (int n) { return (float) (0.45 * std::sin (kTwoPi * 777.0 * n / 48000.0)); };
+        for (int i = 0; i < 4800; ++i)
+        {
+            float al = input (i), ar = al, bl = al, br = al;
+            changed.process (al, ar); reference.process (bl, br);
+        }
+        changed.setTime (0.031f);
+        float al = input (4800), ar = al, bl = al, br = al;
+        changed.process (al, ar); reference.process (bl, br);
+        const double first = std::max (std::fabs ((double) al - bl), std::fabs ((double) ar - br));
+        double settled = 0.0;
+        const int d = (int) (0.031f * 48000.0f);
+        for (int i = 4801; i < 9000; ++i)
+        {
+            float l = input (i), r = l;
+            changed.process (l, r);
+            if (i > 8000)
+            {
+                settled = std::max (settled, std::fabs ((double) l - input (i) - input (i - d)));
+                settled = std::max (settled, std::fabs ((double) r - input (i) - input (i - (d - d / 2))));
+            }
+        }
+        std::printf ("   первый отсчёт Δ %.8f; после перехода ошибка задержки %.8f\n", first, settled);
+        check (first < 1.0e-4, "первый отсчёт при смене Time остаётся непрерывным", num (first, 8));
+        check (settled < 1.0e-5, "после перехода действует новая длина Delay", num (settled, 8));
+    }
+
+    // Новая цель может приходить быстрее 20-мс кроссфейда. Сверяем каждый
+    // момент смены с побайтной копией состояния, у которой цель не менялась.
+    std::printf ("\n--- 23. Delay: частая автоматизация Time и Mix ---\n");
+    {
+        PingPongDelay d;
+        d.prepare (48000.0); d.setTime (0.02f); d.setFeedback (0.0f); d.setMix (1.0f);
+        auto input = [] (int n) { return (float) (0.45 * std::sin (kTwoPi * 777.0 * n / 48000.0)); };
+        int n = 0;
+        for (; n < 4800; ++n) { float l = input (n), r = l; d.process (l, r); }
+        double worst = 0.0;
+        for (int k = 0; k < 30; ++k)
+        {
+            PingPongDelay unchanged = d;           // копия только в тесте, не в аудиопотоке
+            d.setTime ((k % 2) ? 0.075f : 0.031f);
+            float al = input (n), ar = al, bl = al, br = al;
+            d.process (al, ar); unchanged.process (bl, br); ++n;
+            worst = std::max (worst, std::max (std::fabs ((double) al - bl), std::fabs ((double) ar - br)));
+            for (int i = 0; i < 63; ++i, ++n) { float l = input (n), r = l; d.process (l, r); }
+        }
+        d.setTime (0.020f);                        // последняя цель не должна потеряться
+        double late = 0.0;
+        for (int i = 0; i < 6000; ++i, ++n)
+        {
+            float l = input (n), r = l; d.process (l, r);
+            if (i > 5000)
+                late = std::max (late, std::fabs ((double) l - input (n) - input (n - 960)));
+        }
+        std::printf ("   30 смен каждые 64 отсчёта: max Δ %.8f, финальная ошибка %.8f\n", worst, late);
+        check (worst < 1.0e-5 && late < 1.0e-5,
+               "частые цели Time не обрывают переход и последняя достигается", num (worst, 8));
+
+        PingPongDelay noMixChange = d;
+        d.setMix (0.0f);
+        float al = input (n), ar = al, bl = al, br = al;
+        d.process (al, ar); noMixChange.process (bl, br); ++n;
+        const double mixStep = std::max (std::fabs ((double) al - bl), std::fabs ((double) ar - br));
+        float dryError = 0.0f;
+        for (int i = 0; i < 6000; ++i, ++n)
+        {
+            float l = input (n), r = l; d.process (l, r);
+            if (i > 5000) dryError = std::max (dryError, std::fabs (l - input (n)));
+        }
+        std::printf ("   Mix 1 -> 0: первый Δ %.8f, ошибка сухого пути %.8f\n", mixStep, dryError);
+        check (mixStep < 0.002 && dryError < 1.0e-5f,
+               "Mix сглажен и полностью возвращается к сухому сигналу", num (mixStep, 8));
+    }
+
     std::printf ("\n=================================================\n");
     if (suite::gFailures == 0) std::printf ("ВСЕ ТЕСТЫ ПРОЙДЕНЫ (провалов: 0)\n");
     else std::printf ("ПРОВАЛОВ: %d\n", suite::gFailures);

@@ -3,7 +3,7 @@
 //
 //   render_ui <out.png> [view] [width] [height] [phase] [program]
 //             [cutoff] [filter] [morph] [mode] [scene] [elapsed-ms]
-// scene: fx-before | fx-change | fx-hover | hover (необязательно)
+// scene: fx-before | fx-change | fx-hover | hover | lfo-wrap (необязательно)
 //
 // view: 0…7 = слоты A–H, 8…11 = секции патч-колонки (FX/MATRIX/ARP/LFO),
 //       100…104 = оверлей параметров, вкладки SLOT/FX/MOD/ARP-LFO/GLOBAL
@@ -98,6 +98,21 @@ int main (int argc, char** argv)
     if (scene.isNotEmpty())
     {
         if (scene.startsWith ("fx-")) ore->showPage (8);
+        if (scene == "lfo-wrap")
+        {
+            // Реальный таймер редактора: масштаб 4→1, затем playhead
+            // пересекает правый край внутри ступени S&H. elapsedMs задаёт
+            // кадр анимации; состояние/фаза не подменяются после таймера.
+            const auto set = [&proc] (const char* id, float value) {
+                if (auto* p = proc.apvts.getParameter (id))
+                    p->setValueNotifyingHost (p->convertTo0to1 (value));
+            };
+            ore->setAnimationsEnabled (false);
+            set ("lfo1_shape", 2.0f); set ("lfo1_amount", 0.8f); set ("lfo1_rate", 5.0f);
+            ore->setAnimationPhase (0.792);
+            set ("lfo1_rate", 0.05f);
+            ore->setAnimationsEnabled (true);
+        }
         mm->runDispatchLoopUntil (65);       // установить время первого тика
         if (scene == "fx-change" || scene == "fx-hover")
         {
@@ -106,7 +121,7 @@ int main (int argc, char** argv)
         }
         if (scene == "hover" || scene == "fx-hover") ore->hoverKnob (0, true);
         if (elapsedMs > 0) mm->runDispatchLoopUntil (elapsedMs);
-        ore->setAnimationPhase (phase);
+        if (scene != "lfo-wrap") ore->setAnimationPhase (phase);
     }
 
     // заставляем редактор пересчитать раскладку и отрисовать себя в картинку

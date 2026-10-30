@@ -289,6 +289,91 @@ int main (int argc, char** argv)
         check (missing == 0, "Pan, Level и параметры хвоста доступны хосту", String (missing) + " missing");
         granular->releaseResources();
     }
+    granular.reset();
+
+    // Внешний хост и два настоящих VST3-инстанса: MIDI, одинаковый звук,
+    // меняем только Delay Time. Отсчитываем 1024 сэмпла ROBIN отдельно.
+    std::printf ("\n--- Delay Time через VST3-хост ---\n");
+    String delayErrorA, delayErrorB;
+    auto delayA = format->createInstanceFromDescription (d, 48000.0, 128, delayErrorA);
+    auto delayB = format->createInstanceFromDescription (d, 48000.0, 128, delayErrorB);
+    check (delayA != nullptr && delayB != nullptr, "два VST3-инстанса для Delay создаются", delayErrorA + delayErrorB);
+    if (delayA != nullptr && delayB != nullptr)
+    {
+        int missing = 0;
+        const auto setDelayParam = [&] (AudioPluginInstance& target, const String& name, float value) {
+            for (auto* p : target.getParameters())
+                if (p->getName (64) == name) { p->setValueNotifyingHost (value); return; }
+            ++missing;
+            std::printf ("   не найден параметр: %s\n", name.toRawUTF8());
+        };
+        for (auto* q : { delayA.get(), delayB.get() })
+        {
+            q->setCurrentProgram (0);
+            q->prepareToPlay (48000.0, 128);
+            setDelayParam (*q, "sA_Engine", 0.0f);
+            setDelayParam (*q, "sA_On", 1.0f);
+            for (const char* n : { "sB_On", "sC_On", "sD_On", "sE_On", "sF_On", "sG_On", "sH_On" })
+                setDelayParam (*q, n, 0.0f);
+            setDelayParam (*q, "Patch Mode", 0.0f); setDelayParam (*q, "Arp On", 0.0f);
+            setDelayParam (*q, "sA_Level", 0.8f); setDelayParam (*q, "sA_Attack", 0.0f);
+            setDelayParam (*q, "sA_Sustain", 1.0f); setDelayParam (*q, "sA_Tail", 0.0f);
+            setDelayParam (*q, "sA_Cutoff", 1.0f); setDelayParam (*q, "sA_Reso", 0.0f);
+            for (const char* n : { "Drive", "Chorus Mix", "Reverb Mix", "Plate Mix", "Material Mix",
+                                   "Spectre Mix", "Glitch Mix", "Robin Mix", "Comb Mix" })
+                setDelayParam (*q, n, 0.0f);
+            setDelayParam (*q, "Delay Mix", 1.0f); setDelayParam (*q, "Delay Time", 0.0f);
+            setDelayParam (*q, "Delay Fb", 0.0f);
+            setDelayParam (*q, "Comp Ratio", 0.0f); setDelayParam (*q, "Comp Makeup", 0.0f);
+        }
+        MessageManager::getInstance()->runDispatchLoopUntil (200);
+        // VST3-хост может заменить MIDI-вход выходным буфером. Отдельные
+        // объекты обязательны: иначе первая обработка съедает Note On второй.
+        MidiBuffer noteA, noteB, emptyA, emptyB;
+        noteA.addEvent (MidiMessage::noteOn (1, 60, 0.8f), 0);
+        noteB.addEvent (MidiMessage::noteOn (1, 60, 0.8f), 0);
+        AudioBuffer<float> a (2, 128), b (2, 128);
+        float prior = 0.0f;
+        for (int block = 0; block < 150; ++block)
+        {
+            emptyA.clear(); emptyB.clear();
+            delayA->processBlock (a, block == 0 ? noteA : emptyA);
+            delayB->processBlock (b, block == 0 ? noteB : emptyB);
+            for (int i = 0; i < 128; ++i)
+                prior = std::max (prior, std::fabs (a.getSample (0, i) - b.getSample (0, i)));
+        }
+        const int latency = delayA->getLatencySamples();
+        // Диапазон параметра 0.02…1.5 с; 0.08 с в нормализованной шкале.
+        setDelayParam (*delayA, "Delay Time", (0.08f - 0.02f) / (1.5f - 0.02f));
+        float first = -1.0f; double later = 0.0, referenceEnergy = 0.0; int count = 0, bad = 0;
+        for (int block = 0; block < 60; ++block)
+        {
+            emptyA.clear(); emptyB.clear();
+            delayA->processBlock (a, emptyA); delayB->processBlock (b, emptyB);
+            for (int i = 0; i < 128; ++i)
+            {
+                const int at = block * 128 + i;
+                const float x = a.getSample (0, i), y = b.getSample (0, i);
+                if (! std::isfinite (x) || ! std::isfinite (y)) ++bad;
+                if (at == latency) first = std::fabs (x - y);
+                if (at >= latency + 2400)
+                {
+                    later += (double) (x - y) * (x - y);
+                    referenceEnergy += (double) y * y;
+                    ++count;
+                }
+            }
+        }
+        const double delta = std::sqrt (later / std::max (1, count));
+        const double refRms = std::sqrt (referenceEnergy / std::max (1, count));
+        std::printf ("   latency %d, до смены Δ %.8f, первый после задержки Δ %.8f, далее ΔRMS %.6f, ref RMS %.6f, NaN %d\n",
+                     latency, prior, first, delta, refRms, bad);
+        check (missing == 0 && latency == 1024 && prior < 1.0e-6f && first >= 0.0f && first < 1.0e-5f && bad == 0,
+               "Delay Time доступен хосту и не скачет в первом отсчёте", String (first, 8));
+        check (count > 0 && refRms > 0.001 && delta > 1.0e-4,
+               "изменение Delay Time слышно после перехода", String (delta, 6));
+        delayA->releaseResources(); delayB->releaseResources();
+    }
 
     std::printf ("\n=== %s (провалов: %d)\n", failures == 0 ? "ПЛАГИН ПРОЙДЕН" : "ЕСТЬ ПРОВАЛЫ", failures);
     return failures == 0 ? 0 : 1;

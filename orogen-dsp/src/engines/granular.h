@@ -215,12 +215,50 @@ private:
         g->rate  = rate;
         g->phase = 0.0f;
 
-        // Нормировка по огибающей источника: зерно из хвоста затухающей записи
-        // поднимается к уровню «тела». Без этого RMS голоса зависел от позиции
-        // и питч-рейта в 27 дБ (замер: нота 45 -> 0.054, нота 69 -> 0.0023).
+        // Учитываем энергию ВСЕГО фактически читаемого участка, взвешенную
+        // квадратом окна Ханна. Иначе тихая первая 10-мс ячейка поднимает
+        // громкую атаку в середине того же зерна в несколько раз. Результат
+        // вычисляется только при spawn, действующие зёрна не перенормируются.
+        // Не усиливаем затухающий участок сильнее прежнего: используем большее
+        // из RMS в начале и RMS под окном. Это не выходной лимитер.
+        float local = shot->envAt (pos);
+        if (! shot->env.empty() && shot->envStep > 0)
+        {
+            const float readSpan = g->dur * rate;
+            // Фабричные источники: прежние точечные пробы через половину
+            // ячейки. На очень длинном проходе 256 точек могут пропустить
+            // одиночную атаку, поэтому каждая из тех же 256 фазовых секций
+            // интегрирует ВСЕ свои 10-мс ячейки через префикс суммы квадратов.
+            // Hann² берём в центре секции: время ограничено, аллокаций нет.
+            const int probes = clamp ((int) std::ceil (2.0f * readSpan / (float) shot->envStep), 8, 256);
+            const bool integrate = readSpan > 128.0f * (float) shot->envStep;
+            double sumEnergy = 0.0, sumWeight = 0.0;
+            for (int i = 0; i < probes; ++i)
+            {
+                const float phase = ((float) i + 0.5f) / (float) probes;
+                const float window = 0.5f - 0.5f * fastCosTbl (phase);
+                double energy;
+                if (integrate)
+                {
+                    const double from = (double) pos + (double) readSpan * (double) i / probes;
+                    const double to = (double) pos + (double) readSpan * (double) (i + 1) / probes;
+                    energy = shot->meanEnvEnergy (from, to);
+                }
+                else
+                {
+                    const float env = shot->envAt (pos + phase * readSpan);
+                    energy = (double) env * env;
+                }
+                const double weight = (double) window * window;
+                sumEnergy += weight * energy;
+                sumWeight += weight;
+            }
+            if (sumWeight > 0.0)
+                local = std::max (local, (float) std::sqrt (sumEnergy / sumWeight));
+        }
+        local = std::max (1.0e-4f, local);
         // Верхний предел 5x — чтобы не вытягивать шум из полной тишины.
-        const float local = std::max (1.0e-4f, shot->envAt (pos));
-        const float comp  = clamp (bodyRms / local, 0.25f, 5.0f);
+        const float comp = clamp (bodyRms / local, 0.25f, 5.0f);
 
         // Приведение к абсолютному уровню: голос не должен зависеть от того,
         // насколько громко записан источник (пробник 0.40 RMS против Fm Tine
