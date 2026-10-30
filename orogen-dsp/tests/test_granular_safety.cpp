@@ -105,10 +105,41 @@ int main() {
             }
         }
     }
+    // Граница пустой/непустой огибающей: исходник на один отсчёт короче
+    // 10 мс, ровно 10 мс и 5 мс, включая настоящую тишину.
+    int shortCases=0, shortGrains=0, shortUnsafe=0, shortBad=0;
+    for (int sr : {44100,48000,96000}) {
+        const int step=(int)(sr*0.01);
+        for (int n : {step/2,step-1,step})
+          for (float amp : {0.0f,0.03f,0.30f,0.80f}) {
+            OneShot shot; shot.name="short boundary safety"; shot.rootNote=45;
+            shot.levels.resize(1); shot.levels[0].resize((size_t)n);
+            for (int i=0; i<n; ++i)
+                shot.levels[0][(size_t)i]=(float)(amp*std::sin(kTwoPi*1000.0*i/sr));
+            buildMipLevels(shot,sr);
+            const int expectedCells=n<step ? 0 : 1;
+            if ((int)shot.env.size()!=expectedCells) ++shortBad;
+            SampleBank bank; bank.shots.push_back(std::move(shot));
+            for (float pos : {0.0f,0.5f,1.0f}) {
+                GranularEngine e; e.setBank(&bank); e.setSampleRate(sr); e.start(36,1.0f);
+                EngineParams p; p.p[0]=pos; p.p[1]=1.0f; p.p[2]=1.0f; p.p[3]=0.0f;
+                p.detune=0.0f; p.level=1.0f; e.prepare(p);
+                std::array<bool,GranularEngine::kMaxGrains> previous{};
+                for (int i=0; i<sr/10; ++i) {
+                    const float x=e.render(p);
+                    if (!std::isfinite(x) || (amp==0.0f && x!=0.0f)) ++shortBad;
+                    GranularTestProbe::inspect(e,previous,shortGrains,shortUnsafe);
+                }
+                ++shortCases;
+            }
+        }
+    }
     std::printf("ASan/UBSan: %d cases, %d grains, %d unsafe reads, %d NaN, raw peak %.6f\n",cases,grains,unsafe,bad,peak);
     std::printf("long fast source: %d grains, %d unsafe reads, %d NaN/Inf\n",longGrains,longUnsafe,longBad);
+    std::printf("short envelope boundary: %d cases, %d grains, %d unsafe reads, %d invalid/silence errors\n",shortCases,shortGrains,shortUnsafe,shortBad);
     std::printf("long slow source: %d grains, %d unsafe reads, %d NaN/Inf\n",slowGrains,slowUnsafe,slowBad);
     return (cases==240 && grains>100 && unsafe==0 && bad==0
             && longGrains>5 && longUnsafe==0 && longBad==0
-            && slowGrains>5 && slowUnsafe==0 && slowBad==0) ? 0 : 1;
+            && slowGrains>5 && slowUnsafe==0 && slowBad==0
+            && shortCases==108 && shortGrains>100 && shortUnsafe==0 && shortBad==0) ? 0 : 1;
 }

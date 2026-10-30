@@ -137,6 +137,14 @@ build/render_granular_pitch: tools/render_granular_pitch.cpp src/engines/granula
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(INC) tools/render_granular_pitch.cpp -o $@
 
+build/render_granular_short: tools/render_granular_short.cpp src/engines/granular.h src/engines/engine.h src/engines/mip_reader.h src/engines/sinc_interp.h src/content/sample_bank.h src/engines/halfband.h src/core/*.h
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) $(INC) tools/render_granular_short.cpp -o $@
+
+build/analyze_choir_source: tools/analyze_choir_source.cpp src/content/sample_bank.h src/engines/halfband.h src/core/*.h
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) $(INC) tools/analyze_choir_source.cpp -o $@
+
 build/render_demo_sample: tools/render_demo_sample.cpp src/engines/sample.h src/engines/halfband.h src/content/sample_bank.h src/core/*.h
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(INC) tools/render_demo_sample.cpp -o $@

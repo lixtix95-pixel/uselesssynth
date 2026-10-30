@@ -877,6 +877,84 @@ int main()
     // MIP-соседи обязаны описывать одну и ту же позицию исходника. Иначе их
     // кроссфейд гасит тон; простое отношение длин буферов не исправляет задержку
     // КИХ-дециматора. Замеряем фазу и амплитуду на стационарном синусе.
+    // Независимый контроль границы 10-мс RMS-огибающей. При отсутствии
+    // ячеек envAt() возвращает 1.0, что не является RMS короткого источника:
+    // до исправления изменение длины на один отсчёт давало скачок до 12 дБ.
+    std::printf ("\n--- Нормировка короткого источника на границе 10 мс ---\n");
+    {
+        struct ShortResult { double rms = 0.0, gain = 0.0; int envCells = -1; bool finite = true; };
+        auto renderShort = [] (double sr, int sourceSamples, double sourceAmplitude, int note)
+        {
+            OneShot shot; shot.name = "short sine"; shot.rootNote = 45;
+            shot.levels.resize (1); shot.levels[0].resize ((size_t) sourceSamples);
+            for (int i = 0; i < sourceSamples; ++i)
+                shot.levels[0][(size_t) i] = (float) (sourceAmplitude * std::sin (kTwoPi * 1000.0 * i / sr));
+            buildMipLevels (shot, sr);
+            SampleBank b; b.shots.push_back (std::move (shot));
+            GranularEngine e; e.setBank (&b); e.setSampleRate (sr); e.start (note, 1.0f);
+            EngineParams p; p.table = 0; p.p[0] = 0.35f; p.p[1] = 1.0f;
+            p.p[2] = 0.0f; p.p[3] = 0.0f; p.detune = 0.0f; p.level = 1.0f;
+            e.prepare (p);
+            ShortResult out; out.envCells = (int) b.shots[0].env.size();
+            double energy = 0.0;
+            const int n = (int) (sr * 0.01); // первое зерно; следующее не раньше 250 мс
+            for (int i = 0; i < n; ++i)
+            {
+                const float v = e.render (p);
+                out.finite = out.finite && std::isfinite (v);
+                if (i == 0) out.gain = GranularTestProbe::firstGrain (e)[2];
+                energy += (double) v * v;
+            }
+            out.rms = std::sqrt (energy / std::max (1, n));
+            return out;
+        };
+
+        double worstBoundaryDb = 0.0, worstGainDb = 0.0, worstScaleDb = 0.0;
+        int boundaryCases = 0, scaleCases = 0;
+        bool valid = true, silenceValid = true;
+        for (int sr : { 44100, 48000, 96000 })
+        {
+            const int step = (int) (sr * 0.01);
+            for (double amplitude : { 0.03, 0.30, 0.80 })
+            {
+                const auto below = renderShort (sr, step - 1, amplitude, 45);
+                const auto at = renderShort (sr, step, amplitude, 45);
+                valid = valid && below.finite && at.finite && below.envCells == 0 && at.envCells == 1
+                      && below.rms > 1.0e-7 && below.gain > 0.0 && at.gain > 0.0;
+                const double rmsDb = 20.0 * std::log10 (std::max (1.0e-20, at.rms)
+                                                         / std::max (1.0e-20, below.rms));
+                const double gainDb = 20.0 * std::log10 (std::max (1.0e-20, at.gain)
+                                                          / std::max (1.0e-20, below.gain));
+                worstBoundaryDb = std::max (worstBoundaryDb, std::fabs (rmsDb));
+                worstGainDb = std::max (worstGainDb, std::fabs (gainDb));
+                std::printf ("   %d Гц, ампл. %.2f: длина %d/%d, gain %.6f/%.6f, RMS %.6f/%.6f, Δ %+.3f дБ\n",
+                             sr, amplitude, step - 1, step, below.gain, at.gain, below.rms, at.rms, rmsDb);
+                ++boundaryCases;
+            }
+            // Одинаковый 5-мс тон с амплитудами 0.3 и 0.8: нота ниже,
+            // чтобы 16 безопасных отсчётов зерна помещались на 44.1 кГц.
+            const auto quiet = renderShort (sr, step / 2, 0.30, 36);
+            const auto loud  = renderShort (sr, step / 2, 0.80, 36);
+            const double db = 20.0 * std::log10 (std::max (1.0e-20, loud.rms)
+                                                  / std::max (1.0e-20, quiet.rms));
+            valid = valid && quiet.finite && loud.finite && quiet.envCells == 0 && loud.envCells == 0
+                  && quiet.gain > 0.0 && loud.gain > 0.0 && quiet.rms > 1.0e-7;
+            worstScaleDb = std::max (worstScaleDb, std::fabs (db));
+            std::printf ("   %d Гц, 5 мс, амплитуда 0.30 -> 0.80: RMS %.6f/%.6f, Δ %+.3f дБ\n",
+                         sr, quiet.rms, loud.rms, db);
+            ++scaleCases;
+            const auto silent = renderShort (sr, step - 1, 0.0, 45);
+            silenceValid = silenceValid && silent.finite && silent.rms == 0.0;
+        }
+        suite::check (valid && boundaryCases == 9 && worstBoundaryDb < 0.20 && worstGainDb < 0.10,
+                      "один отсчёт у границы 10 мс не меняет уровень зерна скачком",
+                      suite::num (worstBoundaryDb, 3) + " дБ RMS, " + suite::num (worstGainDb, 3) + " дБ gain");
+        suite::check (valid && scaleCases == 3 && worstScaleDb < 0.05,
+                      "калибровка 5-мс источника не зависит от масштаба записи",
+                      suite::num (worstScaleDb, 3) + " дБ");
+        suite::check (silenceValid, "короткая тишина не создаёт сигнал и NaN/Inf");
+    }
+
     std::printf ("\n--- Фазовое совпадение соседних MIP-уровней ---\n");
     {
         const OneShot s = makeStationaryShot (48000.0, 2.0);

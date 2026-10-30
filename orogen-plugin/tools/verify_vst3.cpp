@@ -291,6 +291,73 @@ int main (int argc, char** argv)
     }
     granular.reset();
 
+    // Фабричный Choir через реальный VST3. Это отдельный замер выхода,
+    // а не обещание headroom для произвольных патчей и не замена сырому WAV.
+    // Проверяем два заданных случая: штатную калибровку по центру и gain 1,
+    // master 1 с полной левой панорамой. Все миксы FX = 0, compressor 1:1.
+    std::printf ("\n--- Choir Granular через VST3-хост: два ограниченных сценария ---\n");
+    for (int scenario = 0; scenario < 2; ++scenario)
+    {
+        String error;
+        auto choir = format->createInstanceFromDescription (d, 48000.0, 128, error);
+        check (choir != nullptr, "инстанс Choir создаётся", String (scenario) + ": " + error);
+        if (choir == nullptr) continue;
+        choir->setCurrentProgram (0); choir->prepareToPlay (48000.0, 128);
+        int missing = 0;
+        const auto set = [&] (const String& name, float value) {
+            for (auto* p : choir->getParameters())
+                if (p->getName (64) == name) { p->setValueNotifyingHost (value); return; }
+            ++missing; std::printf ("   не найден параметр: %s\n", name.toRawUTF8());
+        };
+        set ("sA_Engine", 0.5f); set ("sA_On", 1.0f);
+        for (const char* n : { "sB_On", "sC_On", "sD_On", "sE_On", "sF_On", "sG_On", "sH_On" }) set (n, 0.0f);
+        set ("Patch Mode", 0.0f); set ("Arp On", 0.0f);
+        set ("sA_Table", 2.0f / 7.0f); set ("sA_P1", 0.35f); set ("sA_P2", 0.45f);
+        set ("sA_P3", 0.0f); set ("sA_P4", 0.20f); set ("sA_Detune", 0.0f); set ("sA_Tune", 0.5f);
+        set ("sA_Level", 1.0f); set ("sA_Pan", scenario == 0 ? 0.5f : 0.0f);
+        set ("sA_Attack", 0.0f); set ("sA_Sustain", 1.0f); set ("sA_Tail", 0.0f);
+        set ("sA_Cutoff", 1.0f); set ("sA_Reso", 0.0f);
+        set ("Patch Gain", ((scenario == 0 ? 0.67f : 1.0f) - 0.05f) / 3.95f);
+        set ("Master", scenario == 0 ? 0.4f : 0.5f); // физически 0.8 / 1.0
+        set ("Stereo Width", 1.0f); set ("Width", 2.0f / 3.0f);
+        set ("lfo1_Amount", 0.0f); set ("lfo2_Amount", 0.0f);
+        for (int i = 1; i <= 8; ++i) set ("mod" + String (i) + "_Amount", 0.5f);
+        for (const char* n : { "Drive", "Chorus Mix", "Delay Mix", "Reverb Mix", "Plate Mix",
+                               "Material Mix", "Spectre Mix", "Glitch Mix", "Robin Mix", "Comb Mix" }) set (n, 0.0f);
+        set ("Comp Ratio", 0.0f); set ("Comp Makeup", 0.0f);
+        MessageManager::getInstance()->runDispatchLoopUntil (250);
+        const int latency = choir->getLatencySamples();
+        MidiBuffer on, none; on.addEvent (MidiMessage::noteOn (1, 60, 1.0f), 0);
+        AudioBuffer<float> block (2, 128);
+        int bad = 0, hits = 0, frames = 0;
+        float peak = 0.0f; double energy = 0.0;
+        for (int b = 0; b * 128 < 96000 + latency; ++b)
+        {
+            block.clear(); none.clear();
+            choir->processBlock (block, b == 0 ? on : none);
+            for (int i = 0; i < 128; ++i)
+            {
+                const int at = b * 128 + i;
+                if (at < latency || at >= latency + 96000) continue;
+                const float l = block.getSample (0, i), r = block.getSample (1, i);
+                if (! std::isfinite (l) || ! std::isfinite (r)) ++bad;
+                const float framePeak = std::max (std::fabs (l), std::fabs (r));
+                peak = std::max (peak, framePeak);
+                if (framePeak >= 0.979999f) ++hits;
+                energy += (double) l * l + (double) r * r; ++frames;
+            }
+        }
+        const double choirRms = std::sqrt (energy / std::max (1, frames * 2));
+        std::printf ("   %s: 2 с, пик %.6f, stereo RMS %.6f, >=0.98: %d/%d, latency %d, NaN %d\n",
+                     scenario == 0 ? "gain .67/master .8/pan centre" : "gain 1/master 1/pan left",
+                     peak, choirRms, hits, frames, latency, bad);
+        check (missing == 0 && latency == 1024 && frames == 96000 && bad == 0
+               && choirRms > 0.001 && peak < 0.979999f && hits == 0,
+               "данный сценарий Choir звучит и не достигает порога 0.98 на выходе",
+               "peak " + String (peak, 6));
+        choir->releaseResources();
+    }
+
     // Настоящий VST3, 96 кГц, заводской Sub Bass на поздней позиции.
     // Источник имеет стабильную основную частоту 110 Гц за пределами атаки;
     // частота на выходе измеряется пересечениями нуля после ROBIN latency.
