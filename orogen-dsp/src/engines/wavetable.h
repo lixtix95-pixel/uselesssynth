@@ -22,6 +22,18 @@ namespace orogen {
 
 class WavetableEngine final : public EngineBase
 {
+    // Только невладеющие указатели на неизменяемый банк; переключение таблиц
+    // не выделяет память и не копирует данные в аудиопотоке.
+    struct TableView
+    {
+        const float* base = nullptr;
+        int len = 0, mask = 0, frames = 0;
+        bool operator== (const TableView& b) const noexcept
+        { return base == b.base && len == b.len && frames == b.frames; }
+        bool operator!= (const TableView& b) const noexcept { return ! (*this == b); }
+    };
+    enum class RouteFade { Stable, Down, Up };
+
 public:
     // Калибровка уровня: подобрана измерением RMS (см. tests/test_wavetable.cpp),
     // чтобы слот с Wavetable не был на 15 дБ громче слота с Modal.
@@ -40,10 +52,15 @@ public:
 
     void setSampleRate (double sr) override
     {
-        sampleRate = sr;
-        posSm.setTime  (sr, 18.0);
-        warpSm.setTime (sr, 25.0);
-        foldSm.setTime (sr, 25.0);
+        sampleRate = (std::isfinite (sr) && sr >= 1000.0) ? sr : 48000.0;
+        posSm.setTime      (sampleRate, 18.0);
+        warpSm.setTime     (sampleRate, 25.0);
+        foldSm.setTime     (sampleRate, 25.0);
+        foldTrimSm.setTime (sampleRate, 25.0);
+        tiltSm.setTime     (sampleRate, 20.0);
+        pitchGainSm.setTime (sampleRate, 5.0);
+        tableStep = 1.0f / (float) std::max (1.0, sampleRate * 0.005); // 5 ms table crossfade
+        routeStep = 1.0f / (float) std::max (1.0, sampleRate * 0.003); // 3 ms down + 3 ms up
         decimA.reset(); decimB.reset(); decimC.reset();
     }
 
@@ -53,7 +70,13 @@ public:
         vel  = velocity;
         phase = rng.nextFloat();                              // случайный старт фазы
         driftCents = rng.nextBipolar() * 7.0f;                // ±7 центов «аналога»
-        dcX = dcY = 0.0f;
+        dcX = dcY = tiltState = 0.0f;
+        // Повторный note-on не должен проигрывать историю фильтров прошлой ноты.
+        decimA.reset(); decimB.reset(); decimC.reset();
+        currentTable = nextTable = requestedTable = {};
+        tableTransition = false;
+        routeFade = RouteFade::Stable;
+        routeGain = 1.0f;
         needSnap = true;
         active = true;
     }
@@ -62,152 +85,211 @@ public:
 
     void prepare (const EngineParams& p) override
     {
-        if (bank == nullptr || bank->tables.empty()) return;
+        if (bank == nullptr || bank->tables.empty())
+        {
+            requestedTable = currentTable = nextTable = {};
+            return;
+        }
 
         const Wavetable& wt = bank->tables[(size_t) clamp (p.table, 0, (int) bank->tables.size() - 1)];
-        frames = wt.frames;
-        nFramesMinus1 = std::max (1, frames - 1);
+        const size_t count = std::min ({ wt.levels.size(), wt.lens.size(), wt.harms.size() });
+        if (count == 0 || wt.frames < 1)
+        {
+            requestedTable = currentTable = nextTable = {};
+            return;
+        }
 
-        // ---- частота: нота + тюн слота + дрейф голоса
-        const double cents = (double) driftCents * (double) p.detune * 2.0;   // до ±14 центов
-        const double f0 = midiToHz ((double) note + (double) p.tuneSemis) * std::pow (2.0, cents / 1200.0);
-        const double inc1x = f0 / sampleRate;
-
-        // ---- выбор MIP-уровня: самый яркий БЕЗОПАСНЫЙ уровень
-        // allowed = сколько партиалов влезает ниже Найквиста
+        // Частота выше Найквиста не может быть представлена. Плавно гасим её
+        // в полосе 0.45..0.5 SR и ограничиваем phase increment: это убирает и
+        // alias, и выход чтения за массив при MIDI 127 + Tune +24 на низком SR.
+        const double cents = (double) driftCents * (double) p.detune * 2.0;
+        double f0 = midiToHz ((double) note + (double) p.tuneSemis) * std::pow (2.0, cents / 1200.0);
+        if (! std::isfinite (f0) || f0 < 0.0) f0 = sampleRate;
         const double allowed = 0.5 * sampleRate / std::max (1.0, f0);
-        level   = levelForAllowed (allowed);
-        len     = wt.lens[(size_t) level];
-        mask    = len - 1;
-        base    = wt.levels[(size_t) level].data();
-        maxHarm = wt.harms[(size_t) level];
+        int level = clamp (levelForAllowed (allowed), 0, (int) count - 1);
+        while (level + 1 < (int) count && (double) wt.harms[(size_t) level] > allowed) ++level;
+        int len = wt.lens[(size_t) level];
+        const std::vector<float>* samples = &wt.levels[(size_t) level];
+        if ((size_t) level < wt.highDensityLevels.size() && (size_t) level < wt.highDensityLens.size()
+            && ! wt.highDensityLevels[(size_t) level].empty())
+        {
+            samples = &wt.highDensityLevels[(size_t) level];
+            len = wt.highDensityLens[(size_t) level];
+        }
+        const bool valid = len > 1 && (len & (len - 1)) == 0
+                        && samples->size() >= (size_t) wt.frames * (size_t) len;
+        if (! valid)
+        {
+            requestedTable = currentTable = nextTable = {};
+            return;
+        }
+        requestedTable = { samples->data(), len, len - 1, wt.frames };
+        const bool safeMip = (double) wt.harms[(size_t) level] <= allowed;
+        const float pitchGain = safeMip
+            ? (float) clamp ((0.5 * sampleRate - f0) / (0.05 * sampleRate), 0.0, 1.0) : 0.0f;
+        incBase = std::min (f0, 0.499999 * sampleRate) / sampleRate;
+        inc = (float) incBase;
 
-        inc    = (float) inc1x;
-        // Eco: 2×; Normal: 4× для warp и 8× для сильной складки; High: всегда 8×
+        // Eco 2×; Normal 4×/8×; High 8×. Фильтры между разными частотами
+        // нельзя переключать мгновенно: render() делает короткий fade-out/in.
         const bool hardFold = clamp (p.p[2], 0.0f, 1.0f) > 0.45f;
-        osFactor = (quality == 0) ? 2
-                 : (quality == 2 || hardFold) ? 8 : 4;
-        incOs    = (float) (inc1x / (double) osFactor);
+        requestedFactor = (quality == 0) ? 2 : (quality == 2 || hardFold) ? 8 : 4;
 
-        // ---- параметры со сглаживанием
         const float posT  = clamp (p.p[0], 0.0f, 1.0f);
         const float warpT = clamp (p.p[1], 0.0f, 1.0f);
         const float foldT = clamp (p.p[2], 0.0f, 1.0f);
         const float tiltT = clamp (p.p[3], 0.0f, 1.0f);
+        const float trimT = 1.0f / std::sqrt (1.0f + foldT * 2.5f);
 
-        // P4 — наклон спектра. Нейтрален в точке своего значения по умолчанию
-        // (0.3): ниже — темнее, выше — ярче. Иначе добавление ручки изменило бы
-        // звук уже сохранённых патчей.
-        tiltAmount = (tiltT < kTiltNeutral) ? (tiltT - kTiltNeutral) * 2.3f
-                                           : (tiltT - kTiltNeutral) * 1.6f;
+        const float tiltTarget = (tiltT < kTiltNeutral) ? (tiltT - kTiltNeutral) * 2.3f
+                                                        : (tiltT - kTiltNeutral) * 1.6f;
         tiltCoef = 1.0f - std::exp (-6.2831853f * 3000.0f / (float) sampleRate);
 
         if (needSnap)
         {
-            posSm.snap (posT);
-            warpSm.snap (warpT);
-            foldSm.snap (foldT);
+            posSm.snap (posT); warpSm.snap (warpT); foldSm.snap (foldT);
+            foldTrimSm.snap (trimT); tiltSm.snap (tiltTarget); pitchGainSm.snap (pitchGain);
+            currentTable = requestedTable;
+            tableTransition = false;
+            activeRoute = (warpT > 1.0e-4f || foldT > 1.0e-4f) ? requestedFactor : 0;
+            incOs = activeRoute > 0 ? (float) (incBase / (double) activeRoute) : 0.0f;
+            routeFade = RouteFade::Stable; routeGain = 1.0f;
             needSnap = false;
         }
         else
         {
-            posSm.setTarget (posT);
-            warpSm.setTarget (warpT);
-            foldSm.setTarget (foldT);
+            posSm.setTarget (posT); warpSm.setTarget (warpT); foldSm.setTarget (foldT);
+            foldTrimSm.setTarget (trimT); tiltSm.setTarget (tiltTarget); pitchGainSm.setTarget (pitchGain);
+            if (activeRoute > 0) incOs = (float) (incBase / (double) activeRoute);
         }
-
-        // warp: глубина фазовой дисторсии (0..0.15 — сохраняет монотонность фазы)
-        warpDepth = warpT * 0.15f;
-        // fold: коэффициент складки; при 0 не применяется вовсе.
-        // 1..4 — выше начинается «звон» из-за гармоник выше Найквиста даже при 4×.
-        foldDrive = 1.0f + foldT * 2.5f;
-        foldTrim  = 1.0f / std::sqrt (foldDrive);
-        gain      = kGainTrim * (0.4f + 0.6f * clamp (p.level, 0.0f, 1.0f));
+        gain = kGainTrim * (0.4f + 0.6f * clamp (p.level, 0.0f, 1.0f));
     }
 
     void prepareBlock (const EngineParams& p) { prepare (p); }
 
     inline float render (const EngineParams&) override
     {
-        if (! active) return 0.0f;
+        if (! active || currentTable.base == nullptr) return 0.0f;
 
         const float pos  = posSm.next();
         const float warp = warpSm.next();
         const float fold = foldSm.next();
+        const float trim = foldTrimSm.next();
+        const float tiltAmount = tiltSm.next();
+        const float pitchGain = pitchGainSm.next();
 
-        // ---- выбор кадров (морфинг позиции)
-        const float fp = pos * (float) nFramesMinus1;
-        int fa = (int) fp;
-        if (fa > nFramesMinus1) fa = nFramesMinus1;
-        const int   fb = (fa + 1 < frames) ? fa + 1 : fa;
-        const float ff = fp - (float) fa;
+        // Замену источника/MIP смешиваем в фазе на протяжении 5 ms. Если
+        // выбор меняется чаще, текущий переход завершается, затем применяется
+        // самое последнее значение (без разрыва и без очереди аллокаций).
+        if (! tableTransition && requestedTable != currentTable && requestedTable.base != nullptr)
+        {
+            nextTable = requestedTable;
+            tableMix = 0.0f;
+            tableTransition = true;
+        }
+        const auto frameInfo = [pos] (const TableView& t, int& fa, int& fb, float& ff)
+        {
+            const int last = std::max (0, t.frames - 1);
+            const float fp = pos * (float) last;
+            fa = std::min ((int) fp, last);
+            fb = fa < last ? fa + 1 : fa;
+            ff = fp - (float) fa;
+        };
+        int fa = 0, fb = 0, ta = 0, tb = 0;
+        float ff = 0.0f, tf = 0.0f;
+        frameInfo (currentTable, fa, fb, ff);
+        if (tableTransition) frameInfo (nextTable, ta, tb, tf);
+        const auto tableAt = [&] (float ph)
+        {
+            const float a = readLevel (currentTable.base, currentTable.len, currentTable.mask, fa, fb, ff, ph);
+            if (! tableTransition) return a;
+            const float b = readLevel (nextTable.base, nextTable.len, nextTable.mask, ta, tb, tf, ph);
+            return a + (b - a) * tableMix;
+        };
 
         const bool distort = (fold > 1.0e-4f) || (warp > 1.0e-4f);
-        float out;
-
-        if (! distort)
+        const int wantedRoute = distort ? requestedFactor : 0;
+        if (routeFade == RouteFade::Stable && wantedRoute != activeRoute) routeFade = RouteFade::Down;
+        if (routeFade == RouteFade::Down)
         {
-            // ---- прямой путь (одна выборка на сэмпл)
-            out = readLevel (base, len, mask, fa, fb, ff, phase) * gain;
+            if (wantedRoute == activeRoute) routeFade = RouteFade::Up;
+            else
+            {
+                routeGain = std::max (0.0f, routeGain - routeStep);
+                if (routeGain <= 0.0f)
+                {
+                    activeRoute = wantedRoute;
+                    decimA.reset(); decimB.reset(); decimC.reset();
+                    incOs = activeRoute > 0 ? (float) (incBase / (double) activeRoute) : 0.0f;
+                    routeFade = RouteFade::Up;
+                }
+            }
+        }
+        else if (routeFade == RouteFade::Up)
+        {
+            routeGain = std::min (1.0f, routeGain + routeStep);
+            if (routeGain >= 1.0f) routeFade = RouteFade::Stable;
+        }
+
+        const float wet = std::min (1.0f, fold * 20.0f); // плавный ввод нелинейности в первые 5% ручки
+        const float foldDrive = 1.0f + fold * 2.5f;
+        float out;
+        if (activeRoute == 0)
+        {
+            out = tableAt (phase) * gain;
             phase += inc;
             if (phase >= 1.0f) phase -= 1.0f;
         }
         else
         {
-            // ---- путь с оверсэмплингом: 4× для warp, 8× при сильной складке
-            // (волновая складка генерирует гармоники до ~2·drive-го порядка;
-            //  на 4× они ещё заворачиваются в полосу, на 8× — заметно чище)
             const float wd = warp * 0.15f;
-            for (int k = 0; k < osFactor; ++k)
+            for (int k = 0; k < activeRoute; ++k)
             {
                 float ph = phase;
                 if (wd > 0.0f)
                 {
-                    // фазовая дисторсия: φ' = φ + d·sin(2πφ), монотонна при d < 1/(2π)
                     ph += wd * fastSin (ph);
                     if (ph >= 1.0f) ph -= 1.0f;
                     else if (ph < 0.0f) ph += 1.0f;
                 }
-                float s = readLevel (base, len, mask, fa, fb, ff, ph);
+                float sample = tableAt (ph);
                 if (fold > 1.0e-4f)
-                    s = fastSin (s * foldDrive * 0.5f);          // sin(π·x·d/2) — складка
-                if (osFactor == 2)
                 {
-                    decimC.push (s);                                   // 2× -> 1×
+                    const float folded = fastSin (sample * foldDrive * 0.5f);
+                    sample = wet >= 1.0f ? folded : sample + (folded - sample) * wet;
                 }
+                if (activeRoute == 2) decimC.push (sample);
                 else
                 {
-                    decimA.push (s);
+                    decimA.push (sample);
                     if ((k & 1) == 1)
                     {
-                        if (osFactor == 8)
+                        if (activeRoute == 8)
                         {
-                            decimB.push (decimA.decimate());           // 8× -> 4×
-                            if ((k & 3) == 3)
-                                decimC.push (decimB.decimate());       // 4× -> 2×
+                            decimB.push (decimA.decimate());
+                            if ((k & 3) == 3) decimC.push (decimB.decimate());
                         }
-                        else
-                        {
-                            decimC.push (decimA.decimate());           // 4× -> 2×
-                        }
+                        else decimC.push (decimA.decimate());
                     }
                 }
                 phase += incOs;
                 if (phase >= 1.0f) phase -= 1.0f;
             }
-            out = decimC.decimate()                                // 2× -> 1× (острый фильтр)
-                * gain * (fold > 1.0e-4f ? foldTrim : 1.0f);
+            const float foldGain = wet >= 1.0f ? trim : 1.0f + (trim - 1.0f) * wet;
+            out = decimC.decimate() * gain * (fold > 1.0e-4f ? foldGain : 1.0f);
         }
-        // спектральный наклон (P4): 0 = нейтрально, <0 темнее, >0 ярче
+        if (tableTransition)
+        {
+            tableMix += tableStep;
+            if (tableMix >= 1.0f) { currentTable = nextTable; tableTransition = false; }
+        }
         tiltState += tiltCoef * (out - tiltState);
-        if (tiltAmount < -1.0e-4f)      out += tiltAmount * (tiltState - out);
+        if (tiltAmount < -1.0e-4f)      out += (-tiltAmount) * (tiltState - out);
         else if (tiltAmount > 1.0e-4f)  out += tiltAmount * (out - tiltState);
 
-        // DC-блокер: нелинейности (fold, drive) дают постоянную составляющую,
-        // которая «съедает» headroom и уводит фильтр голоса в смещение.
         const float y = out - dcX + 0.999f * dcY;
         dcX = out; dcY = y;
-        return y;
+        return y * pitchGain * routeGain;
     }
 
 private:
@@ -228,8 +310,9 @@ private:
                                    int fa, int fb, float ff, float ph) noexcept
     {
         const float x  = ph * (float) len;
-        const int   i1 = (int) x;
-        const float fx = x - (float) i1;
+        const int   ix = (int) x;
+        const float fx = x - (float) ix;
+        const int   i1 = ix & mask; // защита и от округления phase ровно до 1
         const int   i0 = (i1 - 1) & mask;
         const int   i2 = (i1 + 1) & mask;
         const int   i3 = (i1 + 2) & mask;
@@ -252,24 +335,21 @@ private:
     bool   needSnap = true;
 
     float  phase = 0.0f;
+    double incBase = 0.0;
     float  inc = 0.0f, incOs = 0.0f;
-    int    osFactor = 4;
-    int    quality  = 1;
+    int    requestedFactor = 4, activeRoute = 0, quality = 1;
     float  driftCents = 0.0f;
 
-    int    level = 0;
-    int    len   = kWtBaseLen;
-    int    mask  = kWtBaseLen - 1;
-    int    maxHarm = kWtMaxHarm;
-    const float* base = nullptr;
+    TableView currentTable, nextTable, requestedTable;
+    bool tableTransition = false;
+    float tableMix = 0.0f, tableStep = 1.0f / 240.0f;
+    RouteFade routeFade = RouteFade::Stable;
+    float routeGain = 1.0f, routeStep = 1.0f / 144.0f;
+    float gain = 0.4f;
 
-    int    frames = 6;
-    int    nFramesMinus1 = 5;
-    float  warpDepth = 0.0f, foldDrive = 1.0f, foldTrim = 1.0f, gain = 0.4f;
-
-    SmoothedValue posSm, warpSm, foldSm;
+    SmoothedValue posSm, warpSm, foldSm, foldTrimSm, tiltSm, pitchGainSm;
     static constexpr float kTiltNeutral = 0.3f;   // значение p[3] по умолчанию
-    float tiltAmount = 0.0f, tiltCoef = 0.3f, tiltState = 0.0f;
+    float tiltCoef = 0.3f, tiltState = 0.0f;
     float dcX = 0.0f, dcY = 0.0f;          // состояние DC-блокера
     // промежуточные ступени — 127 отсчётов, финальная — 255 (см. halfband.h)
     HalfbandDecimator2x<127> decimA, decimB;

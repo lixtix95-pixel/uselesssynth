@@ -128,6 +128,7 @@ private:
     void buildFxPage();
     void selectSlot (int slot);
     void refreshEngineContext();
+    void updateSourceSelection (float denormalisedValue);
     void setSection (int index);
     void toggleParamsPage (bool shouldShow);
     void toggleFxPage (bool shouldShow);
@@ -188,8 +189,12 @@ private:
     juce::ComboBox programBox;
 
     // выбор движка и фильтра выбранного слота (sA_type … sH_type / sA_filter …)
-    juce::ComboBox engineBox, filterBox;
+    juce::ComboBox engineBox, filterBox, sourceBox;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> engineAtt, filterAtt;
+    // table — прежний stepped float 0..7, а не Choice. Для CHOP три пункта,
+    // поэтому стандартный ComboBoxAttachment (масштабирует по числу пунктов)
+    // здесь неверен; ParameterAttachment принимает реальные индексы 0,1,2.
+    std::unique_ptr<juce::ParameterAttachment> sourceAtt;
 
     juce::OwnedArray<SlotCard> cards;
     juce::OwnedArray<Bound> centreKnobs, centreBars;    // 3 + 3, зависят от слота

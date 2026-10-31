@@ -38,10 +38,12 @@ namespace orogen {
 inline constexpr int kWtLenMult  = ORG_WT_LEN_MULT;
 inline constexpr int kWtBaseLen  = 4096;
 inline constexpr int kWtMaxHarm  = 512;
-inline constexpr int kWtLevels  = 25;      // 1024, 815, 648 … 4 партиала
+inline constexpr int kWtLegacyLevels = 25; // прежняя пирамида, уровни 0..24 неизменны
+inline constexpr int kWtLevels = kWtLegacyLevels + 3; // дополняем 3, 2 и 1 партиалами
 
 inline int levelMaxHarm (int level)
 {
+    if (level >= kWtLegacyLevels) return std::max (1, 3 - (level - kWtLegacyLevels));
     const double h = kWtMaxHarm * std::pow (2.0, -(double) level / 3.0);
     return std::max (4, (int) std::llround (h));
 }
@@ -50,9 +52,12 @@ inline int levelMaxHarm (int level)
 inline int levelForAllowed (double allowed)
 {
     if (allowed >= kWtMaxHarm) return 0;
+    if (allowed < 2.0) return kWtLegacyLevels + 2;
+    if (allowed < 3.0) return kWtLegacyLevels + 1;
+    if (allowed < 4.0) return kWtLegacyLevels;
     const double xl = std::log2 ((double) kWtMaxHarm / allowed) * 3.0;   // в треть-октавах
     int l = (int) std::ceil (xl);
-    return clamp (l, 0, kWtLevels - 1);
+    return clamp (l, 0, kWtLegacyLevels - 1);
 }
 
 inline int nextPow2 (int v)
@@ -208,9 +213,80 @@ struct Wavetable
     std::vector<std::vector<float>> levels;   // levels[l].size() == frames * lens[l]
     std::vector<int> lens;
     std::vector<int> harms;                   // сколько партиалов в уровне
+    // Derived, not stored in OROWT1: dense versions of small legacy levels.
+    // They preserve the original spectrum but reduce cubic interpolation images.
+    std::vector<std::vector<float>> highDensityLevels;
+    std::vector<int> highDensityLens;
 
     int levelLen (int l) const { return lens[(size_t) l]; }
 };
+
+// Offline-only spectral resampling. Zero padding is scaled to retain the
+// source's amplitude/phase; no peak normalisation or limiter is applied.
+inline std::vector<float> resampleHarmonics (const std::vector<float>& input,
+                                            int frames, int srcLen, int dstLen, int maxHarm)
+{
+    std::vector<float> out ((size_t) frames * (size_t) dstLen, 0.0f);
+    const float scale = (float) dstLen / (float) srcLen;
+    for (int frame = 0; frame < frames; ++frame)
+    {
+        std::vector<std::complex<float>> source ((size_t) srcLen);
+        for (int i = 0; i < srcLen; ++i)
+            source[(size_t) i] = { input[(size_t) frame * (size_t) srcLen + (size_t) i], 0.0f };
+        Fft::forward (source);
+        std::vector<std::complex<float>> dense ((size_t) dstLen);
+        dense[0] = source[0] * scale;
+        for (int k = 1; k <= maxHarm; ++k)
+        {
+            dense[(size_t) k] = source[(size_t) k] * scale;
+            dense[(size_t) (dstLen - k)] = source[(size_t) (srcLen - k)] * scale;
+        }
+        Fft::inverse (dense);
+        for (int i = 0; i < dstLen; ++i)
+            out[(size_t) frame * (size_t) dstLen + (size_t) i] = dense[(size_t) i].real();
+    }
+    return out;
+}
+
+// Достраиваем безопасные уровни с 3, 2, 1 партиалами из прежнего уровня 4.
+// Тихая основная гармоника формантов не нормируется в громкий синус.
+inline void appendLowHarmonicLevels (Wavetable& wt)
+{
+    if (wt.levels.size() != (size_t) kWtLegacyLevels
+        || wt.lens.size() != wt.levels.size() || wt.harms.size() != wt.levels.size()
+        || wt.frames < 1) return;
+    const int len = wt.lens.back();
+    if (len < 8 || (len & (len - 1)) != 0 || wt.harms.back() != 4
+        || wt.levels.back().size() != (size_t) wt.frames * (size_t) len) return;
+    const auto last = wt.levels.back();
+    const int denseLen = std::max (256, len);
+    for (int maxHarm : { 3, 2, 1 })
+    {
+        auto out = resampleHarmonics (last, wt.frames, len, denseLen, maxHarm);
+        wt.harms.push_back (maxHarm);
+        wt.lens.push_back (denseLen);
+        wt.levels.push_back (std::move (out));
+    }
+}
+
+// At the upper end of the keyboard, even a band-limited 32–64 sample table
+// produces audible cubic-interpolation images. Keep the original 25 levels
+// byte-for-byte intact and derive longer representations during build/load.
+inline void buildHighDensityLevels (Wavetable& wt)
+{
+    const size_t count = std::min ({ (size_t) kWtLegacyLevels, wt.levels.size(), wt.lens.size(), wt.harms.size() });
+    wt.highDensityLevels.clear(); wt.highDensityLevels.resize (count);
+    wt.highDensityLens.assign (count, 0);
+    if (wt.frames < 1) return;
+    for (size_t i = 0; i < count; ++i)
+    {
+        const int len = wt.lens[i], harm = wt.harms[i];
+        if (harm < 1 || harm > 8 || len < 8 || len >= 256 || (len & (len - 1)) != 0
+            || harm >= len / 2 || wt.levels[i].size() != (size_t) wt.frames * (size_t) len) continue;
+        wt.highDensityLevels[i] = resampleHarmonics (wt.levels[i], wt.frames, len, 256, harm);
+        wt.highDensityLens[i] = 256;
+    }
+}
 
 // Строим все уровни одной таблицы.
 // taperTop: доля верхних партиалов, гасимая косинусной «шторкой» (0.2 = 20 %).
@@ -221,9 +297,9 @@ inline Wavetable buildTable (TableKind kind, int frames = 6, float taperTop = 0.
     Wavetable wt;
     wt.name   = tableKindName (kind);
     wt.frames = frames;
-    wt.levels.resize ((size_t) kWtLevels);
-    wt.lens.resize   ((size_t) kWtLevels);
-    wt.harms.resize  ((size_t) kWtLevels);
+    wt.levels.resize ((size_t) kWtLegacyLevels);
+    wt.lens.resize   ((size_t) kWtLegacyLevels);
+    wt.harms.resize  ((size_t) kWtLegacyLevels);
 
     // фазы партиалов: детерминированные, одинаковые для всех кадров и уровней.
     // Нужны, чтобы кадры морфились согласованно (иначе позиция «плывёт» по фазе),
@@ -236,7 +312,7 @@ inline Wavetable buildTable (TableKind kind, int frames = 6, float taperTop = 0.
 
     std::vector<float> amps ((size_t) kWtMaxHarm);
 
-    for (int l = 0; l < kWtLevels; ++l)
+    for (int l = 0; l < kWtLegacyLevels; ++l)
     {
         const int maxHarm = levelMaxHarm (l);              // партиалы этого уровня
         const int len     = nextPow2 (maxHarm * kWtLenMult);   // степень двойки -> маска
@@ -278,6 +354,8 @@ inline Wavetable buildTable (TableKind kind, int frames = 6, float taperTop = 0.
             for (int i = 0; i < len; ++i) dst[i] = spec[(size_t) i].real() * g;
         }
     }
+    appendLowHarmonicLevels (wt);
+    buildHighDensityLevels (wt);
     return wt;
 }
 
@@ -331,36 +409,62 @@ public:
     {
         FILE* f = std::fopen (path.c_str(), "rb");
         if (! f) return false;
+        const auto fail = [f]() { std::fclose (f); return false; };
+        if (std::fseek (f, 0, SEEK_END) != 0) return fail();
+        const long length = std::ftell (f);
+        if (length < 10 || std::fseek (f, 0, SEEK_SET) != 0) return fail();
+        size_t remaining = (size_t) length;
+        const auto read = [f, &remaining] (void* dst, size_t n)
+        {
+            if (n > remaining || std::fread (dst, 1, n, f) != n) return false;
+            remaining -= n;
+            return true;
+        };
         char magic[6] = {};
-        if (std::fread (magic, 1, 6, f) != 6 || std::memcmp (magic, "OROWT1", 6) != 0)
-        { std::fclose (f); return false; }
-
         uint32_t nt = 0;
-        if (std::fread (&nt, 4, 1, f) != 1) { std::fclose (f); return false; }
-        tables.assign (nt, {});
-        for (auto& t : tables)
+        if (! read (magic, 6) || std::memcmp (magic, "OROWT1", 6) != 0
+            || ! read (&nt, sizeof (nt)) || nt > 64) return fail();
+
+        // Ограничиваем размеры и проверяем каждый read ДО выделения памяти.
+        // Ошибка не заменяет существующий банк частично загруженным.
+        std::vector<Wavetable> loaded ((size_t) nt);
+        size_t totalSamples = 0;
+        constexpr size_t maxSamples = 16u * 1024u * 1024u; // 64 MiB float data
+        for (auto& t : loaded)
         {
             uint32_t nf = 0, nl = 0;
-            std::fread (&nf, 4, 1, f);
-            std::fread (&nl, 4, 1, f);
+            if (! read (&nf, sizeof (nf)) || ! read (&nl, sizeof (nl))
+                || nf == 0 || nf > 64 || nl == 0 || nl > 64) return fail();
             t.frames = (int) nf;
             t.lens.resize (nl); t.harms.resize (nl); t.levels.resize (nl);
+            uint32_t previousHarm = 0xffffffffu;
             for (uint32_t l = 0; l < nl; ++l)
             {
                 uint32_t len = 0, hm = 0;
-                std::fread (&hm, 4, 1, f);
-                std::fread (&len, 4, 1, f);
-                t.harms[l] = (int) hm;
-                t.lens[l]  = (int) len;
-                t.levels[l].resize ((size_t) nf * len);
-                std::fread (t.levels[l].data(), sizeof (float), (size_t) nf * len, f);
+                if (! read (&hm, sizeof (hm)) || ! read (&len, sizeof (len))
+                    || len < 8 || len > 65536 || (len & (len - 1)) != 0
+                    || hm == 0 || hm > len / 2 || hm > previousHarm) return fail();
+                previousHarm = hm;
+                const size_t samples = (size_t) nf * (size_t) len;
+                if (samples > maxSamples - totalSamples || samples > remaining / sizeof (float)) return fail();
+                totalSamples += samples;
+                t.harms[l] = (int) hm; t.lens[l] = (int) len;
+                t.levels[l].resize (samples);
+                if (! read (t.levels[l].data(), samples * sizeof (float))) return fail();
+                for (float value : t.levels[l]) if (! std::isfinite (value)) return fail();
             }
             uint32_t nameLen = 0;
-            std::fread (&nameLen, 4, 1, f);
+            if (! read (&nameLen, sizeof (nameLen)) || nameLen > 4096 || nameLen > remaining) return fail();
             t.name.resize (nameLen);
-            std::fread (t.name.data(), 1, nameLen, f);
+            if (! read (t.name.data(), nameLen)) return fail();
+            // Старые банки получают новые низкочастичные уровни без изменений
+            // первых 25; плотные уровни восстанавливаются, а не сериализуются.
+            appendLowHarmonicLevels (t);
+            buildHighDensityLevels (t);
         }
-        std::fclose (f);
+        if (remaining != 0) return fail();
+        if (std::fclose (f) != 0) return false;
+        tables = std::move (loaded);
         return true;
     }
 };

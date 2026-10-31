@@ -66,7 +66,9 @@ static void testHostedGuiGestures (AudioPluginFormat& format, const PluginDescri
     const auto flushDisplay = reinterpret_cast<int (*) (void*)> (x11.getFunction ("XFlush"));
     const auto move = reinterpret_cast<int (*) (void*, int, int, int, unsigned long)> (xtest.getFunction ("XTestFakeMotionEvent"));
     const auto button = reinterpret_cast<int (*) (void*, unsigned int, int, unsigned long)> (xtest.getFunction ("XTestFakeButtonEvent"));
-    if (openDisplay == nullptr || closeDisplay == nullptr || flushDisplay == nullptr || move == nullptr || button == nullptr)
+    const auto key = reinterpret_cast<int (*) (void*, unsigned int, int, unsigned long)> (xtest.getFunction ("XTestFakeKeyEvent"));
+    const auto keycode = reinterpret_cast<unsigned char (*) (void*, unsigned long)> (x11.getFunction ("XKeysymToKeycode"));
+    if (openDisplay == nullptr || closeDisplay == nullptr || flushDisplay == nullptr || move == nullptr || button == nullptr || key == nullptr || keycode == nullptr)
     { check (false, "XTEST: функции X11 доступны"); return; }
     void* display = openDisplay (nullptr);
     if (display == nullptr) { check (false, "XTEST: открыт X11 display"); return; }
@@ -103,6 +105,28 @@ static void testHostedGuiGestures (AudioPluginFormat& format, const PluginDescri
             check (morph.balanced() && glide.balanced(),
                    "VST3 передаёт хосту begin/value/end для Morph/Glide на VectorPad",
                    morph.info() + " / " + glide.info());
+        }
+        // Real VST3 edit callback for the new SOURCE selector: open the
+        // combo and use Down/Enter, like a keyboard-accessible DAW session.
+        {
+            auto* table = findParam ("sA_Table");
+            if (table != nullptr) table->setValueNotifyingHost (0.0f);
+            mm->runDispatchLoopUntil (150);
+            HostGestureTrace source (table);
+            const auto pt = editor->localPointToGlobal (Point<int> (665, 102));
+            move (display, -1, pt.x, pt.y, 0); flushDisplay (display); mm->runDispatchLoopUntil (100);
+            button (display, 1, 1, 0); flushDisplay (display); mm->runDispatchLoopUntil (100);
+            button (display, 1, 0, 0); flushDisplay (display); mm->runDispatchLoopUntil (300);
+            const auto sendKey = [&] (unsigned long symbol) {
+                const auto code = keycode (display, symbol);
+                key (display, code, 1, 0); flushDisplay (display); mm->runDispatchLoopUntil (100);
+                key (display, code, 0, 0); flushDisplay (display); mm->runDispatchLoopUntil (150);
+            };
+            sendKey (0xff54UL); // Down
+            sendKey (0xff0dUL); // Return
+            check (source.balanced() && table->getValue() > 0.01f,
+                   "VST3 SOURCE: выбор таблицы передаёт хосту begin/value/end",
+                   source.info() + " / " + String (table != nullptr ? table->getValue() : -1.0f, 3));
         }
         // The separate rack is tested through the hosted VST3, not through
         // internal OrogenEditor helpers: X11 -> VST3 edit callbacks -> host.

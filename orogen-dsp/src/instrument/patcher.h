@@ -72,7 +72,10 @@ struct EngineBank
     {
         double b = (double) rs.bytes();
         for (const auto& t : wt.tables)
+        {
             for (const auto& lv : t.levels) b += (double) lv.size() * sizeof (float);
+            for (const auto& lv : t.highDensityLevels) b += (double) lv.size() * sizeof (float);
+        }
         for (const auto& s : smp.shots)
             for (const auto& lv : s.levels) b += (double) lv.size() * sizeof (float);
         for (const auto& l : loops.loops)

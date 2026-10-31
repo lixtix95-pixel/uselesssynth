@@ -6,7 +6,7 @@ INC      := -Isrc
 # файлы копируются без правок)
 MONOJUICE_OBJ := build/monojuice_chorus.o build/monojuice_adapter.o
 
-TEST_BINS := build/test_wavetable build/test_fm build/test_harmonic build/test_sample \
+TEST_BINS := build/test_wavetable build/test_wavetable_safety build/test_fm build/test_harmonic build/test_sample \
              build/test_granular build/test_granular_reverse build/test_granular_envelope build/test_granular_streams build/test_granular_randomness build/test_vocal_vibrato build/test_granular_vocal \
              build/test_modal build/test_resynth build/test_organics \
              build/test_instrument build/test_engine_handoff build/test_meters build/test_fx build/test_fx_bypass build/test_fx_extra build/test_fx_monohuice build/test_fx_dynamic build/test_fx_rack_handoff build/test_chop
@@ -19,6 +19,18 @@ all: $(TEST_BINS) $(DEMO_BINS)
 build/test_wavetable: tests/test_wavetable.cpp src/engines/wavetable.h src/engines/halfband.h src/content/wavetable_bank.h src/core/*.h
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(INC) tests/test_wavetable.cpp -o $@
+
+build/test_wavetable_safety: tests/test_wavetable_safety.cpp src/engines/wavetable.h src/engines/halfband.h src/content/wavetable_bank.h src/core/*.h
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) $(INC) tests/test_wavetable_safety.cpp -o $@
+
+build/test_wavetable_safety_asan: tests/test_wavetable_safety.cpp src/engines/wavetable.h src/engines/halfband.h src/content/wavetable_bank.h src/core/*.h
+	@mkdir -p build
+	$(CXX) -O1 -g1 -std=c++17 -fsanitize=address,undefined -fno-omit-frame-pointer $(INC) tests/test_wavetable_safety.cpp -o $@
+
+.PHONY: asan-wavetable
+asan-wavetable: build/test_wavetable_safety_asan
+	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 ./build/test_wavetable_safety_asan
 
 build/test_fm: tests/test_fm.cpp tests/engine_suite.h src/engines/fm.h src/engines/engine.h src/core/*.h
 	@mkdir -p build
@@ -296,6 +308,9 @@ build/render_demo_sample: tools/render_demo_sample.cpp src/engines/sample.h src/
 build/render_demo: tools/render_demo.cpp src/engines/wavetable.h src/engines/halfband.h src/content/wavetable_bank.h src/core/*.h
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(INC) tools/render_demo.cpp -o $@
+
+.PHONY: test-build
+test-build: $(TEST_BINS)
 
 test: $(TEST_BINS)
 	@set -e; for t in $(TEST_BINS); do echo "== $$t"; ./$$t; done

@@ -46,6 +46,40 @@ namespace
     constexpr int kChipTotal = (int) (sizeof (kChips) / sizeof (kChips[0]));
     constexpr int kChipsPerPage = 5;
 
+    // Списки отражают те же данные/индексы, что читают движки в prepare().
+    // Число автоматизируемых значений table остаётся 8 даже у CHOP.
+    int sourceCountForEngine (int type) noexcept
+    {
+        switch ((EngineType) type)
+        {
+            case EngineType::FM: case EngineType::Harmonic: return 0;
+            case EngineType::Chop: return (int) LoopKind::Count;
+            case EngineType::Wavetable: case EngineType::Sample: case EngineType::Granular:
+            case EngineType::Modal: case EngineType::Resynth: case EngineType::Organics: return 8;
+            default: return 0;
+        }
+    }
+
+    const char* sourceNameForEngine (int type, int index) noexcept
+    {
+        if (index < 0 || index >= sourceCountForEngine (type)) return "";
+        switch ((EngineType) type)
+        {
+            case EngineType::Wavetable: return tableKindName ((TableKind) index);
+            case EngineType::Sample: case EngineType::Granular:
+            case EngineType::Resynth: case EngineType::Organics: return oneShotName ((OneShotKind) index);
+            case EngineType::Modal:
+            {
+                // Эти названия соответствуют восьми наборам kRatios modal.h.
+                static constexpr const char* names[] = { "Bronze Bell", "Glass", "Wood", "Steel",
+                                                         "Membrane", "Ceramic", "Stone", "Ice" };
+                return names[index];
+            }
+            case EngineType::Chop: return loopName ((LoopKind) index);
+            default: return "";
+        }
+    }
+
     int chipModule (int index)
     {
         if (index < 0 || index >= kChipTotal) return -1;
@@ -1685,6 +1719,7 @@ private:
                 changed[(size_t) s] = type != engineTypes[(size_t) s];
                 engineTypes[(size_t) s] = type;
             }
+            if (std::none_of (changed.begin(), changed.end(), [] (bool b) { return b; })) return;
             for (auto& e : entries)
             {
                 if (e.slot < 0 || ! changed[(size_t) e.slot] || e.ctl == nullptr) continue;
@@ -2136,6 +2171,16 @@ void OrogenEditor::buildCentre()
     addAndMakeVisible (filterBox);
     engineBox.setTooltip ("Engine type of the selected slot (sA_type ... sH_type)");
     filterBox.setTooltip ("Filter model of the selected slot (sA_filter ... sH_filter)");
+    addAndMakeVisible (sourceBox);
+    sourceBox.setName ("Source for selected slot");
+    sourceBox.setTextWhenNothingSelected ("NO SOURCE NEEDED");
+    sourceBox.setTooltip ("Select the selected slot's table, source, material or loop. FM and Harmonic do not use a source.");
+    sourceBox.onChange = [this]
+    {
+        const int index = sourceBox.getSelectedId() - 1;
+        if (sourceAtt != nullptr && index >= 0 && index < sourceCountForEngine (pi (slotId ("type"))))
+            sourceAtt->setValueAsCompleteGesture ((float) index);
+    };
     engineBox.onChange = [this] { refreshEngineContext(); };
 
     // три ручки центра: параметры зависят от слота → привязываются в selectSlot()
@@ -2334,14 +2379,20 @@ void OrogenEditor::selectSlot (int slot)
 
     engineAtt.reset();
     filterAtt.reset();
-    rebuildPreview (true);          // смена слота — сразу новое превью
+    sourceAtt.reset();
+    if (! paramsOpen && ! fxOpen) rebuildPreview (true);
 
     engineAtt = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (
         proc.apvts, slotId ("type"), engineBox);
     filterAtt = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (
         proc.apvts, slotId ("filter"), filterBox);
+    sourceBox.getProperties().set ("paramId", slotId ("table"));
+    if (auto* parameter = proc.apvts.getParameter (slotId ("table")))
+        sourceAtt = std::make_unique<juce::ParameterAttachment> (*parameter,
+            [this] (float value) { updateSourceSelection (value); });
 
     refreshEngineContext();
+    if (sourceAtt != nullptr) sourceAtt->sendInitialUpdate();
     repaint();
 }
 
@@ -2357,6 +2408,12 @@ void OrogenEditor::refreshEngineContext()
     {
         contextSlot = selectedSlot;
         contextEngine = type;
+        sourceBox.clear (juce::dontSendNotification);
+        const int count = sourceCountForEngine (type);
+        for (int i = 0; i < count; ++i)
+            sourceBox.addItem (juce::String (sourceNameForEngine (type, i)).toUpperCase(), i + 1);
+        sourceBox.setEnabled (count > 0);
+        updateSourceSelection (pv (slotId ("table")));
         if (centreKnobs.size() > 1 && centreBars.size() > 1)
         {
             centreKnobs[1]->slider.setTooltip ("P1: " + selectedMacroLabel (0));
@@ -2366,6 +2423,20 @@ void OrogenEditor::refreshEngineContext()
         repaint (R (568.0f, 88.0f, 280.0f, 24.0f));
     }
     if (paramsPage != nullptr) paramsPage->refreshEngineLabels();
+}
+
+void OrogenEditor::updateSourceSelection (float denormalisedValue)
+{
+    const int count = sourceBox.getNumItems();
+    if (count == 0)
+    {
+        sourceBox.setSelectedId (0, juce::dontSendNotification);
+        return;
+    }
+    // CHOP DSP clamps legacy/host table values 3..7 to loop #3. Display the
+    // effective loop without rewriting the saved/automated host value.
+    const int index = juce::jlimit (0, count - 1, juce::roundToInt (denormalisedValue));
+    sourceBox.setSelectedId (index + 1, juce::dontSendNotification);
 }
 
 void OrogenEditor::setSection (int index)
@@ -2387,6 +2458,7 @@ void OrogenEditor::toggleParamsPage (bool shouldShow)
         if (vectorPad != nullptr) vectorPad->finishGesture();
     }
     paramsOpen = shouldShow;
+    if (! shouldShow && ! fxOpen) rebuildPreview (true);
     if (paramsPage != nullptr)
     {
         paramsPage->setVisible (paramsOpen);
@@ -2404,6 +2476,7 @@ void OrogenEditor::toggleFxPage (bool shouldShow)
         if (vectorPad != nullptr) vectorPad->finishGesture();
     }
     fxOpen = shouldShow;
+    if (! shouldShow && ! paramsOpen) rebuildPreview (true);
     if (fxPage != nullptr)
     {
         fxPage->setVisible (fxOpen);
@@ -2565,6 +2638,7 @@ juce::StringArray OrogenEditor::mainScreenParamIds() const
     for (auto* c : columns) out.addArray (c->allIds());
     for (auto* k : centreKnobs) out.add (k->slider.getProperties().getWithDefault ("paramId", {}).toString());
     for (auto* b : centreBars)  out.add (b->slider.getProperties().getWithDefault ("paramId", {}).toString());
+    out.add (slotId ("type")); out.add (slotId ("filter")); out.add (slotId ("table"));
     out.removeEmptyStrings();
     return out;
 }
@@ -2596,6 +2670,7 @@ void OrogenEditor::resized()
 
     engineBox.setBounds (R (262.0f, 92.0f, 168.0f, 20.0f));
     filterBox.setBounds (R (438.0f, 92.0f, 124.0f, 20.0f));
+    sourceBox.setBounds (R (570.0f, 92.0f, 195.0f, 20.0f));
 
     for (int i = 0; i < centreKnobs.size(); ++i)
     {
@@ -2917,7 +2992,7 @@ void OrogenEditor::timerCallback()
         // S&H при wrap и при смене числа циклов меняет всю кривую. Во всех
         // остальных тиках достаточно двух небольших областей playhead.
         const bool curveChanged = wraps != 0.0 || previousCycles != lfoPreviewCycleCount;
-        repaintAnimated (previousHead, curveChanged);
+        if (! paramsOpen && ! fxOpen) repaintAnimated (previousHead, curveChanged);
     }
 
     const auto revision = proc.engine().meterRevision();
@@ -2959,8 +3034,11 @@ void OrogenEditor::timerCallback()
 
     // Забираем только результат последней подписи; обновление области дисплея
     // происходит отдельно от 14 % постоянно анимируемых зон.
-    rebuildPreview (false);
-    takePreviewResult();
+    if (! paramsOpen && ! fxOpen)
+    {
+        rebuildPreview (false);
+        takePreviewResult();
+    }
 
     // программа могла смениться извне (хост, MIDI program change) — держим
     // селектор в шапке синхронным с банком
@@ -3200,8 +3278,9 @@ void OrogenEditor::paintDisplay (juce::Graphics& g)
                    Palette::textFaint, 6.0f);
     draw::caption (g, "filter", { (int) area.getX() + 190, (int) area.getY() + 18, 100, 10 },
                    Palette::textFaint, 6.0f);
+    draw::caption (g, "source", { 570, 84, 195, 10 }, Palette::textFaint, 6.0f);
     draw::caption (g, "drag x: " + selectedMacroLabel (0) + " / y: " + selectedMacroLabel (1),
-                   { 578, 96, 258, 10 }, Palette::textFaint, 5.8f);
+                   { 775, 84, 195, 10 }, Palette::textFaint, 5.8f);
     // Не новый контрол: статус уже существующего параметра выбранного слота.
     // Видно и при выключенном слоте; изменение из PARAMS/хоста обновляется
     // даже без включённых анимаций.

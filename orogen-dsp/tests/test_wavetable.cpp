@@ -112,7 +112,7 @@ int main()
     check (bank.tables.size() == 8, "8 таблиц в банке");
 
     // пик каждого кадра должен быть в допуске (нормализация)
-    double worstPeak = 0.0;
+    double worstPeak = 0.0, lowHarmPeak = 0.0;
     for (const auto& t : bank.tables)
         for (size_t l = 0; l < t.levels.size(); ++l)
         {
@@ -122,11 +122,15 @@ int main()
                 const float* d = t.levels[l].data() + (size_t) f * len;
                 float pk = 0.0f;
                 for (int i = 0; i < len; ++i) pk = std::max (pk, std::fabs (d[i]));
-                worstPeak = std::max (worstPeak, (double) pk);
+                if (l < (size_t) kWtLegacyLevels) worstPeak = std::max (worstPeak, (double) pk);
+                else lowHarmPeak = std::max (lowHarmPeak, (double) pk);
             }
         }
     check (worstPeak > 0.9 && worstPeak < 1.001, "кадры нормализованы (peak ≈ 0.98)",
            "max peak = " + std::to_string (worstPeak).substr (0, 5));
+    check (std::isfinite (lowHarmPeak) && lowHarmPeak < 1.3,
+           "дополнительные уровни без новой нормализации остаются конечными",
+           "raw max peak = " + std::to_string (lowHarmPeak).substr (0, 6));
 
     // ---------------------------------------------------------------- 2. сериализация
     std::printf ("\n2. Сериализация .orowt\n");

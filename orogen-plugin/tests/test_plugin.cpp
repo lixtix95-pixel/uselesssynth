@@ -27,6 +27,7 @@ static void crashTrace (int sig)
 }
 #include <algorithm>
 #include <cmath>
+#include <ctime>
 #include <functional>
 #include <vector>
 
@@ -1455,6 +1456,62 @@ public:
     long long pixels = 0;
 };
 
+// Process CPU includes the preview worker.  Keep this opt-in and run it without
+// a concurrent compile so before/after comparisons describe the same workload.
+class UiPerfProbe : public OrogenEditor
+{
+public:
+    explicit UiPerfProbe (OrogenProcessor& p) : OrogenEditor (p) {}
+    void paint (juce::Graphics& g) override
+    {
+        if (recording) ++parentPaints;
+        OrogenEditor::paint (g);
+    }
+    bool recording = false;
+    int parentPaints = 0;
+};
+
+static void testUiPerformance()
+{
+   #if JUCE_LINUX || JUCE_BSD
+    std::printf ("\n--- GUI: process CPU, 1280x800, automation 20 Hz ---\n");
+    OrogenProcessor p; p.setCurrentProgram (0);
+    p.setPlayConfigDetails (0, 2, 48000.0, 128); p.prepareToPlay (48000.0, 128);
+    UiPerfProbe editor (p); editor.setSize (1280, 800);
+    editor.addToDesktop (0); editor.setTopLeftPosition (0, 0); editor.setVisible (true);
+    auto* mm = juce::MessageManager::getInstance();
+    mm->runDispatchLoopUntil (1500);
+    auto trial = [&] (const char* label, bool automation)
+    {
+        editor.parentPaints = 0; editor.recording = true;
+        const auto cpu = std::clock();
+        const double wall = juce::Time::getMillisecondCounterHiRes();
+        for (int i = 0; i < 32; ++i)
+        {
+            if (automation) setP (p, "sA_p0", (i & 1) ? 0.8f : 0.2f);
+            mm->runDispatchLoopUntil (50);
+        }
+        const double elapsed = juce::Time::getMillisecondCounterHiRes() - wall;
+        const double cpuMs = 1000.0 * (double) (std::clock() - cpu) / CLOCKS_PER_SEC;
+        editor.recording = false;
+        std::printf ("   %-16s wall %.0f ms process CPU %.1f ms / %.2f%%, parent paint %d\n",
+                     label, elapsed, cpuMs, 100.0 * cpuMs / elapsed, editor.parentPaints);
+    };
+    trial ("main idle", false);
+    trial ("main automated", true);
+    editor.showPage (50); mm->runDispatchLoopUntil (500);
+    check (editor.fxOverlay() != nullptr && editor.fxOverlay()->isVisible(), "FX page open for GUI CPU probe");
+    trial ("FX idle", false); trial ("FX automated", true);
+    editor.showPage (100); mm->runDispatchLoopUntil (500);
+    check (editor.paramsOverlay() != nullptr && editor.paramsOverlay()->isVisible(), "PARAMS page open for GUI CPU probe");
+    trial ("PARAMS idle", false); trial ("PARAMS automated", true);
+    editor.keyPressed (juce::KeyPress (juce::KeyPress::escapeKey));
+    mm->runDispatchLoopUntil (400);
+    check (! editor.paramsOverlay()->isVisible(), "main page restored after GUI CPU probe");
+    editor.removeFromDesktop(); p.releaseResources();
+   #endif
+}
+
 static void testNativeMeterPaint()
 {
    #if JUCE_LINUX || JUCE_BSD
@@ -2027,6 +2084,274 @@ struct GestureTrace : juce::AudioProcessorParameter::Listener
     }
 };
 
+// Named source choices retain the existing sX_table IDs and stepped-float
+// automation; CHOP intentionally uses 0/1/2 instead of scaling 3 UI entries
+// across the 0..7 host range.
+static void testSourcePicker()
+{
+    std::printf ("\n--- GUI: именованные источники, слоты и автоматизация ---\n");
+    OrogenProcessor p; p.setCurrentProgram (0);
+    OrogenEditor editor (p); editor.setSize (1280, 800); editor.setAnimationsEnabled (false);
+    auto* mm = juce::MessageManager::getInstance();
+    juce::ComboBox* source = nullptr;
+    for (auto* c : editor.getChildren())
+        if (auto* b = dynamic_cast<juce::ComboBox*> (c))
+            if (b->getName() == "Source for selected slot") source = b;
+    check (source != nullptr, "на главном экране есть селектор источника");
+    if (source == nullptr) return;
+    const char* modal[] = { "Bronze Bell", "Glass", "Wood", "Steel", "Membrane", "Ceramic", "Stone", "Ice" };
+    int disabled = 0, lists = 0, names = 0, choices = 0, isolated = 0, patches = 0, gestures = 0, hostChanges = 0;
+    for (int slot = 0; slot < 8; ++slot)
+    {
+        editor.showPage (slot);
+        const auto id = slotPrefix (slot) + "table";
+        GestureTrace trace (p, id);
+        for (int type = 0; type < 9; ++type)
+        {
+            setP (p, slotPrefix (slot) + "type", (float) type);
+            mm->runDispatchLoopUntil (60); // message thread also covers host type automation
+            const int count = type == 1 || type == 2 ? 0 : type == 8 ? 3 : 8;
+            if (source->getNumItems() == count && source->isEnabled() == (count > 0)) ++lists;
+            if (count == 0)
+            {
+                setP (p, id, 7.0f);
+                if (! source->isEnabled() && editor.selectedSourceLabel() == "NO TABLE"
+                    && p.apvts.getRawParameterValue (id)->load() == 7.0f) ++disabled;
+                continue;
+            }
+            for (int target = 0; target < count; ++target)
+            {
+                juce::String expected;
+                if (type == 0) expected = tableKindName ((TableKind) target);
+                else if (type == 5) expected = modal[target];
+                else if (type == 8) expected = loopName ((LoopKind) target);
+                else expected = oneShotName ((OneShotKind) target);
+                if (source->getItemText (target) == expected.toUpperCase()) ++names;
+                setP (p, id, (float) ((target + 1) % count));
+                std::array<float, 8> before {};
+                for (int s = 0; s < 8; ++s) before[(size_t) s] = p.apvts.getRawParameterValue (slotPrefix (s) + "table")->load();
+                trace.clear();
+                source->setSelectedId (target + 1, juce::sendNotificationSync);
+                const int value = juce::roundToInt (p.apvts.getRawParameterValue (id)->load());
+                if (value == target && source->getSelectedId() == target + 1) ++choices;
+                bool others = true;
+                for (int s = 0; s < 8; ++s) if (s != slot)
+                    others &= p.apvts.getRawParameterValue (slotPrefix (s) + "table")->load() == before[(size_t) s];
+                if (others) ++isolated;
+                Patch patch; FxChain::Settings fx; p.collectPatch (patch, fx);
+                if (patch.slots[(size_t) slot].params.table == target) ++patches;
+                if (trace.balanced()) ++gestures;
+            }
+            if (type == 8)
+            {
+                setP (p, id, 7.0f);  // старый проект: движок ограничивает 3..7 до последнего лупа
+                const bool preserved = source->getSelectedId() == 3 && source->getText() == "DUB STABS"
+                                    && p.apvts.getRawParameterValue (id)->load() == 7.0f;
+                check (preserved, "CHOP отображает последний луп, не переписывая старое значение 7", id);
+            }
+        }
+        setP (p, slotPrefix (slot) + "type", 0.0f);
+        mm->runDispatchLoopUntil (60);
+        if (auto* parameter = p.apvts.getParameter (id))
+        {
+            std::thread host ([parameter, slot] { parameter->setValueNotifyingHost (parameter->convertTo0to1 ((float) slot)); });
+            host.join();
+            mm->runDispatchLoopUntil (80);
+            if (source->getSelectedId() == slot + 1 && source->getText() == juce::String (tableKindName ((TableKind) slot)).toUpperCase()) ++hostChanges;
+        }
+    }
+    const int expectedChoices = 8 * (6 * 8 + 3);
+    std::printf ("   списки %d/72, названия %d/%d, выбор %d/%d, изоляция %d/%d, Patch %d/%d, жесты %d/%d, host→GUI %d/8\n",
+                 lists, names, expectedChoices, choices, expectedChoices, isolated, expectedChoices,
+                 patches, expectedChoices, gestures, expectedChoices, hostChanges);
+    check (lists == 72 && disabled == 16, "9 контекстов на A–H; FM/Harmonic не предлагают фиктивный источник");
+    check (names == expectedChoices && choices == expectedChoices && isolated == expectedChoices && patches == expectedChoices,
+           "реальные имена источников и индексы выбираются независимо в каждом слоте");
+    check (gestures == expectedChoices && hostChanges == 8,
+           "каждый выбор шлёт полный host gesture; автоматизация обновляет GUI из другого потока");
+    // A Component must be visible for JUCE's hit-test; a desktop peer is not
+    // needed for this geometry check (the separate XTEST exercises the peer).
+    editor.setVisible (true);
+    int sizes = 0;
+    for (const int width : { 960, 1280, 1600 })
+    {
+        editor.setSize (width, width * 5 / 8);
+        const auto centre = source->getBounds().getCentre();
+        auto* hit = editor.getComponentAt (centre); // ComboBox may return its internal Label
+        if ((hit == source || (hit != nullptr && source->isParentOf (hit)))
+            && editor.getLocalBounds().contains (source->getBounds())) ++sizes;
+    }
+    check (sizes == 3 && editor.mainScreenParamIds().contains ("sH_table"),
+           "селектор кликабелен на трёх масштабах и привязан к выбранному слоту", juce::String (sizes) + "/3");
+    juce::MemoryBlock state; p.getStateInformation (state);
+    OrogenProcessor restored; restored.setStateInformation (state.getData(), (int) state.getSize());
+    int saved = 0;
+    for (int slot = 0; slot < 8; ++slot)
+        if (restored.apvts.getRawParameterValue (slotPrefix (slot) + "table")->load()
+            == p.apvts.getRawParameterValue (slotPrefix (slot) + "table")->load()) ++saved;
+    check (saved == 8, "все восемь источников сохраняются через прежние host ID", juce::String (saved) + "/8");
+}
+
+static void testHiddenPreviewResume()
+{
+    std::printf ("\n--- GUI: скрытое превью и возврат из FX/PARAMS ---\n");
+    OrogenProcessor p; p.setCurrentProgram (0);
+    OrogenEditor editor (p); editor.setAnimationsEnabled (false);
+    auto* mm = juce::MessageManager::getInstance();
+    for (int s = 0; s < 8; ++s) setP (p, slotPrefix (s) + "on", s == 0 ? 1.0f : 0.0f);
+    setP (p, "sA_type", 0.0f); setP (p, "sA_table", 0.0f); setP (p, "sA_p0", 0.1f);
+    editor.rebuildPreview (true); const bool initial = editor.waitForPreview (15000);
+    const auto a = editor.previewWave();
+    editor.showPage (50); setP (p, "sA_table", 7.0f); setP (p, "sA_p0", 0.9f);
+    mm->runDispatchLoopUntil (250);
+    const bool fxHidden = editor.previewWave() == a && ! editor.isPreviewPending();
+    editor.keyPressed (juce::KeyPress (juce::KeyPress::escapeKey));
+    const bool fxReady = editor.waitForPreview (15000);
+    const auto b = editor.previewWave();
+    editor.showPage (100); setP (p, "sA_table", 1.0f); setP (p, "sA_p0", 0.4f);
+    mm->runDispatchLoopUntil (250);
+    const bool paramsHidden = editor.previewWave() == b && ! editor.isPreviewPending();
+    editor.keyPressed (juce::KeyPress (juce::KeyPress::escapeKey));
+    const bool paramsReady = editor.waitForPreview (15000);
+    const auto c = editor.previewWave();
+    auto delta = [] (const std::vector<float>& x, const std::vector<float>& y) {
+        if (x.empty() || x.size() != y.size()) return 0.0;
+        double s = 0.0; for (size_t i = 0; i < x.size(); ++i) { const double d = x[i] - y[i]; s += d*d; }
+        return std::sqrt (s / x.size());
+    };
+    const double d1 = delta (a, b), d2 = delta (b, c);
+    std::printf ("   hidden FX/PARAMS %d/%d, resume ΔRMS %.8f / %.8f\n", (int) fxHidden, (int) paramsHidden, d1, d2);
+    check (initial && fxReady && paramsReady && fxHidden && paramsHidden,
+           "перекрытый осциллограф не рендерится при автоматизации");
+    check (d1 > 0.001 && d2 > 0.001, "после закрытия показан актуальный звук, а не устаревшая форма");
+}
+
+// A menu choice must reach an already-held note, not only the Patch snapshot.
+static void testSourcePickerAudio()
+{
+    std::printf ("\n--- GUI source -> real AudioProcessor (held note) ---\n");
+    OrogenProcessor changed, reference;
+    for (auto* p : { &changed, &reference })
+    {
+        p->setPlayConfigDetails (0, 2, 48000.0, 128); p->prepareToPlay (48000.0, 128);
+        p->setCurrentProgram (0); soloSlot (*p, 0, (int) EngineType::Wavetable);
+        setP (*p, "sA_table", 0.0f); setP (*p, "sA_attack", .001f);
+        setP (*p, "sA_sustain", 1.0f); setP (*p, "sA_detune", 0.0f);
+        setP (*p, "sA_p0", .6f); setP (*p, "sA_p1", 0.0f); setP (*p, "sA_p2", 0.0f); setP (*p, "sA_p3", .3f);
+        setP (*p, "gl_gain", .7f); setP (*p, "gl_master", .8f);
+    }
+    OrogenEditor editor (changed); editor.setAnimationsEnabled (false); editor.showPage (0);
+    juce::ComboBox* source = nullptr;
+    for (auto* c : editor.getChildren()) if (auto* b = dynamic_cast<juce::ComboBox*> (c))
+        if (b->getName() == "Source for selected slot") source = b;
+    juce::MessageManager::getInstance()->runDispatchLoopUntil (200);
+    GestureTrace trace (changed, "sA_table");
+    juce::AudioBuffer<float> x (2, 128), y (2, 128); juce::MidiBuffer firstX, firstY, noneX, noneY;
+    firstX.addEvent (juce::MidiMessage::noteOn (1, 60, .8f), 0);
+    firstY.addEvent (juce::MidiMessage::noteOn (1, 60, .8f), 0);
+    double before=0.0, after=0.0, ref=0.0; int beforeCount=0, afterCount=0, bad=0;
+    for (int block=0;block<300;++block)
+    {
+        if (block==100 && source != nullptr) source->setSelectedId (8, juce::sendNotificationSync);
+        x.clear(); y.clear(); changed.processBlock (x, block==0 ? firstX : noneX); reference.processBlock (y, block==0 ? firstY : noneY);
+        for (int ch=0;ch<2;++ch) for (int i=0;i<128;++i)
+        {
+            const double a=x.getSample(ch,i),b=y.getSample(ch,i),d=a-b;
+            if (!std::isfinite(a)||!std::isfinite(b))++bad;
+            if (block>=20&&block<100) {before+=d*d;++beforeCount;}
+            if (block>=120) {after+=d*d;ref+=b*b;++afterCount;}
+        }
+    }
+    const double prior=std::sqrt(before/std::max(1,beforeCount));
+    const double delta=std::sqrt(after/std::max(1,afterCount)), level=std::sqrt(ref/std::max(1,afterCount));
+    std::printf ("   before ΔRMS %.9f, after ΔRMS %.9f, ref %.6f, nonfinite %d\n", prior, delta, level, bad);
+    check (source && trace.balanced() && bad==0 && prior<1.e-7 && level>.001 && delta>.001,
+           "выбор таблицы в GUI меняет удержанную ноту через AudioProcessor с host gesture");
+    changed.releaseResources(); reference.releaseResources();
+}
+
+static void testNativeSourceMenu (bool force = false)
+{
+   #if JUCE_LINUX
+    if (! force && std::getenv ("OROGEN_GUI_XTEST") == nullptr) return;
+    std::printf ("\n--- X11: реальные клики по меню источников A–H ---\n");
+    juce::DynamicLibrary x11, xtest;
+    if (! x11.open ("libX11.so.6") || ! xtest.open ("libXtst.so.6")) { check (false, "libX11 и libXtst"); return; }
+    const auto open = reinterpret_cast<void* (*) (const char*)> (x11.getFunction ("XOpenDisplay"));
+    const auto close = reinterpret_cast<int (*) (void*)> (x11.getFunction ("XCloseDisplay"));
+    const auto sync = reinterpret_cast<int (*) (void*, int)> (x11.getFunction ("XSync"));
+    const auto move = reinterpret_cast<int (*) (void*, int, int, int, unsigned long)> (xtest.getFunction ("XTestFakeMotionEvent"));
+    const auto button = reinterpret_cast<int (*) (void*, unsigned int, int, unsigned long)> (xtest.getFunction ("XTestFakeButtonEvent"));
+    if (! open || ! close || ! sync || ! move || ! button) { check (false, "XTEST symbols"); return; }
+    void* dpy = open (nullptr); if (! dpy) { check (false, "XTEST display"); return; }
+    {
+        OrogenProcessor p; p.setCurrentProgram (0);
+        OrogenEditor editor (p); editor.setAnimationsEnabled (false);
+        editor.addToDesktop (0); editor.setTopLeftPosition (0, 0); editor.setVisible (true);
+        auto* mm = juce::MessageManager::getInstance(); mm->runDispatchLoopUntil (600);
+        juce::ComboBox* source = nullptr;
+        for (auto* c : editor.getChildren()) if (auto* b = dynamic_cast<juce::ComboBox*> (c))
+            if (b->getName() == "Source for selected slot") source = b;
+        auto click = [&] (juce::Point<int> pt, int settle) {
+            move (dpy, -1, pt.x, pt.y, 0); sync (dpy, 0); mm->runDispatchLoopUntil (45);
+            button (dpy, 1, 1, 0); sync (dpy, 0); mm->runDispatchLoopUntil (55);
+            button (dpy, 1, 0, 0); sync (dpy, 0); move (dpy, -1, pt.x + 1, pt.y, 0); sync (dpy, 0);
+            mm->runDispatchLoopUntil (settle);
+        };
+        int cards = 0, menus = 0, selected = 0, isolated = 0, patches = 0, gestures = 0;
+        if (source != nullptr)
+            for (const int width : { 960, 1280, 1600 })
+            {
+                editor.setSize (width, width * 5 / 8); mm->runDispatchLoopUntil (150);
+                const float scale = (float) width / 1280.0f;
+                for (int slot = 0; slot < 8; ++slot)
+                    for (int type : { 0, 8 })
+                    {
+                        editor.showPage ((slot + 1) % 8);
+                        click (editor.localPointToGlobal (juce::Point<int> (juce::roundToInt (35 * scale), juce::roundToInt ((113 + 70 * slot) * scale))), 140);
+                        const bool card = editor.visiblePage() % 8 == slot; if (card) ++cards;
+                        const auto id = slotPrefix (slot) + "table";
+                        setP (p, slotPrefix (slot) + "type", (float) type);
+                        const int count = type == 0 ? 8 : 3;
+                        const int target = slot % count;
+                        setP (p, id, (float) ((target + 1) % count)); mm->runDispatchLoopUntil (90);
+                        std::array<int, 8> before {};
+                        for (int s = 0; s < 8; ++s) before[(size_t) s] = juce::roundToInt (p.apvts.getRawParameterValue (slotPrefix (s) + "table")->load());
+                        GestureTrace trace (p, id);
+                        click (source->getScreenBounds().getCentre(), 250);
+                        auto* menu = juce::Component::getCurrentlyModalComponent();
+                        if (! menu || menu->getName() != "menu") { juce::PopupMenu::dismissAllActiveMenus(); continue; }
+                        ++menus;
+                        juce::Component* item = nullptr;
+                        const auto text = source->getItemText (target);
+                        for (auto* child : menu->getChildren()) if (auto* access = child->getAccessibilityHandler())
+                            if (access->getTitle() == text) { item = child; break; }
+                        if (! item) { juce::PopupMenu::dismissAllActiveMenus(); continue; }
+                        click (item->getScreenBounds().getCentre(), 160);
+                        const int value = juce::roundToInt (p.apvts.getRawParameterValue (id)->load());
+                        if (card && value == target && source->getSelectedId() == target + 1) ++selected;
+                        bool others = true;
+                        for (int s = 0; s < 8; ++s) if (s != slot)
+                            others &= juce::roundToInt (p.apvts.getRawParameterValue (slotPrefix (s) + "table")->load()) == before[(size_t) s];
+                        if (others) ++isolated;
+                        Patch patch; FxChain::Settings fx; p.collectPatch (patch, fx);
+                        if (patch.slots[(size_t) slot].params.table == target) ++patches;
+                        if (trace.balanced()) ++gestures;
+                    }
+            }
+        constexpr int n = 3 * 8 * 2;
+        std::printf ("   карта %d/%d, меню %d/%d, выбор %d/%d, изоляция %d/%d, Patch %d/%d, gestures %d/%d\n",
+                     cards,n,menus,n,selected,n,isolated,n,patches,n,gestures,n);
+        check (cards == n && menus == n && selected == n && isolated == n && patches == n && gestures == n,
+               "XTEST выбирает Wavetable и CHOP для всех слотов на трёх размерах с host gestures");
+        juce::PopupMenu::dismissAllActiveMenus(); editor.removeFromDesktop();
+    }
+    close (dpy);
+   #else
+    if (force) check (false, "XTEST доступен только на Linux/X11");
+   #endif
+}
+
 static void testHostGestureContracts()
 {
     std::printf ("\n--- GUI: жесты автоматизации хоста ---\n");
@@ -2540,6 +2865,36 @@ static void testAudioCallbackAllocations()
     check (ready == FxChain::ModuleCount && total == 0 && nonfinite == 0,
            "реальный AudioProcessor processBlock: подготовлены копии всех типов, аллокаций и NaN/Inf нет",
            juce::String (ready) + "/13, alloc=" + juce::String ((juce::int64) total) + ", nonfinite=" + juce::String (nonfinite));
+
+    // Wavetable selection and distortion/topology changes are processed on the
+    // real callback, with parameters changed outside the monitored interval as
+    // a host would do before processBlock. Worker allocations are excluded.
+    OrogenProcessor wt; wt.setPlayConfigDetails (0, 2, 48000.0, 128); wt.prepareToPlay (48000.0, 128);
+    wt.setCurrentProgram (0); soloSlot (wt, 0, (int) EngineType::Wavetable);
+    setP (wt, "sA_attack", .001f); setP (wt, "sA_sustain", 1.0f);
+    setP (wt, "sA_detune", 0.0f); setP (wt, "sA_p3", .3f);
+    juce::AudioBuffer<float> wave (2, 128); juce::MidiBuffer note, noMidi;
+    note.addEvent (juce::MidiMessage::noteOn (1, 60, .8f), 0);
+    wt.processBlock (wave, note);
+    std::uint64_t wtAlloc = 0; int wtBad = 0; double energy = 0.0;
+    for (int block = 0; block < 256; ++block)
+    {
+        setP (wt, "sA_table", (float) ((block / 3) % 8));
+        setP (wt, "sA_p1", (block / 5) % 2 ? .7f : 0.0f);
+        setP (wt, "sA_p2", (block / 7) % 2 ? .6f : 0.0f);
+        start(); wt.processBlock (wave, noMidi); wtAlloc += stop();
+        for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < 128; ++i)
+        {
+            const float v = wave.getSample (ch, i);
+            if (! std::isfinite (v)) ++wtBad;
+            if (block > 12) energy += (double) v * v;
+        }
+    }
+    wt.releaseResources();
+    check (wtAlloc == 0 && wtBad == 0 && energy > 0.001,
+           "Wavetable: 256 аудиоблоков со сменой таблицы, Warp/Fold и OS без аллокаций/NaN",
+           "alloc=" + juce::String ((juce::int64) wtAlloc) + ", nonfinite=" + juce::String (wtBad)
+           + ", energy=" + num (energy, 6));
    #else
     check (false, "этот allocation probe рассчитан на Linux/glibc");
    #endif
@@ -2952,6 +3307,35 @@ int main (int argc, char** argv)
         juce::DeletedAtShutdown::deleteAll();
         juce::MessageManager::deleteInstance();
         std::printf ("\nGranular AudioProcessor: провалов %d\n", failures);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "--source-audio-only")
+    {
+        testSourcePickerAudio();
+        juce::DeletedAtShutdown::deleteAll();
+        juce::MessageManager::deleteInstance();
+        std::printf ("ИТОГО SOURCE-AUDIO: провалов %d\n", failures);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "--source-map-only")
+    {
+        testSourcePicker(); testHiddenPreviewResume();
+        juce::DeletedAtShutdown::deleteAll();
+        juce::MessageManager::deleteInstance();
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "--source-ui-only")
+    {
+        testSourcePicker(); testHiddenPreviewResume(); testNativeSourceMenu (true);
+        juce::DeletedAtShutdown::deleteAll();
+        juce::MessageManager::deleteInstance();
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "--ui-perf-only")
+    {
+        testUiPerformance();
+        juce::DeletedAtShutdown::deleteAll();
+        juce::MessageManager::deleteInstance();
         return failures == 0 ? 0 : 1;
     }
     if (argc > 1 && juce::String (argv[1]) == "--animation-ui-only")
@@ -5288,6 +5672,9 @@ int main (int argc, char** argv)
     testNativeSlotControls();
     testNativeVectorGesture();
     testNativeEngineMenu();
+    testSourcePicker(); testSourcePickerAudio();
+    testHiddenPreviewResume();
+    testNativeSourceMenu();
     testNativeMeterPaint();
     testNativeAnimationPaint();
     testEditorControlLifetime();
