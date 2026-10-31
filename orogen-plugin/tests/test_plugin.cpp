@@ -1548,6 +1548,179 @@ static void testNativeMeterPaint()
    #endif
 }
 
+// Проверяем настоящий peer/X11, а не только offscreen snapshot: при частичном
+// repaint старые пиксели могут остаться на экране, хотя snapshot правильный.
+class AnimationPaintProbe : public OrogenEditor
+{
+public:
+    explicit AnimationPaintProbe (OrogenProcessor& p) : OrogenEditor (p) {}
+    void paint (juce::Graphics& g) override
+    {
+        bool measureTime = false;
+        if (recording)
+        {
+            const float sx = (float) getWidth() / 1280.0f, sy = (float) getHeight() / 800.0f;
+            const juce::Rectangle<int> lane (juce::roundToInt (248.0f * sx), juce::roundToInt (348.0f * sy),
+                                               juce::roundToInt (736.0f * sx), juce::roundToInt (62.0f * sy));
+            const auto bounds = g.getClipBounds().getIntersection (lane);
+            // Clip может быть объединением раздельных зон. Его getBounds()
+            // почти на весь экран, хотя dirty только маленькие прямоугольники.
+            // Считаем верхнюю оценку площади плитками 4x4 через сам clip.
+            int area = 0;
+            constexpr int tile = 4;
+            for (int y = bounds.getY(); y < bounds.getBottom(); y += tile)
+                for (int x = bounds.getX(); x < bounds.getRight(); x += tile)
+                {
+                    const int w = std::min (tile, bounds.getRight() - x);
+                    const int h = std::min (tile, bounds.getBottom() - y);
+                    if (g.clipRegionIntersects ({ x, y, w, h })) area += w * h;
+                }
+            if (area > 0)
+            {
+                ++laneCalls; lanePixels += area; laneMax = std::max (laneMax, area); measureTime = true;
+                if (area < lane.getWidth() * lane.getHeight() / 2) { ++normalCalls; normalPixels += area; }
+            }
+        }
+        const double started = juce::Time::getMillisecondCounterHiRes();
+        OrogenEditor::paint (g);
+        if (measureTime) lanePaintMs += juce::Time::getMillisecondCounterHiRes() - started;
+    }
+    void resetCounts() { laneCalls = laneMax = normalCalls = 0; lanePixels = normalPixels = 0; lanePaintMs = 0.0; }
+    bool recording = false;
+    int laneCalls = 0, laneMax = 0, normalCalls = 0;
+    long long lanePixels = 0, normalPixels = 0;
+    double lanePaintMs = 0.0;
+};
+
+static void testNativeAnimationPaint()
+{
+   #if JUCE_LINUX || JUCE_BSD
+    if (std::getenv ("OROGEN_GUI_NATIVE") == nullptr) return;
+    std::printf ("\n--- Нативный GUI: анимация LFO на разных масштабах ---\n");
+    OrogenProcessor p;
+    p.setCurrentProgram (0);
+    p.setPlayConfigDetails (0, 2, 48000.0, 512);
+    p.prepareToPlay (48000.0, 512);
+    setP (p, "lfo1_rate", 10.0f);
+    setP (p, "lfo1_amount", 1.0f);
+    AnimationPaintProbe editor (p);
+    editor.showPage (0);
+    editor.addToDesktop (0); editor.setTopLeftPosition (0, 0); editor.setVisible (true);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil (1800);
+    int badFrames = 0, testedFrames = 0, movingCases = 0, totalCases = 0, efficientCases = 0, sampleHoldWraps = 0;
+    for (const int width : { 960, 1280, 1600 })
+    {
+        const int height = width * 5 / 8;
+        editor.setSize (width, height);
+        juce::MessageManager::getInstance()->runDispatchLoopUntil (300);
+        for (int shape = 0; shape < 3; ++shape)
+        {
+            setP (p, "lfo1_shape", (float) shape);
+            // 10 Гц, 6 циклов на экран: wrap на 0.6 с должен произойти
+            // ПОСЛЕ первого снимка, а не до начала наблюдения.
+            editor.setAnimationPhase (0.32);
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (110);
+            editor.resetCounts(); editor.recording = true;
+            int stale = 0, near = 0, movement = 0, maxChannelDiff = 0;
+            juce::Image previous;
+            const float sx = (float) width / 1280.0f, sy = (float) height / 800.0f;
+            const int x0 = (int) std::floor (248.0f * sx), x1 = (int) std::ceil (984.0f * sx);
+            const int y0 = (int) std::floor (348.0f * sy), y1 = (int) std::ceil (410.0f * sy);
+            for (int frame = 0; frame < 8; ++frame)
+            {
+                juce::MessageManager::getInstance()->runDispatchLoopUntil (60);
+                // Таймер может попасть на последнюю итерацию dispatch loop:
+                // реализуем только уже запрошенные repaint, не создавая новый.
+                if (editor.getPeer() != nullptr) editor.getPeer()->performAnyPendingRepaintsNow();
+                const auto live = editor.getPeer() != nullptr
+                    ? juce::createSnapshotOfNativeWindow (editor.getPeer()->getNativeHandle()) : juce::Image();
+                juce::Image fresh (juce::Image::ARGB, width, height, true);
+                // Offscreen контрольный кадр не является paint нативного окна
+                // и не должен попадать в статистику частичных перерисовок.
+                editor.recording = false;
+                { juce::Graphics g (fresh); editor.paintEntireComponent (g, true); }
+                editor.recording = true;
+                int frameStale = 0;
+                if (! live.isValid() || live.getWidth() != width || live.getHeight() != height) ++frameStale;
+                else for (int y = y0; y < y1; ++y) for (int x = x0; x < x1; ++x)
+                {
+                    const auto a = live.getPixelAt (x, y), b = fresh.getPixelAt (x, y);
+                    const int diff = std::max ({ std::abs ((int) a.getRed() - (int) b.getRed()),
+                                                 std::abs ((int) a.getGreen() - (int) b.getGreen()),
+                                                 std::abs ((int) a.getBlue() - (int) b.getBlue()) });
+                    maxChannelDiff = std::max (maxChannelDiff, diff);
+                    // RGB нативного X11 и ARGB-буфер могут отличаться на 1–2
+                    // LSB из-за округления нескольких альфа-наложений.
+                    if (diff > 2) ++frameStale; else if (diff != 0) ++near;
+                    if (previous.isValid() && a != previous.getPixelAt (x, y)) ++movement;
+                }
+                previous = live;
+                stale += frameStale;
+                ++testedFrames;
+                if (frameStale != 0) ++badFrames;
+            }
+            editor.recording = false;
+            ++totalCases; if (movement > 0) ++movingCases;
+            if (shape == 2 && movement > 3000) ++sampleHoldWraps;
+            if (width == 1280 && editor.normalCalls >= 3
+                && (double) editor.normalPixels / editor.normalCalls < 1400.0) ++efficientCases;
+            std::printf ("   %dx%d shape=%d: %d paint, средний clip %.0f px, max %d px, "
+                         "обычных %d (среднее %.0f px), paint %.3f мс, stale %d px, 1–2LSB %d px, maxdiff %d, движение %d px\n",
+                         width, height, shape, editor.laneCalls,
+                         editor.laneCalls ? (double) editor.lanePixels / editor.laneCalls : 0.0,
+                         editor.laneMax, editor.normalCalls,
+                         editor.normalCalls ? (double) editor.normalPixels / editor.normalCalls : 0.0,
+                         editor.lanePaintMs, stale, near, maxChannelDiff, movement);
+        }
+    }
+    check (badFrames == 0 && testedFrames == 72,
+           "частичная анимация совпадает со свежим кадром при трёх масштабах и S&H wrap",
+           juce::String (badFrames) + "/" + juce::String (testedFrames) + " кадров с отличиями");
+    check (movingCases == totalCases && totalCases == 9,
+           "playhead двигается для всех форм и масштабов", juce::String (movingCases) + "/9");
+    check (efficientCases == 3,
+           "обычные кадры LFO используют маленький clip при 1280×800", juce::String (efficientCases) + "/3");
+    check (sampleHoldWraps == 3, "S&H действительно перерисовывает кривую при wrap на трёх масштабах",
+           juce::String (sampleHoldWraps) + "/3");
+
+    // Все панели, а не только LFO: полная отрисовка должна совпадать с
+    // отрисовкой небольшими клипами, в т.ч. на границах панелей/масштабах.
+    editor.setAnimationsEnabled (false);
+    int tileBad = 0, maxTileDiff = 0;
+    for (int width : { 960, 1280, 1600 })
+    {
+        const int height = width * 5 / 8;
+        editor.setSize (width, height);
+        juce::MessageManager::getInstance()->runDispatchLoopUntil (100);
+        juce::Image full (juce::Image::ARGB, width, height, true);
+        { juce::Graphics g (full); editor.paintEntireComponent (g, true); }
+        juce::Image tiled (juce::Image::ARGB, width, height, true);
+        for (int y = 0; y < height; y += 79)
+            for (int x = 0; x < width; x += 137)
+            {
+                juce::Graphics g (tiled);
+                g.reduceClipRegion (x, y, std::min (137, width - x), std::min (79, height - y));
+                editor.paintEntireComponent (g, true);
+            }
+        int bad = 0;
+        for (int y = 0; y < height; ++y) for (int x = 0; x < width; ++x)
+        {
+            const auto a = full.getPixelAt (x, y), b = tiled.getPixelAt (x, y);
+            const int diff = std::max ({ std::abs ((int) a.getRed() - (int) b.getRed()),
+                                         std::abs ((int) a.getGreen() - (int) b.getGreen()),
+                                         std::abs ((int) a.getBlue() - (int) b.getBlue()) });
+            maxTileDiff = std::max (maxTileDiff, diff);
+            if (diff > 2) ++bad;
+        }
+        std::printf ("   %dx%d: частичная/полная отрисовка, различий >2 LSB %d px\n", width, height, bad);
+        tileBad += bad;
+    }
+    check (tileBad == 0, "частичные clips не теряют панели на разных масштабах",
+           juce::String (tileBad) + " px, max Δ " + juce::String (maxTileDiff) + "/255");
+    editor.removeFromDesktop(); p.releaseResources();
+   #endif
+}
+
 int main (int argc, char** argv)
 {
     // Голова без X11: GUI-инициализация здесь упала бы (нет дисплея), а
@@ -1589,6 +1762,13 @@ int main (int argc, char** argv)
         juce::DeletedAtShutdown::deleteAll();
         juce::MessageManager::deleteInstance();
         std::printf ("\nGranular AudioProcessor: провалов %d\n", failures);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "--animation-ui-only")
+    {
+        testNativeAnimationPaint();
+        juce::DeletedAtShutdown::deleteAll();
+        juce::MessageManager::deleteInstance();
         return failures == 0 ? 0 : 1;
     }
     if (argc > 1 && juce::String (argv[1]) == "--meter-ui-only")
@@ -3840,6 +4020,7 @@ int main (int argc, char** argv)
 
     testGuiRegressions();
     testNativeMeterPaint();
+    testNativeAnimationPaint();
     testEditorControlLifetime();
     testGranularProcessorRegression();
     testGranularReverseProcessor();

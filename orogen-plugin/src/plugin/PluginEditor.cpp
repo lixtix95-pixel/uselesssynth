@@ -51,6 +51,12 @@ namespace
         return juce::jlimit (1, 6, juce::roundToInt (rate * 0.6f) + 1);
     }
 
+    juce::Rectangle<float> lfoLane()
+    {
+        constexpr float laneH = 178.0f / 3.0f;
+        return { 262.0f, 290.0f + laneH + 8.0f, 708.0f, laneH - 18.0f };
+    }
+
     // Это схема формы, а не фаза какой-либо из полифонических нот. Треугольник
     // совпадает с формулой Voice; S&H держит значение весь цикл, а не создаёт
     // фиктивные быстрые ступеньки внутри него.
@@ -2036,14 +2042,41 @@ bool OrogenEditor::waitForPreview (int timeoutMs)
     return ! prevPending;
 }
 
+juce::Point<float> OrogenEditor::lfoPlayheadPoint() const
+{
+    const auto lane = lfoLane();
+    const int cycles = lfoPreviewCycleCount > 0 ? lfoPreviewCycleCount
+                                               : lfoPreviewCycles (pv ("lfo1_rate"));
+    const float v = lfoPreviewValue (pi ("lfo1_shape"), lfoPreviewPhase * cycles + lfoPreviewOffset);
+    return { lane.getX() + (float) lfoPreviewPhase * lane.getWidth(),
+             lane.getCentreY() - v * (0.15f + 0.85f * pv ("lfo1_amount")) * lane.getHeight() * 0.46f };
+}
+
+juce::Rectangle<int> OrogenEditor::lfoPlayheadDirty() const
+{
+    const auto p = lfoPlayheadPoint();
+    // Гало радиусом 5 px + запас на AA и дробный масштаб.
+    return juce::Rectangle<float> ((p.x - 7.0f) * kx(), (p.y - 7.0f) * ky(),
+                                    14.0f * kx(), 14.0f * ky()).getSmallestIntegerContainer().expanded (1);
+}
+
 void OrogenEditor::repaintAnimated()
 {
-    // Полный repaint() на 24 кадрах/с стоил 8.8 мс (≈21 % ядра). Двигается же
-    // меньше десятой доли процента площади, поэтому перерисовываем только те
-    // зоны, где анимация действительно есть.
+    // Публичный полный вариант для внешних принудительных обновлений.
+    repaintAnimated ({}, true);
+}
+
+void OrogenEditor::repaintAnimated (juce::Rectangle<int> previousHead, bool curveChanged)
+{
     repaint (R (988.0f, 24.0f, 100.0f, 16.0f));                    // LED маршрутов
     repaint (R (16.0f, 66.0f + 70.0f * (float) selectedSlot, 216.0f, 62.0f));  // выбранный слот
-    repaint (R (248.0f, 348.0f, 736.0f, 62.0f));                   // дорожка LFO с playhead
+    if (curveChanged)
+        repaint (R (248.0f, 348.0f, 736.0f, 62.0f));  // новый offset/масштаб всей кривой
+    else
+    {
+        if (! previousHead.isEmpty()) repaint (previousHead);
+        repaint (lfoPlayheadDirty());                  // стереть старую и нарисовать новую точку
+    }
     repaint (R (248.0f, 570.0f, 736.0f, 70.0f));                   // чипы FX + их страницы
 
     for (auto* c : columns) if (c->isVisible()) c->repaintCables();  // кометы в кабелях
@@ -2053,8 +2086,9 @@ void OrogenEditor::repaintAnimated()
 
 int OrogenEditor::animatedAreaPercent() const
 {
-    // та же геометрия, что в repaintAnimated(), в процентах от 1280×800
-    const double area = 100.0 * 16.0 + 216.0 * 62.0 + 736.0 * 62.0 + 736.0 * 70.0;
+    // Оценка обычного тика в координатах макета; при смене offset кривой
+    // разово перерисовывается вся дорожка LFO, а не только две точки.
+    const double area = 100.0 * 16.0 + 216.0 * 62.0 + 2.0 * 16.0 * 16.0 + 736.0 * 70.0;
     double total = area;
     for (auto* c : columns) if (c->isVisible()) total += (double) c->cableAreaPx();
     if (vectorPad != nullptr) total += (double) vectorPad->getWidth() * (double) vectorPad->getHeight();
@@ -2156,6 +2190,8 @@ void OrogenEditor::timerCallback()
 
     if (animOn && dt > 0.0)
     {
+        const auto previousHead = lfoPlayheadDirty();
+        const int previousCycles = lfoPreviewCycleCount;
         animSeconds += dt;
         // Интегрируем мгновенную скорость: изменение Rate не переносит
         // playhead в позицию, вычисленную из всего прошедшего времени.
@@ -2178,7 +2214,10 @@ void OrogenEditor::timerCallback()
         for (auto* c : columns) c->tickTransition ((float) dt);   // плавное листание
         if (paramsPage != nullptr) paramsPage->tickTransition ((float) dt);
         chipTransition = juce::jmax (0.0f, chipTransition - (float) dt / 0.14f);
-        repaintAnimated();                  // только живые зоны, не весь экран
+        // S&H при wrap и при смене числа циклов меняет всю кривую. Во всех
+        // остальных тиках достаточно двух небольших областей playhead.
+        const bool curveChanged = wraps != 0.0 || previousCycles != lfoPreviewCycleCount;
+        repaintAnimated (previousHead, curveChanged);
     }
 
     const auto revision = proc.engine().meterRevision();
@@ -2237,18 +2276,29 @@ void OrogenEditor::timerCallback()
 // ---------------------------------------------------------------------------
 void OrogenEditor::paint (juce::Graphics& g)
 {
+    // Частичный clip не отменяет вычисление paths, подписей и параметров внутри
+    // paint...(). Отсекаем целые панели ДО их построения; запас в 4 физических
+    // пикселя покрывает сглаживание обводок на дробном масштабе.
+    const auto visible = [this, &g] (float x, float y, float w, float h) {
+        return g.clipRegionIntersects (R (x, y, w, h).expanded (4));
+    };
+    // Проверяем до addTransform: области R уже в физических координатах.
+    const bool top = visible (0, 0, 1280, 62), rail = visible (0, 62, 240, 578);
+    const bool display = visible (248, 66, 736, 214), mod = visible (248, 290, 736, 178);
+    const bool knobs = visible (248, 468, 736, 120), chips = visible (248, 570, 736, 70);
+    const bool column = visible (996, 62, 272, 576), bottom = visible (12, 642, 1256, 146);
     g.fillAll (Palette::bg);
     g.saveState();
     g.addTransform (juce::AffineTransform::scale (kx(), ky()));
 
-    paintTopBar (g);
-    paintRail (g);
-    paintDisplay (g);
-    paintModEditor (g);
-    paintCentreKnobs (g);
-    paintChips (g);
-    paintColumnFrame (g);
-    paintBottom (g);
+    if (top)     paintTopBar (g);
+    if (rail)    paintRail (g);
+    if (display) paintDisplay (g);
+    if (mod)     paintModEditor (g);
+    if (knobs)   paintCentreKnobs (g);
+    if (chips)   paintChips (g);
+    if (column)  paintColumnFrame (g);
+    if (bottom)  paintBottom (g);
 
     g.restoreState();
 }
@@ -2548,8 +2598,7 @@ void OrogenEditor::paintModEditor (juce::Graphics& g)
 
     // --- дорожка 2: LFO 1 (форма из параметра shape, амплитуда из amount) ---
     {
-        const auto lane = juce::Rectangle<float> (area.getX() + 14.0f, area.getY() + laneH + 8.0f,
-                                                  area.getWidth() - 28.0f, laneH - 18.0f);
+        const auto lane = lfoLane();
         const int shape = pi ("lfo1_shape");
         const float amount = pv ("lfo1_amount");
         const float rate = pv ("lfo1_rate");
@@ -2584,15 +2633,11 @@ void OrogenEditor::paintModEditor (juce::Graphics& g)
         // обещает совпадения с фазой конкретного полифонического голоса.
         if (animOn)
         {
-            const float t = (float) lfoPreviewPhase;
-            const float v = lfoPreviewValue (shape, lfoPreviewPhase * cycles + lfoPreviewOffset);
-
-            const float px = lane.getX() + t * lane.getWidth();
-            const float py = lane.getCentreY() - v * (0.15f + 0.85f * amount) * lane.getHeight() * 0.46f;
+            const auto p = lfoPlayheadPoint();
             g.setColour (Palette::signal.withAlpha (0.16f));
-            g.fillEllipse (px - 5.0f, py - 5.0f, 10.0f, 10.0f);
+            g.fillEllipse (p.x - 5.0f, p.y - 5.0f, 10.0f, 10.0f);
             g.setColour (Palette::signal);
-            g.fillEllipse (px - 2.0f, py - 2.0f, 4.0f, 4.0f);
+            g.fillEllipse (p.x - 2.0f, p.y - 2.0f, 4.0f, 4.0f);
         }
 
         draw::caption (g, "lfo 1", { (int) lane.getRight() - 110, (int) lane.getY() - 4, 108, 10 },

@@ -110,6 +110,9 @@ private:
 
     void timerCallback() override;
     void syncLfoPreviewCycles (int cycles);
+    juce::Point<float> lfoPlayheadPoint() const;
+    juce::Rectangle<int> lfoPlayheadDirty() const;
+    void repaintAnimated (juce::Rectangle<int> previousHead, bool curveChanged);
     void repaintChangedValues();
     void takePreviewResult();
     void buildRail();

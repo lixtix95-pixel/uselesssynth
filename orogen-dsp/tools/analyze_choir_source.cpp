@@ -1,5 +1,6 @@
-// Диагностика частоты фабричного Choir. Не меняет источник и не является
-// тестом отсутствия клиппинга: измеряет периоды исходной формы, до движка.
+// Диагностика частоты фабричного Choir. Измеряет периоды исходной формы
+// до движка/FX и сравнивает их с заданной мгновенной частотой вибрато.
+// Это не тест отсутствия клиппинга.
 #include "../src/content/sample_bank.h"
 #include <algorithm>
 #include <cmath>
@@ -53,9 +54,8 @@ int main()
     {
         const double t = (times[i] + times[i - 1]) * 0.5;
         const double f = 1.0 / (times[i] - times[i - 1]);
-        // Производная реальной фазы f0*t*(1 + .004*sin(omega*t+.7)).
-        const double predicted = f0 * (1.0 + 0.004 * std::sin (omega * t + 0.7)
-                                      + 0.004 * omega * t * std::cos (omega * t + 0.7));
+        // Целевая мгновенная частота. Фаза — интеграл этой функции.
+        const double predicted = f0 * (1.0 + 0.004 * std::sin (omega * t + 0.7));
         maxError = std::max (maxError, std::fabs (f - predicted));
         ++periods;
         if (t >= 1.4 && t <= 1.8)
@@ -69,7 +69,7 @@ int main()
     std::printf ("Choir, источник 48 кГц, root MIDI %d / %.1f Гц, без двигателя и FX\n", shot.rootNote, f0);
     std::printf ("%d периодов; t=1.4..1.8 с: %.3f Гц (t=%.5f) .. %.3f Гц (t=%.5f), %d периодов\n",
                  periods, lo, loT, hi, hiT, inWindow);
-    std::printf ("Макс. |частота по периоду - производная фазы| = %.3f Гц; номинальный множитель vib отдельно: 109.560..110.440 Гц\n",
+    std::printf ("Макс. |частота по периоду - целевое вибрато| = %.3f Гц; цель: 109.560..110.440 Гц\n",
                  maxError);
     std::printf ("Это измерение исходника, не измерение пиков или клиппинга VST3.\n");
     return 0;

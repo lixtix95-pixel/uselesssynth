@@ -27,3 +27,4 @@ orogen-repo.bundle
 
 # local Linux VST3 distribution (binary remains outside git history)
 /OROGEN-linux-vst3.zip
+/OROGEN-linux-vst3-previous-*.zip

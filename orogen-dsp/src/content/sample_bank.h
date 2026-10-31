@@ -15,6 +15,7 @@
 #include "../core/dsp.h"
 #include "../core/fft.h"
 #include "../engines/halfband.h"
+#include "../engines/vibrato_phase.h"
 
 #include <string>
 #include <vector>
@@ -216,6 +217,9 @@ inline void renderOneShot (OneShotKind kind, std::vector<float>& out, double sr,
             {
                 const double t = i / sr;
                 const double vib = 1.0 + 0.004 * std::sin (TAUd * 5.2 * t + 0.7);
+                // Интеграл мгновенной частоты. f(t)*t даёт лишний член
+                // t*f'(t), и вибрато ошибочно усиливается к концу источника.
+                const double cycles = sinusoidalVibratoCycles (f0, t, 5.2, 0.004, 0.7);
                 const double env = std::min (1.0, t * 6.0) * std::exp (-t * 1.1);
                 float s = 0;
                 for (int k = 1; k <= 24; ++k)
@@ -227,7 +231,7 @@ inline void renderOneShot (OneShotKind kind, std::vector<float>& out, double sr,
                         const float d = (hz - F[fi]) / (F[fi] * 0.3f);
                         w += std::exp (-d * d) * G[fi];
                     }
-                    s += w * (float) std::sin (TAUd * k * f0 * vib * t) / std::pow ((float) k, 0.25f);
+                    s += w * (float) std::sin (TAUd * k * cycles) / std::pow ((float) k, 0.25f);
                 }
                 out[(size_t) i] = (float) (s * env * 0.35);
             }
@@ -301,7 +305,9 @@ inline void renderOneShot (OneShotKind kind, std::vector<float>& out, double sr,
             for (int i = 0; i < n; ++i)
             {
                 const double t = i / sr;
-                const double drift = 1.0 + 0.002 * std::sin (TAUd * 0.7 * t);
+                // Та же ошибка f(t)*t была и во втором вокальном источнике;
+                // сохраняем исходную частоту/глубину, интегрируем фазу.
+                const double cycles = sinusoidalVibratoCycles (f0, t, 0.7, 0.002, 0.0);
                 const double env = std::min (1.0, t * 8.0) * std::exp (-t * 1.4);
                 float s = 0;
                 for (int k = 1; k <= 30; ++k)
@@ -313,7 +319,7 @@ inline void renderOneShot (OneShotKind kind, std::vector<float>& out, double sr,
                         const float d = (hz - F[fi]) / (F[fi] * 0.26f);
                         w += std::exp (-d * d) * G[fi];
                     }
-                    s += w * (float) std::sin (TAUd * k * f0 * drift * t) / std::pow ((float) k, 0.2f);
+                    s += w * (float) std::sin (TAUd * k * cycles) / std::pow ((float) k, 0.2f);
                 }
                 out[(size_t) i] = (float) (s * env * 0.3);
             }
