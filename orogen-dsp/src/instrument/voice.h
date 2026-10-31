@@ -154,6 +154,7 @@ public:
         // одинаковое начальное зерно) выдавали бы одно и то же значение.
         noteRng.seed (0x9E3779B9u ^ (serial * 2654435761u));
         noteRandom = noteRng.nextBipolar();
+        noteSerial = serial; // постоянен для всех слотов этой ноты, включая поздний старт Morph
         modWarpF = modDetuneF = 0.0f;
 
         for (int i = 0; i < kSlots; ++i)
@@ -319,9 +320,10 @@ public:
         return true;
     }
 
-    // Пиковый уровень каждого слота за последнее окно управления (для метринга).
+    // Пики текущего окна метра. Читаются и сбрасываются только аудиопотоком;
+    // GUI получает опубликованную Instrument атомарную копию, не эти значения.
     const std::array<float, kSlots>& slotMeters() const { return slotMeter; }
-    void decayMeters() { for (auto& m : slotMeter) m *= 0.9f; }
+    void clearMeters() noexcept { slotMeter.fill (0.0f); }
 
     float cpuCost() const
     {
@@ -416,6 +418,10 @@ private:
         tailLeft[(size_t) i] = s.tail;
         lastAmp[(size_t) i] = 0.0f;
         e->setNoteRandom (noteRandom);
+        // Разный воспроизводимый поток на каждую ноту и слот. Раньше все
+        // Granular-слоты сбрасывали RNG направления в один и тот же seed:
+        // при 50% два идентичных слоя реверсировались синхронно.
+        e->setRandomStreamSeed (noteSlotStreamSeed (noteSerial, i));
         e->start (targetNote, velocityGain);
         EngineParams ep = slotParams (p, i);
         e->prepare (ep);
@@ -570,6 +576,7 @@ private:
     double ageSamples = 0.0;
 
     int   targetNote = 60;
+    uint32_t noteSerial = 0;
     float targetPitch = 60.0f, currentPitch = 60.0f;
     float pitchMod = 0.0f, morphMod = 0.0f;
     float modWarpF = 0.0f, modDetuneF = 0.0f;

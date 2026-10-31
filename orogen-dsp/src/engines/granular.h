@@ -53,6 +53,10 @@ public:
         noteRandom = clamp (value, -1.0f, 1.0f);
     }
 
+    // Отдельный seed направления не трогает генератор позиции и Spread.
+    // Самостоятельный Granular без голоса получает прежний поток (seed 0).
+    void setRandomStreamSeed (uint32_t seed) noexcept override { directionStreamSeed = seed; }
+
     void start (int midiNote, float velocity) override
     {
         note = midiNote;
@@ -65,7 +69,7 @@ public:
         needSnap = true;
         active = true;
         rng = Rng { 0x51F3A7u };
-        directionRng = Rng { 0xB79D31u }; // не влияет на RNG позиции и питча
+        directionRng = Rng { 0xB79D31u ^ directionStreamSeed }; // независим от RNG позиции и питча
     }
 
     void stop() override
@@ -327,6 +331,7 @@ private:
     float  noteRandom = 0.5f;
     float  baseRate = 1.0f, spread = 0.0f, sizeSec = 0.08f, density = 20.0f, bodyRms = 1.0f;
     float  reverseChance = 0.0f;
+    uint32_t directionStreamSeed = 0;
     float  spawnAcc = 0.0f, dcX = 0.0f, dcY = 0.0f, dcCoef = 0.999f;
     SmoothedValue posSm, sizeSm, gainSm;
     Rng rng { 0x51F3A7u }, directionRng { 0xB79D31u };

@@ -476,6 +476,13 @@ OrLookAndFeel::OrLookAndFeel()
     setColour (juce::ComboBox::arrowColourId, Palette::textDim);
     setColour (juce::Slider::textBoxTextColourId, Palette::textDim);
     setColour (juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
+    setColour (juce::ScrollBar::thumbColourId, Palette::textDim);
+    setColour (juce::ScrollBar::backgroundColourId, juce::Colours::transparentBlack);
+    setColour (juce::ScrollBar::trackColourId, juce::Colours::transparentBlack);
+    setColour (juce::TextEditor::focusedOutlineColourId, Palette::lineHi);
+    setColour (juce::TextEditor::highlightColourId, Palette::lineMid);
+    setColour (juce::TextEditor::highlightedTextColourId, Palette::text);
+    setColour (juce::CaretComponent::caretColourId, Palette::signal);
     setColour (juce::Label::textColourId, Palette::text);
     setColour (juce::TextButton::textColourOffId, Palette::textDim);
     setColour (juce::TextButton::textColourOnId, Palette::text);

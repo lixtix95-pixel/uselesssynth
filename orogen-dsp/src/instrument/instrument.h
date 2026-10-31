@@ -9,6 +9,8 @@
 #include <vector>
 #include <deque>
 #include <array>
+#include <atomic>
+#include <cstdint>
 
 namespace orogen {
 
@@ -16,6 +18,11 @@ class Instrument
 {
 public:
     static constexpr int kMaxVoices = 16;
+
+    Instrument() noexcept
+    {
+        for (auto& meter : publishedMeters) meter.store (0.0f, std::memory_order_relaxed);
+    }
 
     void prepare (double sr, int voices = kMaxVoices)
     {
@@ -37,6 +44,7 @@ public:
         lastNote = 60;
         sampleCounter = 0;
         resetStats();
+        resetMetering (sr);
     }
 
     void setSampleRate (double sr)
@@ -46,6 +54,7 @@ public:
         fx.prepare (sr);
         fx.set (fxSettings);
         arpeggiator.prepare (sr);
+        resetMetering (sr);
     }
 
     // --- Патч: три режима, чтобы аудио-поток не аллоцировал -------------------
@@ -231,20 +240,25 @@ public:
         l = antiDenormal (vl);
         r = antiDenormal (vr);
         ++sampleCounter;
+        if (++meterFrames >= meterWindowFrames) publishMeters();
     }
 
     int activeVoiceCount() const { return activeVoices; }
 
-    // Уровни слотов A–H по всем голосам (дБ, −120 = тишина) — для тестов и UI.
-    void slotLevelsDb (float* out) const
+    // Уровни A–H в дБ (−120 = тишина): GUI читает только атомарный снимок.
+    // Голоса и их изменяемые float-метры остаются в аудиопотоке.
+    void slotLevelsDb (float* out) const noexcept
     {
         for (int i = 0; i < Voice::kSlots; ++i)
         {
-            float pk = 0.0f;
-            for (const auto& v : voices) pk = std::max (pk, v.slotMeters()[(size_t) i]);
+            const float pk = publishedMeters[(size_t) i].load (std::memory_order_relaxed);
             out[i] = 20.0f * std::log10 (pk + 1.0e-6f);
         }
     }
+    // GUI обнаруживает приостановленный processBlock без обращения к часам
+    // или блокировкам из аудиопотока. Счётчик меняется раз в окно и при reset.
+    std::uint32_t meterRevision() const noexcept { return publishedMeterRevision.load (std::memory_order_acquire); }
+
     int maxActiveVoiceCount() const { return peakActiveVoices; }
     int stolenCount() const { return stolenVoices; }
     float preFxPeak() const { return lastPreFxPeak; }
@@ -258,6 +272,44 @@ public:
     void resetStats() { peakActiveVoices = 0; stolenVoices = 0; notesStarted = 0; lastPreFxPeak = 0.0f; nonFiniteSamples = 0; }
 
 private:
+    // Подготовка вызывается только вне render(). GUI может читать атомарный
+    // снимок и во время перестройки, но не обращается к контейнеру voices.
+    void resetMetering (double sr) noexcept
+    {
+        const double rate = std::max (1.0, sr);
+        meterWindowFrames = std::max (1, (int) std::lround (rate * 0.01)); // 10 мс
+        meterReleaseCoef = (float) std::exp (-(double) meterWindowFrames / (rate * 0.12));
+        meterFrames = 0;
+        meterEnvelope.fill (0.0f);
+        for (auto& v : voices) v.clearMeters();
+        for (auto& meter : publishedMeters) meter.store (0.0f, std::memory_order_relaxed);
+        publishedMeterRevision.fetch_add (1, std::memory_order_release);
+    }
+
+    // Вызывается только аудиопотоком раз в 10 мс: пики за окно сбрасываются,
+    // а короткий экспоненциальный спад удерживает и краткие транзиенты для UI.
+    void publishMeters() noexcept
+    {
+        meterFrames = 0;
+        std::array<float, Voice::kSlots> peaks {};
+        for (auto& v : voices)
+        {
+            const auto& voicePeaks = v.slotMeters();
+            for (int i = 0; i < Voice::kSlots; ++i)
+                peaks[(size_t) i] = std::max (peaks[(size_t) i], voicePeaks[(size_t) i]);
+            v.clearMeters();
+        }
+        for (int i = 0; i < Voice::kSlots; ++i)
+        {
+            const float peak = std::isfinite (peaks[(size_t) i]) ? peaks[(size_t) i] : 0.0f;
+            float& level = meterEnvelope[(size_t) i];
+            level = std::max (peak, level * meterReleaseCoef);
+            if (level < 1.0e-8f) level = 0.0f; // не допускать denormal в длительной тишине
+            publishedMeters[(size_t) i].store (level, std::memory_order_relaxed);
+        }
+        publishedMeterRevision.fetch_add (1, std::memory_order_release);
+    }
+
     EngineBank bank;
     EngineRetireBin retireBin;
     Arpeggiator arpeggiator;
@@ -267,6 +319,13 @@ private:
     Patch patch = patchInit();
     FxChain fx;
     FxChain::Settings fxSettings;
+
+    // Только publishedMeters разделяется с GUI; остальное — локально аудиопотоку.
+    std::array<std::atomic<float>, Voice::kSlots> publishedMeters {};
+    std::atomic<std::uint32_t> publishedMeterRevision { 0 };
+    std::array<float, Voice::kSlots> meterEnvelope {};
+    int meterFrames = 0, meterWindowFrames = 480;
+    float meterReleaseCoef = 0.9200444f;
 
     double sampleRate = 48000.0;
     long long sampleCounter = 0;

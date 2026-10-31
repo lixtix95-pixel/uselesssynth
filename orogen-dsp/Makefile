@@ -7,8 +7,8 @@ INC      := -Isrc
 MONOJUICE_OBJ := build/monojuice_chorus.o build/monojuice_adapter.o
 
 TEST_BINS := build/test_wavetable build/test_fm build/test_harmonic build/test_sample \
-             build/test_granular build/test_granular_reverse build/test_modal build/test_resynth build/test_organics \
-             build/test_instrument build/test_fx build/test_chop
+             build/test_granular build/test_granular_reverse build/test_granular_streams build/test_modal build/test_resynth build/test_organics \
+             build/test_instrument build/test_meters build/test_fx build/test_chop
 DEMO_BINS := build/render_demo build/render_demo_sample build/render_demo_granular build/render_demo_modal \
              build/render_demo_resynth build/render_demo_organics build/render_demo_synth build/render_demo_instrument \
              build/render_demo_fx build/render_demo_comb build/render_demo_chop
@@ -51,6 +51,28 @@ build/test_granular_reverse: tests/test_granular_reverse.cpp tests/engine_suite.
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(INC) tests/test_granular_reverse.cpp -o $@
 
+build/test_granular_streams: tests/test_granular_streams.cpp tests/engine_suite.h src/instrument/*.h src/engines/*.h src/content/*.h src/core/*.h
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) $(INC) tests/test_granular_streams.cpp -o $@
+
+build/test_meters: tests/test_meters.cpp tests/engine_suite.h src/instrument/*.h src/engines/*.h src/content/*.h src/core/*.h $(MONOJUICE_OBJ)
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) $(INC) -pthread tests/test_meters.cpp $(MONOJUICE_OBJ) -o $@
+
+# Linux/GCC: отдельно, TSan и ASan нельзя смешивать. Компилируем сторонние
+# единицы тоже с инструментированием. -no-pie помогает TSan на этом раннере.
+build/test_meters_tsan: tests/test_meters.cpp tests/engine_suite.h src/instrument/*.h src/engines/*.h src/content/*.h src/core/*.h third_party/monojuice/dsp/*.cpp third_party/monojuice/dsp/*.h
+	@mkdir -p build
+	$(CXX) -O1 -g1 -std=c++17 -fsanitize=thread -fno-omit-frame-pointer -no-pie -pthread $(INC) tests/test_meters.cpp third_party/monojuice/dsp/ChorusCore.cpp third_party/monojuice/dsp/AudioAdapter.cpp -o $@
+
+.PHONY: tsan-meters
+tsan-meters: build/test_meters_tsan
+	OROGEN_METER_RACE_ONLY=1 TSAN_OPTIONS=halt_on_error=1 ./build/test_meters_tsan
+
+build/render_granular_streams: tools/render_granular_streams.cpp src/instrument/*.h src/engines/*.h src/content/*.h src/core/*.h
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) $(INC) tools/render_granular_streams.cpp -o $@
+
 # Отдельно от CPU-бенчмарка: санитайзеры заметно замедляют горячий цикл.
 build/test_granular_safety_asan: tests/test_granular_safety.cpp src/engines/granular.h src/engines/engine.h src/engines/mip_reader.h src/engines/sinc_interp.h src/engines/halfband.h src/content/sample_bank.h src/core/*.h
 	@mkdir -p build
@@ -59,6 +81,22 @@ build/test_granular_safety_asan: tests/test_granular_safety.cpp src/engines/gran
 .PHONY: asan-granular
 asan-granular: build/test_granular_safety_asan
 	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 ./build/test_granular_safety_asan
+
+build/test_granular_streams_asan: tests/test_granular_streams.cpp tests/engine_suite.h src/instrument/*.h src/engines/*.h src/content/*.h src/core/*.h
+	@mkdir -p build
+	$(CXX) -O1 -g1 -std=c++17 -fsanitize=address,undefined -fno-omit-frame-pointer $(INC) tests/test_granular_streams.cpp -o $@
+
+.PHONY: asan-streams
+asan-streams: build/test_granular_streams_asan
+	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 ./build/test_granular_streams_asan
+
+build/test_meters_asan: tests/test_meters.cpp tests/engine_suite.h src/instrument/*.h src/engines/*.h src/content/*.h src/core/*.h third_party/monojuice/dsp/*.cpp third_party/monojuice/dsp/*.h
+	@mkdir -p build
+	$(CXX) -O1 -g1 -std=c++17 -fsanitize=address,undefined -fno-omit-frame-pointer -pthread $(INC) tests/test_meters.cpp third_party/monojuice/dsp/ChorusCore.cpp third_party/monojuice/dsp/AudioAdapter.cpp -o $@
+
+.PHONY: asan-meters
+asan-meters: build/test_meters_asan
+	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 ./build/test_meters_asan
 
 build/test_delay_safety_asan: tests/test_delay_safety.cpp src/instrument/*.h src/core/*.h third_party/monojuice/dsp/*.h
 	@mkdir -p build

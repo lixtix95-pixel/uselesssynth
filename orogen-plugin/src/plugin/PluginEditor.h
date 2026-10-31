@@ -6,7 +6,7 @@
 //
 // Все элементы управления привязаны к реальным параметрам APVTS (см. Params.h) —
 // нарисованных «регуляторов без параметра» нет. Кнопка-«матрица» в шапке
-// патч-колонки открывает страницу PARAMS со всеми 294 параметрами, чтобы доступ
+// патч-колонки открывает страницу PARAMS со всеми 306 параметрами, чтобы доступ
 // к ним не потерялся: макет показывает ~50 самых нужных.
 #pragma once
 
@@ -217,6 +217,9 @@ private:
     std::array<std::uint64_t, 8> railVisualHashes {};
     std::uint64_t laneVisualHash = 0, chipVisualHash = 0, padVisualHash = 0, displayVisualHash = 0;
     std::array<float, 8> slotLevelsSmooth { };
+    std::uint32_t lastMeterRevision = 0;
+    double meterUnchangedSeconds = 0.0;
+    bool meterRevisionSeen = false;
     float animPhaseFor (double speed, double offset = 0.0) const;   // 0…1
 
     std::array<float, 8> slotLevels { };

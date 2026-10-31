@@ -3,7 +3,9 @@
 //
 //   render_ui <out.png> [view] [width] [height] [phase] [program]
 //             [cutoff] [filter] [morph] [mode] [scene] [elapsed-ms]
-// scene: fx-before | fx-change | fx-hover | hover | lfo-wrap (необязательно)
+// scene: fx-before | fx-change | fx-hover | hover | lfo-wrap | granular |
+//        anim-frames | transition-frames | lfo-wrap-frames (необязательно).
+// Для *-frames <out> — каталог из 40 PNG; GIF собирается отдельно.
 //
 // view: 0…7 = слоты A–H, 8…11 = секции патч-колонки (FX/MATRIX/ARP/LFO),
 //       100…104 = оверлей параметров, вкладки SLOT/FX/MOD/ARP-LFO/GLOBAL
@@ -82,6 +84,17 @@ int main (int argc, char** argv)
             prm->setValueNotifyingHost (prm->convertTo0to1 ((float) patchMode));
 
     auto* ore = static_cast<OrogenEditor*> (editor.get());
+    if (scene == "granular")
+    {
+        const auto set = [&proc] (const char* id, float value) {
+            if (auto* p = proc.apvts.getParameter (id))
+                p->setValueNotifyingHost (p->convertTo0to1 (value));
+        };
+        set ("sA_on", 1.0f);
+        set ("sA_type", 4.0f);
+        set ("sA_table", 0.0f);
+        set ("sA_grainReverse", 0.5f);
+    }
     // Статические скриншоты оверлея должны показывать финальное состояние,
     // а не первый кадр перехода при открытии вкладки.
     if (page >= 100) { ore->setAnimationsEnabled (false); ore->setAnimationsEnabled (true); }
@@ -91,6 +104,56 @@ int main (int argc, char** argv)
     {
         std::fprintf (stderr, "превью не готово за 30 секунд\n");
         return 2;
+    }
+
+    // Серии кадров: один редактор, одна реальная очередь сообщений и
+    // тот же таймер, что в плагине. Для периодического кадра фазу задаём
+    // явно; для перехода и LFO сохраняем фактический ход времени таймера.
+    if (scene == "anim-frames" || scene == "transition-frames" || scene == "lfo-wrap-frames")
+    {
+        if (out.createDirectory().failed()) { std::fprintf (stderr, "не удалось создать каталог кадров\n"); return 3; }
+        ore->setAnimationsEnabled (true);
+        if (scene == "transition-frames")
+        {
+            ore->showPage (8);
+            mm->runDispatchLoopUntil (220);
+        }
+        if (scene == "lfo-wrap-frames")
+        {
+            const auto set = [&proc] (const char* id, float value) {
+                if (auto* p = proc.apvts.getParameter (id))
+                    p->setValueNotifyingHost (p->convertTo0to1 (value));
+            };
+            ore->setAnimationsEnabled (false);
+            set ("lfo1_shape", 2.0f); set ("lfo1_amount", 0.8f); set ("lfo1_rate", 5.0f);
+            ore->setAnimationPhase (0.792);
+            set ("lfo1_rate", 0.05f);
+            ore->setAnimationsEnabled (true);
+        }
+        for (int i = 0; i < 40; ++i)
+        {
+            if (scene == "anim-frames") ore->setAnimationPhase (0.05 * (double) i);
+            else
+            {
+                if (scene == "transition-frames" && i == 4) ore->nextColumnPage (0);
+                if (scene == "transition-frames" && i == 14) ore->hoverKnob (0, true);
+                if (scene == "transition-frames" && i == 29) ore->hoverKnob (0, false);
+                mm->runDispatchLoopUntil (50);
+            }
+            juce::Image frame (juce::Image::ARGB, w, h, true);
+            { juce::Graphics g (frame); editor->paintEntireComponent (g, true); }
+            const auto file = out.getChildFile ("frame" + juce::String (i).paddedLeft ('0', 3) + ".png");
+            file.deleteFile();
+            juce::FileOutputStream stream (file);
+            juce::PNGImageFormat png;
+            if (! stream.openedOk() || ! png.writeImageToStream (frame, stream))
+            { std::fprintf (stderr, "не удалось записать кадр %d\n", i); return 4; }
+        }
+        std::printf ("записано 40 кадров: %s\n", out.getFullPathName().toRawUTF8());
+        editor.reset();
+        juce::DeletedAtShutdown::deleteAll();
+        juce::MessageManager::deleteInstance();
+        return 0;
     }
 
     // Необязательные сцены для GIF: используем тот же таймер редактора,

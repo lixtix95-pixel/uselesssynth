@@ -5,6 +5,7 @@
 #include "../src/plugin/PluginProcessor.h"
 #include "../src/plugin/PluginEditor.h"
 #include "../src/plugin/UiParamMap.h"
+#include "../src/plugin/EngineUi.h"
 
 #include <cstdio>
 #include <csignal>
@@ -691,6 +692,9 @@ static void testGuiRegressions()
         setP (p, "gl_morph", 0.1f);
         setP (p, "sB_on", 0.0f);
         setP (p, "sB_type", 0.0f);
+        setP (p, "sA_on", 0.0f);
+        setP (p, "sA_type", (float) EngineType::Granular);
+        setP (p, "sA_grainReverse", 0.0f);
         editor->addToDesktop (0);
         editor->setTopLeftPosition (0, 0);
         editor->setVisible (true);
@@ -716,13 +720,20 @@ static void testGuiRegressions()
         const auto lfo = nativeChange ("lfo1_amount", 0.90f, { 262, 356, 708, 44 });
         const auto rail = nativeChange ("sB_type", 4.0f, { 16, 136, 216, 62 });
         const auto pad = nativeChange ("gl_morph", 0.80f, { 1108, 646, 156, 138 });
-        std::printf ("   native/fresh px: значение %d/%d, FX %d/%d, LFO %d/%d, слот B %d/%d, pad %d/%d\n",
-                     label[0], label[1], chip[0], chip[1], lfo[0], lfo[1], rail[0], rail[1], pad[0], pad[1]);
+        const auto reverseOff = nativeChange ("sA_grainReverse", 0.73f, { 840, 96, 130, 10 });
+        setP (p, "sA_on", 1.0f);
+        juce::MessageManager::getInstance()->runDispatchLoopUntil (500);
+        const auto reverseOn = nativeChange ("sA_grainReverse", 0.31f, { 840, 96, 130, 10 });
+        std::printf ("   native/fresh px: значение %d/%d, FX %d/%d, LFO %d/%d, слот B %d/%d, pad %d/%d, Reverse off/on %d/%d / %d/%d\n",
+                     label[0], label[1], chip[0], chip[1], lfo[0], lfo[1], rail[0], rail[1], pad[0], pad[1],
+                     reverseOff[0], reverseOff[1], reverseOn[0], reverseOn[1]);
         check (label[1] > 5 && label[0] > 5, "значение центральной ручки перерисовывается в настоящем окне");
         check (chip[1] > 20 && chip[0] > 20, "автоматизация FX обновляет чип при выключенных анимациях");
         check (lfo[1] > 20 && lfo[0] > 20, "автоматизация LFO обновляет график при выключенных анимациях");
         check (rail[1] > 20 && rail[0] > 20, "автоматизация типа выключенного слота обновляет рейл");
         check (pad[1] > 20 && pad[0] > 20, "автоматизация Morph обновляет векторный блок");
+        check (reverseOff[0] > 5 && reverseOff[1] > 5 && reverseOn[0] > 5 && reverseOn[1] > 5,
+               "автоматизация Grain Reverse обновляет статус в нативном окне при выключенном и включённом слоте");
         editor->removeFromDesktop();
     }
     else std::printf ("   native-window тесты пропущены: нужен оконный менеджер и OROGEN_GUI_NATIVE=1\n");
@@ -854,6 +865,113 @@ static void testGuiRegressions()
     check (visibleReverse == 8 && boundReverse == 8 && collectedReverse,
            "восемь регуляторов Reverse доступны в секциях SLOT и связаны с DSP",
            juce::String (visibleReverse) + "/8 видимы, " + juce::String (boundReverse) + "/8 связаны");
+
+    // Все подписи, включая девять вариантов смысла макросов и источника,
+    // должны помещаться при увеличенном шрифте в исходной геометрии 1280×800.
+    editor->showPage (201);
+    setP (p, "sA_type", (float) EngineType::Granular);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil (120);
+    const int contentWidth = viewport != nullptr && viewport->getViewedComponent() != nullptr
+                           ? viewport->getViewedComponent()->getWidth() : 0;
+    const int captionWidth = contentWidth > 0 ? contentWidth / juce::jlimit (2, 5, contentWidth / 260) - 4 : 0;
+    float widest = 0.0f;
+    juce::String longest;
+    int measured = 0, tooWide = 0;
+    auto measureLabel = [&] (const juce::String& label)
+    {
+        juce::GlyphArrangement glyphs;
+        glyphs.addLineOfText (orFont (Palette::paramLabelSize), label, 0.0f, 0.0f);
+        const float w = glyphs.getBoundingBox (0, -1, true).getWidth();
+        if (w > widest) { widest = w; longest = label; }
+        ++measured;
+        if (w > (float) captionWidth) ++tooWide;
+    };
+    for (const auto& tab : buildUiTabs())
+        for (const auto& section : tab.sections)
+            for (const auto& id : section.ids)
+                if (auto* parameter = p.apvts.getParameter (id))
+                {
+                    const auto name = parameter->getName (64);
+                    const bool slotId = id.length() >= 5 && id[0] == 's' && id[1] >= 'A' && id[1] <= 'H' && id[2] == '_';
+                    const auto field = slotId ? id.substring (3) : juce::String();
+                    const bool macro = field.length() == 2 && field[0] == 'p' && field[1] >= '0' && field[1] <= '3';
+                    if (macro || field == "table" || field == "grainReverse")
+                    {
+                        for (int type = 0; type < 9; ++type)
+                        {
+                            const juce::String meaning = macro ? engineMacroName (type, (int) (field[1] - '0'))
+                                : field == "grainReverse" ? (type == (int) EngineType::Granular ? "PROBABILITY 0-1" : "UNUSED")
+                                                         : engineSourceControlName (type);
+                            measureLabel (name + "  ·  " + meaning);
+                        }
+                    }
+                    else measureLabel (name);
+                }
+    auto nonMonoPixels = [] (const juce::Image& img)
+    {
+        long long count = 0;
+        for (int y = 0; y < img.getHeight(); ++y)
+            for (int x = 0; x < img.getWidth(); ++x)
+            {
+                const auto c = img.getPixelAt (x, y);
+                if (c.getRed() != c.getGreen() || c.getGreen() != c.getBlue()) ++count;
+            }
+        return count;
+    };
+    long long nonMono = nonMonoPixels (capture (*editor));
+    // И страницы ALL, где появляется полоса прокрутки: стандартный JUCE
+    // раньше рисовал её синим, хотя короткая страница выглядела монохромной.
+    for (int tab = 0; tab < 5; ++tab)
+    {
+        editor->showPage (100 + tab);
+        nonMono += nonMonoPixels (capture (*editor));
+    }
+    std::printf ("   PARAMS: шрифт %.1f px, %d вариантов, max %.1f/%d px (%s), не-монохромных пикселей %lld на 6 страницах\n",
+                 Palette::paramLabelSize, measured, widest, captionWidth, longest.toRawUTF8(), nonMono);
+    check (measured >= 306 && captionWidth > 0 && tooWide == 0,
+           "все подписи параметров и девять контекстов помещаются в колонку",
+           juce::String (tooWide) + " обрезаны");
+    check (nonMono == 0, "шесть страниц PARAMS монохромны, включая поля и полосу прокрутки",
+           juce::String (nonMono) + " пикселей");
+   #if JUCE_LINUX || JUCE_BSD
+    if (std::getenv ("OROGEN_GUI_NATIVE") != nullptr)
+    {
+        editor->showPage (201);
+        editor->addToDesktop (0); editor->setTopLeftPosition (0, 0); editor->setVisible (true);
+        juce::MessageManager::getInstance()->runDispatchLoopUntil (300);
+        if (aReverse != nullptr) aReverse->showTextBox();
+        juce::MessageManager::getInstance()->runDispatchLoopUntil (150);
+        juce::Label* valueBox = nullptr;
+        if (aReverse != nullptr)
+            for (auto* child : aReverse->getChildren())
+                if (auto* label = dynamic_cast<juce::Label*> (child)) valueBox = label;
+        const bool editing = valueBox != nullptr && valueBox->getCurrentTextEditor() != nullptr;
+        const auto focusedImage = capture (*editor);
+        const auto focusedNonMono = nonMonoPixels (focusedImage);
+        std::printf ("   редактирование числа: активно %s, не-монохромных пикселей %lld, LNF %s\n",
+                     editing ? "да" : "нет", focusedNonMono,
+                     aReverse != nullptr && dynamic_cast<OrLookAndFeel*> (&aReverse->getLookAndFeel()) != nullptr ? "OROGEN" : "другой");
+        if (focusedNonMono != 0)
+        {
+            int shown = 0;
+            for (int y = 0; y < focusedImage.getHeight() && shown < 5; ++y)
+                for (int x = 0; x < focusedImage.getWidth() && shown < 5; ++x)
+                {
+                    const auto c = focusedImage.getPixelAt (x, y);
+                    if (c.getRed() != c.getGreen() || c.getGreen() != c.getBlue())
+                    {
+                        std::printf ("   цветной пиксель %d,%d = %u,%u,%u\n", x, y, c.getRed(), c.getGreen(), c.getBlue());
+                        ++shown;
+                    }
+                }
+        }
+        check (editing && focusedNonMono == 0,
+               "фокус и выделение числового поля остаются монохромными",
+               juce::String (focusedNonMono) + " пикселей");
+        if (valueBox != nullptr) valueBox->hideEditor (true);
+        editor->removeFromDesktop();
+    }
+   #endif
     for (int s = 0; s < 8; ++s) setP (p, slotPrefix (s) + "grainReverse", 0.0f);
 
     // Все четыре новых параметра представлены живыми SliderAttachment.
@@ -1306,6 +1424,130 @@ static void testDelayProcessorRegression()
            "новое значение Delay Time действительно меняет звук", num (diffRms, 6));
 }
 
+// Снимаем реальные clip bounds paint() нативного окна. Обычный снимок
+// компонента всегда перерисовывает весь экран и не обнаруживает лишний repaint.
+class MeterPaintProbe : public OrogenEditor
+{
+public:
+    explicit MeterPaintProbe (OrogenProcessor& p) : OrogenEditor (p) {}
+    void paint (juce::Graphics& g) override
+    {
+        if (recording)
+        {
+            const auto r = g.getClipBounds();
+            ++calls;
+            pixels += (long long) r.getWidth() * (long long) r.getHeight();
+            maxArea = std::max (maxArea, r.getWidth() * r.getHeight());
+            if (r.getWidth() >= getWidth() && r.getHeight() >= getHeight()) ++full;
+        }
+        OrogenEditor::paint (g);
+    }
+    bool recording = false;
+    int calls = 0, full = 0, maxArea = 0;
+    long long pixels = 0;
+};
+
+static void testNativeMeterPaint()
+{
+   #if JUCE_LINUX || JUCE_BSD
+    if (std::getenv ("OROGEN_GUI_NATIVE") == nullptr) return;
+    std::printf ("\n--- Нативный GUI: обновление метров во время ноты ---\n");
+    OrogenProcessor p;
+    p.setCurrentProgram (0);
+    p.setPlayConfigDetails (0, 2, 48000.0, 512);
+    p.prepareToPlay (48000.0, 512);
+    soloSlot (p, 0, (int) EngineType::Granular);
+    setP (p, "sA_attack", 0.005f); setP (p, "sA_decay", 0.1f);
+    setP (p, "sA_sustain", 1.0f); setP (p, "sA_release", 0.05f); setP (p, "sA_tail", 0.0f);
+    MeterPaintProbe editor (p);
+    editor.setAnimationsEnabled (false);
+    editor.showPage (0);
+    editor.addToDesktop (0); editor.setTopLeftPosition (0, 0); editor.setVisible (true);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil (1800);
+    auto native = [&] {
+        return editor.getPeer() != nullptr
+            ? juce::createSnapshotOfNativeWindow (editor.getPeer()->getNativeHandle()) : juce::Image();
+    };
+    const auto before = native();
+    juce::AudioBuffer<float> block (2, 512);
+    juce::MidiBuffer midi, empty;
+    midi.addEvent (juce::MidiMessage::noteOn (1, 60, 1.0f), 0);
+    editor.recording = true;
+    for (int k = 0; k < 25; ++k)
+    {
+        for (int j = 0; j < 4; ++j)
+        {
+            block.clear();
+            p.processBlock (block, k == 0 && j == 0 ? midi : empty);
+        }
+        juce::MessageManager::getInstance()->runDispatchLoopUntil (45);
+    }
+    editor.recording = false;
+    const auto during = native();
+    const auto delta = [&] (const juce::Image& a, const juce::Image& b) {
+        if (! a.isValid() || ! b.isValid()) return -1;
+        int n = 0;
+        for (int y = 90; y < 104; ++y) for (int x = 21; x < 36; ++x)
+            if (a.getPixelAt (x, y) != b.getPixelAt (x, y)) ++n;
+        return n;
+    };
+    const int changedPixels = delta (before, during);
+    // Хост может остановить аудиоколбэк вообще, даже пока GUI открыт.
+    // Должно погаснуть без вызовов processBlock и снова загореться после них.
+    const auto revisionBeforeStall = p.engine().meterRevision();
+    juce::MessageManager::getInstance()->runDispatchLoopUntil (1300);
+    const auto stalled = native();
+    const auto revisionAfterStall = p.engine().meterRevision();
+    for (int k = 0; k < 12; ++k)
+    {
+        for (int j = 0; j < 4; ++j) { block.clear(); p.processBlock (block, empty); }
+        juce::MessageManager::getInstance()->runDispatchLoopUntil (45);
+    }
+    const auto resumed = native();
+    const auto revisionAfterResume = p.engine().meterRevision();
+    const int stallPixels = delta (during, stalled), resumePixels = delta (stalled, resumed);
+    juce::MidiBuffer noteOff;
+    noteOff.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+    for (int k = 0; k < 54; ++k)
+    {
+        for (int j = 0; j < 4; ++j)
+        {
+            block.clear();
+            p.processBlock (block, k == 0 && j == 0 ? noteOff : empty);
+        }
+        juce::MessageManager::getInstance()->runDispatchLoopUntil (30);
+    }
+    const auto after = native();
+    juce::Image fresh (juce::Image::ARGB, 1280, 800, true);
+    { juce::Graphics g (fresh); editor.paintEntireComponent (g, true); }
+    int stalePixels = 0;
+    if (after.isValid())
+        for (int y = 84; y < 110; ++y) for (int x = 16; x < 41; ++x)
+            if (after.getPixelAt (x, y) != fresh.getPixelAt (x, y)) ++stalePixels;
+    const int fadePixels = delta (during, after);
+    std::printf ("   paint: %d вызовов, %d полных, средний clip %.0f px, max %d; LED вход/спад Δ %d/%d px, stale %d px\n",
+                 editor.calls, editor.full, editor.calls ? (double) editor.pixels / editor.calls : 0.0,
+                 editor.maxArea, changedPixels, fadePixels, stalePixels);
+    std::printf ("   остановка/возобновление processBlock: Δ %d/%d px, ревизия %u → %u → %u\n",
+                 stallPixels, resumePixels, revisionBeforeStall, revisionAfterStall, revisionAfterResume);
+    check (editor.calls > 3 && editor.full == 0 && editor.maxArea <= 500,
+           "метры обновляют только свечение индикатора, не всё окно",
+           juce::String (editor.full) + " полных кадров, max " + juce::String (editor.maxArea) + " px");
+    check (changedPixels > 3 && fadePixels > 3,
+           "индикатор загорается и затухает в нативном окне",
+           juce::String (changedPixels) + "/" + juce::String (fadePixels) + " px");
+    check (after.isValid() && stalePixels == 0,
+           "частичный repaint не оставляет следов вокруг индикатора",
+           juce::String (stalePixels) + " px");
+    check (revisionBeforeStall == revisionAfterStall && revisionAfterResume != revisionAfterStall
+           && stallPixels > 3 && resumePixels > 3,
+           "при остановке аудиоколбэка метр гаснет, а при возобновлении снова работает",
+           juce::String (stallPixels) + "/" + juce::String (resumePixels) + " px");
+    editor.removeFromDesktop();
+    p.releaseResources();
+   #endif
+}
+
 int main (int argc, char** argv)
 {
     // Голова без X11: GUI-инициализация здесь упала бы (нет дисплея), а
@@ -1347,6 +1589,14 @@ int main (int argc, char** argv)
         juce::DeletedAtShutdown::deleteAll();
         juce::MessageManager::deleteInstance();
         std::printf ("\nGranular AudioProcessor: провалов %d\n", failures);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "--meter-ui-only")
+    {
+        testNativeMeterPaint();
+        juce::DeletedAtShutdown::deleteAll();
+        juce::MessageManager::deleteInstance();
+        std::printf ("\nНативные метры GUI: провалов %d\n", failures);
         return failures == 0 ? 0 : 1;
     }
     if (argc > 1 && juce::String (argv[1]) == "--gui-only")
@@ -3589,6 +3839,7 @@ int main (int argc, char** argv)
     }
 
     testGuiRegressions();
+    testNativeMeterPaint();
     testEditorControlLifetime();
     testGranularProcessorRegression();
     testGranularReverseProcessor();

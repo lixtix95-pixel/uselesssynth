@@ -725,6 +725,14 @@ public:
 
         addAndMakeVisible (viewport);
         viewport.setScrollBarsShown (true, false);
+        // Viewport создаётся до присоединения к редактору: без явной палитры
+        // JUCE оставлял ярко-синий thumb на длинных страницах ALL.
+        for (auto* bar : { &viewport.getVerticalScrollBar(), &viewport.getHorizontalScrollBar() })
+        {
+            bar->setColour (juce::ScrollBar::thumbColourId, Palette::textDim);
+            bar->setColour (juce::ScrollBar::backgroundColourId, juce::Colours::transparentBlack);
+            bar->setColour (juce::ScrollBar::trackColourId, juce::Colours::transparentBlack);
+        }
 
         addAndMakeVisible (closeButton);
         closeButton.onClick = [this] { if (onClose) onClose(); };
@@ -1009,6 +1017,13 @@ private:
                     {
                         auto* sl = new juce::Slider (juce::Slider::LinearHorizontal,
                                                      juce::Slider::TextBoxRight);
+                        // Контент строится до присоединения оверлея к редактору.
+                        // Не даём временной стандартной палитре JUCE сохранить
+                        // синеватую рамку и цвет выделения в числовых полях.
+                        sl->setColour (juce::Slider::textBoxTextColourId, Palette::text);
+                        sl->setColour (juce::Slider::textBoxBackgroundColourId, Palette::bg);
+                        sl->setColour (juce::Slider::textBoxOutlineColourId, Palette::lineHi);
+                        sl->setColour (juce::Slider::textBoxHighlightColourId, Palette::lineMid);
                         sl->setTextBoxStyle (juce::Slider::TextBoxRight, false, 56, 15);
                         addAndMakeVisible (sl);
                         sliderAtts.push_back (std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
@@ -1119,8 +1134,8 @@ private:
                     draw::caption (g, e.section, header.withTrimmedLeft (10), Palette::text, 7.5f);
                 }
 
-                g.setColour (Palette::textFaint);
-                g.setFont (orFont (7.0f));
+                g.setColour (Palette::paramLabel);
+                g.setFont (orFont (Palette::paramLabelSize));
                 const auto label = e.ctl->getProperties().getWithDefault ("contextLabel", e.name).toString();
                 g.drawText (label, e.captionRect, juce::Justification::centredLeft, true);
             }
@@ -1392,6 +1407,8 @@ OrogenEditor::OrogenEditor (OrogenProcessor& p)
 {
     lnf = std::make_unique<OrLookAndFeel>();
     setLookAndFeel (lnf.get());
+    slotLevels.fill (-120.0f);
+    slotLevelsSmooth.fill (-120.0f);
 
     setOpaque (true);
     setResizable (true, false);
@@ -2121,7 +2138,7 @@ void OrogenEditor::repaintChangedValues()
     // previewPatchHash специально игнорирует его звуковые параметры.
     VisualHash display;
     display.add ((float) selectedSlot);
-    for (const auto* field : { "on", "type", "table", "filter" }) display.add (pv (slotId (field)));
+    for (const auto* field : { "on", "type", "table", "filter", "grainReverse" }) display.add (pv (slotId (field)));
     display.add (pv ("gl_mode")); display.add (pv ("gl_morph"));
     if (changed (display.value, displayVisualHash)) repaint (R (248.0f, 66.0f, 736.0f, 214.0f));
     visualHashesValid = true;
@@ -2164,16 +2181,33 @@ void OrogenEditor::timerCallback()
         repaintAnimated();                  // только живые зоны, не весь экран
     }
 
+    const auto revision = proc.engine().meterRevision();
+    if (! meterRevisionSeen || revision != lastMeterRevision)
+    {
+        meterRevisionSeen = true;
+        lastMeterRevision = revision;
+        meterUnchangedSeconds = 0.0;
+    }
+    else meterUnchangedSeconds += dt;
     float db[8] = { -120.0f, -120.0f, -120.0f, -120.0f, -120.0f, -120.0f, -120.0f, -120.0f };
     proc.engine().slotLevelsDb (db);
 
     for (int i = 0; i < 8; ++i)
     {
+        // Некоторые хосты полностью останавливают processBlock при тишине.
+        // Если 250 мс нет публикаций, гасим только визуальный уровень; при
+        // возобновлении аудио новая ревизия сразу возвращает реальные значения.
+        const float target = meterUnchangedSeconds > 0.25 ? -120.0f : db[i];
         // метры: спад не мгновенный, а с постоянной времени ~120 мс
-        const float target = db[i];
         float& sm = slotLevelsSmooth[(size_t) i];
         sm += (target - sm) * (dt > 0.0 ? (float) juce::jmin (1.0, dt / 0.12) : 0.2f);
-        if (std::abs (sm - slotLevels[(size_t) i]) > 0.2f) { slotLevels[(size_t) i] = sm; changed = true; }
+        if (std::abs (sm - slotLevels[(size_t) i]) > 0.2f)
+        {
+            slotLevels[(size_t) i] = sm;
+            // draw::led: центр (28, 97+70*i), радиус 2.8, свечение до 3r.
+            // Перерисовываем его с запасом, а не всё окно/всю карточку.
+            repaint (R (18.0f, 87.0f + 70.0f * (float) i, 20.0f, 20.0f));
+        }
     }
 
     // Статические графики, чипы, рейл и pad обновляются от параметров даже
@@ -2418,6 +2452,17 @@ void OrogenEditor::paintDisplay (juce::Graphics& g)
                    Palette::textFaint, 6.0f);
     draw::caption (g, "drag x: " + selectedMacroLabel (0) + " / y: " + selectedMacroLabel (1),
                    { 578, 96, 258, 10 }, Palette::textFaint, 5.8f);
+    // Не новый контрол: статус уже существующего параметра выбранного слота.
+    // Видно и при выключенном слоте; изменение из PARAMS/хоста обновляется
+    // даже без включённых анимаций.
+    if (type == (int) EngineType::Granular)
+    {
+        const int reverse = juce::roundToInt (100.0f * juce::jlimit (0.0f, 1.0f, pv (slotId ("grainReverse"))));
+        g.setColour (Palette::textDim);
+        g.setFont (orFont (8.5f));
+        g.drawText ("GRAIN REV " + juce::String (reverse) + "%", juce::Rectangle<int> (840, 96, 130, 10),
+                    juce::Justification::centredRight, false);
+    }
 
     // подпись: движок + контент (для вейвтейбла — имя таблицы)
     juce::String sub = juce::String (engineName (type)).toUpperCase();

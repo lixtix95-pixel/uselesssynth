@@ -8,8 +8,11 @@
 
 ```bash
 # VST3-обёртка (JUCE 8) лежит рядом: ../orogen-plugin, см. PLUGIN.md
-make test     # 12 наборов: 9 движков, отдельный reverse, инструмент и FX
-make asan-granular  # отдельная автоматизация Granular под ASan/UBSan; GCC/Clang
+make test     # 14 наборов: движки, reverse/потоки, инструмент/метры и FX
+make asan-granular  # границы Granular под ASan/UBSan; GCC/Clang
+make asan-streams   # независимые потоки направлений под ASan/UBSan
+make asan-meters    # метры и полифония под ASan/UBSan
+make tsan-meters    # гонка аудиопотока/GUI под TSan (Linux/GCC, отдельно от ASan)
 make asan-delay     # отдельная автоматизация Delay под ASan/UBSan; GCC/Clang
 make demo     # 11 офлайн-рендеров в audio/*.wav + спектрограммы
 make build/render_demo_fx && ./build/render_demo_fx       # audio/fx_demo.wav (34 с)
@@ -17,7 +20,10 @@ make build/render_demo_comb && ./build/render_demo_comb   # audio/comb_chorus_de
 ```
 
 Требуется g++ ≥ 10 (C++17) и GNU make. Никаких внешних зависимостей.
-Последний полный прогон 30.10.2026: 12/12 наборов, **354 OK / 0 FAIL**.
+Последний полный прогон 31.10.2026: 14/14 наборов, **370 OK / 0 FAIL**.
+Метры публикуют пики окнами 10 мс через атомики, с экспоненциальным спадом
+120 мс; TSan до исправления обнаружил гонку чтения/записи, после — 0 отчётов
+в проверенном сценарии. ASan/UBSan потоков Reverse и метров прошли отдельно.
 ASan/UBSan Granular: 240 сценариев / 3013 зёрен с автоматизацией, 432 / 3114
 с вероятностями реверса 0/50/100%, 216 / 2016 на границе 10 мс и 30 быстрых +
 96 медленных зёрен длинного источника, без ошибок. Отдельный ASan/UBSan Delay: три sample rate,
@@ -56,7 +62,7 @@ LICENSE         GPL-3.0 (весь проект), NOTICE.md — что чьё
 | 2 | FM | **готов**: алиасинг −67.8 дБ, 0.10 % CPU/голос, 6 пресетов | [ENGINE-02-fm.md](ENGINE-02-fm.md) |
 | 3 | Harmonic | **готов**: алиасинг −87.6 дБ, 64 партиала, 0.93 % CPU/голос | [ENGINE-03-harmonic.md](ENGINE-03-harmonic.md) |
 | 4 | Sample | общий MIP до 11 уровней; текущий стенд 14/14, полная доводка отдельно | [ENGINE-04-sample.md](ENGINE-04-sample.md) |
-| 5 | Granular | стенд 49/49 + реверс 8/8; исправлена оценка обоих концов обратного зерна; headroom Choir остаётся открытым | [ENGINE-05-granular.md](ENGINE-05-granular.md) |
+| 5 | Granular | стенд 49/49 + reverse 8/8 + независимые потоки 7/7; headroom Choir остаётся открытым | [ENGINE-05-granular.md](ENGINE-05-granular.md) |
 | 6 | Modal | **готов**: алиасинг −92.9 дБ, T60 0.25…12 с, 0.38 % CPU/голос | [ENGINE-06-modal.md](ENGINE-06-modal.md) |
 | 7 | Resynth | **готов**: алиасинг −73.6 дБ, stretch 0.25…4× независим от питча, 1.19 % CPU/голос | [ENGINE-07-resynth.md](ENGINE-07-resynth.md) |
 | 8 | Organics | исправлены склейка и короткий источник; остальные перепады требуют отдельной доводки | [ENGINE-08-organics.md](ENGINE-08-organics.md) |

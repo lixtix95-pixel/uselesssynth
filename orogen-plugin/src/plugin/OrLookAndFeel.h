@@ -14,10 +14,10 @@ namespace orogen
 struct Palette
 {
     // Фон и панели
-    static inline const juce::Colour bg        { 0xff06070a };   // общий фон окна
-    static inline const juce::Colour panel     { 0xff0a0c10 };   // панель/карточка
-    static inline const juce::Colour panelAlt  { 0xff0d1015 };   // вложенная панель
-    static inline const juce::Colour disc      { 0xff0b0d11 };   // тело ручки
+    static inline const juce::Colour bg        { 0xff080808 };   // общий фон окна
+    static inline const juce::Colour panel     { 0xff0c0c0c };   // панель/карточка
+    static inline const juce::Colour panelAlt  { 0xff101010 };   // вложенная панель
+    static inline const juce::Colour disc      { 0xff0d0d0d };   // тело ручки
 
     // Линии
     static inline const juce::Colour line      { 0x1affffff };   // 10 % белого — рамки
@@ -27,21 +27,23 @@ struct Palette
     static inline const juce::Colour tickOff   { 0x24ffffff };   // неактивная насечка
 
     // Текст и сигнал
-    static inline const juce::Colour text      { 0xffe9eef3 };
-    static inline const juce::Colour textDim   { 0x8ae9eef3 };    // 54 %
+    static inline const juce::Colour text      { 0xffededed };
+    static inline const juce::Colour textDim   { 0x8aededed };    // 54 %
     static inline const juce::Colour textFaint { 0x66ffffff };
+    // В оверлее это подписи параметров, а не декоративные элементы: они
+    // должны оставаться читаемыми в масштабе 1280×800.
+    static inline const juce::Colour paramLabel { 0xc0f2f2f2 };
+    static constexpr float paramLabelSize = 10.0f;
     static inline const juce::Colour signal    { 0xffffffff };   // кривые, дуги, заливки
-    static inline const juce::Colour hot       { 0xffff6a5c };
 
-    // Цвет слота A–H: только для точки-идентификатора в рейле, чтобы слоты
-    // различались, когда включено несколько сразу.
+    // Индикаторы A–H различаются яркостью, но не оттенком: монохромный макет.
     static juce::Colour slot (int i)
     {
         static const juce::Colour c[8] =
         {
-            juce::Colour (0xffeaf2f8), juce::Colour (0xffb9c6d2), juce::Colour (0xff9fb0c0),
-            juce::Colour (0xffc8b6a4), juce::Colour (0xffa8b8a4), juce::Colour (0xffbfb6cf),
-            juce::Colour (0xffc6aaa8), juce::Colour (0xff9db4bf)
+            juce::Colour (0xfff0f0f0), juce::Colour (0xffc4c4c4), juce::Colour (0xffafafaf),
+            juce::Colour (0xffb8b8b8), juce::Colour (0xffb4b4b4), juce::Colour (0xffbababa),
+            juce::Colour (0xffafafaf), juce::Colour (0xffafafaf)
         };
         return c[(size_t) juce::jlimit (0, 7, i)];
     }

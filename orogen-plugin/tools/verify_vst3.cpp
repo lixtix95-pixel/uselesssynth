@@ -417,6 +417,67 @@ int main (int argc, char** argv)
     }
     reference.reset(); reversed.reset();
 
+    // Два одинаковых Granular-слота в противоположных каналах. Только
+    // случайность направления на 50% должна их рассинхронизировать; на
+    // 0/100% одинаковые крайние режимы остаются идентичными.
+    std::printf ("\n--- Независимость Reverse A/B через реальный VST3 ---\n");
+    double stereoDiff[3] {}, corr[3] {};
+    int stereoMissing = 0, stereoBad = 0, stereoCreated = 0;
+    for (int mode = 0; mode < 3; ++mode)
+    {
+        String createError;
+        auto stereo = format->createInstanceFromDescription (d, 48000.0, 128, createError);
+        if (stereo == nullptr) { std::printf ("   ошибка инстанса: %s\n", createError.toRawUTF8()); continue; }
+        ++stereoCreated;
+        stereo->prepareToPlay (48000.0, 128);
+        const auto set = [&] (const String& name, float value) {
+            for (auto* parameter : stereo->getParameters())
+                if (parameter->getName (64) == name) { parameter->setValueNotifyingHost (value); return; }
+            ++stereoMissing; std::printf ("   не найден: %s\n", name.toRawUTF8());
+        };
+        for (const char letter : { 'A', 'B' })
+        {
+            const String prefix = "s" + String::charToString ((juce_wchar) letter) + "_";
+            set (prefix + "Engine", 0.5f); set (prefix + "On", 1.0f);
+            set (prefix + "P1", 0.35f); set (prefix + "P2", 0.45f);
+            set (prefix + "P3", 0.7f); set (prefix + "P4", 0.3f);
+            set (prefix + "Table", 0.0f); set (prefix + "Detune", 0.0f);
+            set (prefix + "Grain Reverse", 0.5f * (float) mode);
+            set (prefix + "Level", 0.4f); set (prefix + "Pan", letter == 'A' ? 0.0f : 1.0f);
+            set (prefix + "Attack", 0.0f); set (prefix + "Decay", 0.1f);
+            set (prefix + "Sustain", 1.0f); set (prefix + "Release", 0.1f);
+            set (prefix + "Tail", 0.0f); set (prefix + "Cutoff", 1.0f); set (prefix + "Reso", 0.0f);
+        }
+        for (const char* name : { "sC_On", "sD_On", "sE_On", "sF_On", "sG_On", "sH_On" }) set (name, 0.0f);
+        set ("Patch Mode", 0.0f); set ("Arp On", 0.0f); set ("Stereo Width", 1.0f); set ("Width", 2.0f / 3.0f);
+        for (const char* name : { "Drive", "Chorus Mix", "Delay Mix", "Reverb Mix", "Plate Mix", "Material Mix",
+                                  "Spectre Mix", "Glitch Mix", "Robin Mix", "Comb Mix", "Comp Ratio", "Comp Makeup" }) set (name, 0.0f);
+        MessageManager::getInstance()->runDispatchLoopUntil (200);
+        AudioBuffer<float> block (2, 128);
+        MidiBuffer note, none; note.addEvent (MidiMessage::noteOn (1, 60, 0.8f), 0);
+        double dl = 0.0, ll = 0.0, rr = 0.0, lr = 0.0;
+        for (int b = 0; b < 900; ++b)
+        {
+            block.clear(); stereo->processBlock (block, b == 0 ? note : none);
+            if (b < 16) continue;
+            for (int i = 0; i < 128; ++i)
+            {
+                const double l = block.getSample (0, i), r = block.getSample (1, i);
+                if (! std::isfinite (l) || ! std::isfinite (r)) ++stereoBad;
+                dl += (l-r)*(l-r); ll += l*l; rr += r*r; lr += l*r;
+            }
+        }
+        stereoDiff[mode] = std::sqrt (dl / std::max (1.0e-20, 0.5 * (ll + rr)));
+        corr[mode] = lr / std::sqrt (std::max (1.0e-20, ll * rr));
+        stereo->releaseResources();
+    }
+    std::printf ("   0/50/100%%: ΔRMS/RMS %.7f / %.7f / %.7f, корреляция %.5f / %.5f / %.5f, NaN %d\n",
+                 stereoDiff[0], stereoDiff[1], stereoDiff[2], corr[0], corr[1], corr[2], stereoBad);
+    check (stereoCreated == 3 && stereoMissing == 0 && stereoBad == 0
+           && stereoDiff[0] < 0.001 && stereoDiff[1] > 0.1 && stereoDiff[2] < 0.001,
+           "0/100% совпадают, а 50% даёт разные потоки слотов A/B через VST3",
+           String (stereoDiff[0], 6) + " / " + String (stereoDiff[1], 6) + " / " + String (stereoDiff[2], 6));
+
     // Фабричный Choir через реальный VST3. Это отдельный замер выхода,
     // а не обещание headroom для произвольных патчей и не замена сырому WAV.
     // Проверяем два заданных случая: штатную калибровку по центру и gain 1,
