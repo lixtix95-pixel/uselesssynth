@@ -79,6 +79,41 @@ public:
         for (auto& v : voices) v.stageSlots (p, bank);
     }
 
+    using UserTables = std::array<std::shared_ptr<const UserWavetable>, 8>;
+
+    // Producer only: assets and new engines are constructed/published off the
+    // audio thread. Old engines retain their immutable table until retired.
+    void stageUserWavetables (const UserTables& tables, const Patch& p)
+    {
+        const std::lock_guard<std::mutex> lock (stageMutex);
+        bool changed = false;
+        for (size_t i = 0; i < tables.size(); ++i)
+            if (bank.userWavetables[i] != tables[i])
+            {
+                bank.userWavetables[i] = tables[i];
+                ++bank.userWtGeneration[i];
+                changed = true;
+            }
+        if (changed) for (auto& v : voices) v.stageSlots (p, bank);
+    }
+
+    void stageUserWavetable (int slot, std::shared_ptr<const UserWavetable> table, const Patch& p)
+    {
+        if (slot < 0 || slot >= 8) return;
+        const std::lock_guard<std::mutex> lock (stageMutex);
+        const auto i = (size_t) slot;
+        if (bank.userWavetables[i] == table) return;
+        bank.userWavetables[i] = std::move (table);
+        ++bank.userWtGeneration[i];
+        for (auto& v : voices) v.stageSlots (p, bank);
+    }
+
+    UserTables getUserWavetables() const
+    {
+        const std::lock_guard<std::mutex> lock (stageMutex);
+        return bank.userWavetables;
+    }
+
     void applyPatch (const Patch& p) noexcept
     {
         patch = p;
@@ -334,7 +369,7 @@ private:
     // deque, а не vector: Voice неперемещаемый (атомарный флаг подмены движков),
     // а deque никогда не переносит элементы — адреса стабильны.
     std::deque<Voice> voices;
-    std::mutex stageMutex;  // producers / stopped-audio setup only
+    mutable std::mutex stageMutex;  // producers / stopped-audio setup only
     std::mutex retireMutex; // serializes non-audio bin consumers
     Patch patch = patchInit();
     FxChain fx;

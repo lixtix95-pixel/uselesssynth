@@ -55,6 +55,9 @@ inline const char* engineTypeName (EngineType t)
 struct EngineBank
 {
     WavetableBank wt;
+    // Accessed by serialized staging operations, never by the audio thread.
+    std::array<std::shared_ptr<const UserWavetable>, 8> userWavetables {};
+    std::array<std::uint64_t, 8> userWtGeneration {};
     SampleBank    smp;
     ResynthBank   rs;
 
@@ -193,7 +196,7 @@ struct Patch
 
 // Создание движка нужного типа с привязкой контента. Вызывается вне аудио-потока
 // (при загрузке патча) — аллокация здесь допустима.
-inline std::unique_ptr<EngineBase> makeEngine (EngineType t, const EngineBank& b)
+inline std::unique_ptr<EngineBase> makeEngine (EngineType t, const EngineBank& b, int slot = -1)
 {
     // счётчик жизни движков: тест «создано == удалено» ловит потерю указателя
     EngineStats::created.fetch_add (1, std::memory_order_relaxed);
@@ -203,6 +206,8 @@ inline std::unique_ptr<EngineBase> makeEngine (EngineType t, const EngineBank& b
         {
             auto e = std::make_unique<WavetableEngine>();
             e->setBank (&b.wt);
+            if (slot >= 0 && slot < (int) b.userWavetables.size())
+                e->setUserTable (b.userWavetables[(size_t) slot]);
             return e;
         }
         case EngineType::FM:       return std::make_unique<FmEngine>();

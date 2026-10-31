@@ -512,6 +512,14 @@ inline juce::AudioProcessorValueTreeState::ParameterLayout makeLayout()
             String (kFxModules[module].name) + " #" + String (copy + 1) + " Rack Position",
             0, FxChain::kRackLimit, copy == 0 ? module + 1 : 0));
     }
+    // New per-slot selection is appended so every existing host ID/index,
+    // including all four FX copies and rack ranks, remains untouched.
+    for (int s = 0; s < kNumSlots; ++s)
+    {
+        const auto id = slotPrefix (s) + "wtUser";
+        layout.add (std::make_unique<AudioParameterBool> (ParameterID { id, 1 },
+                                                          slotPrefix (s) + "User Wavetable", false));
+    }
     return std::move (layout.result);
 }
 

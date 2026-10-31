@@ -176,6 +176,11 @@ private:
 
     int selectedSlot = 0;
     int contextSlot = -1, contextEngine = -1;
+    std::uint64_t seenWtRevision = 0;
+    juce::String userWtName;
+    bool userWtPresent = false, wtImportBusy = false;
+    float sourceUserValue = 0.0f;
+    std::thread wtImportThread;
     int section = 0;                 // 0 FX · 1 MATRIX · 2 ARP · 3 LFO
     bool paramsOpen = false, fxOpen = false;
 
@@ -190,11 +195,14 @@ private:
 
     // выбор движка и фильтра выбранного слота (sA_type … sH_type / sA_filter …)
     juce::ComboBox engineBox, filterBox, sourceBox;
+    juce::TextButton wtLoadButton { "WAV WT" }, wtResynthButton { "RESYNTH" };
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> engineAtt, filterAtt;
     // table — прежний stepped float 0..7, а не Choice. Для CHOP три пункта,
     // поэтому стандартный ComboBoxAttachment (масштабирует по числу пунктов)
     // здесь неверен; ParameterAttachment принимает реальные индексы 0,1,2.
-    std::unique_ptr<juce::ParameterAttachment> sourceAtt;
+    std::unique_ptr<juce::ParameterAttachment> sourceAtt, sourceUserAtt;
+    void showWavetableImport (bool resynth, int cycleLength = 2048);
+    void beginWavetableFileImport (juce::File file, bool resynth, int cycleLength, int slot);
 
     juce::OwnedArray<SlotCard> cards;
     juce::OwnedArray<Bound> centreKnobs, centreBars;    // 3 + 3, зависят от слота

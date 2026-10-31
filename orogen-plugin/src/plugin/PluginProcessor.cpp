@@ -1,6 +1,7 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 #include "UiParamMap.h"
+#include "WavetableFile.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -139,6 +140,7 @@ void OrogenProcessor::cachePointers()
         r.on     = apvts.getRawParameterValue (pre + "on");
         r.filter = apvts.getRawParameterValue (pre + "filter");
         r.grainReverse = apvts.getRawParameterValue (pre + "grainReverse");
+        r.wtUser = apvts.getRawParameterValue (pre + "wtUser");
         r.f.clear();
         for (int i = 0; i < n; ++i)
             r.f.push_back (apvts.getRawParameterValue (pre + st[i].id));
@@ -220,7 +222,7 @@ void OrogenProcessor::cachePointers()
     for (int i = 0; i < kNumSlots; ++i)
     {
         const auto& r = slotRefs[(size_t) i];
-        if (r.type == nullptr || r.on == nullptr || r.filter == nullptr || r.grainReverse == nullptr)
+        if (r.type == nullptr || r.on == nullptr || r.filter == nullptr || r.grainReverse == nullptr || r.wtUser == nullptr)
             std::fprintf (stderr, "OROGEN: не найден параметр слота %d\n", i);
         for (size_t k = 0; k < r.f.size(); ++k)
             if (r.f[k] == nullptr)
@@ -254,6 +256,7 @@ std::uint64_t OrogenProcessor::hashParams() const noexcept
         if (r.on)     mix (r.on->load());
         if (r.filter) mix (r.filter->load());
         if (r.grainReverse) mix (r.grainReverse->load());
+        if (r.wtUser) mix (r.wtUser->load());
         for (auto* f : r.f) if (f) mix (f->load());
     }
     for (auto* g : globRefs) if (g) mix (g->load());
@@ -391,6 +394,7 @@ void OrogenProcessor::collectPatch (Patch& p, FxChain::Settings& fx) const noexc
         sp.params.tuneSemis  = r.f[(size_t) kTune]->load();
         sp.params.detune     = r.f[(size_t) kDetune]->load();
         sp.params.grainReverse = r.grainReverse->load();
+        sp.params.wtUser = r.wtUser->load() > 0.5f;
         sp.params.p[0] = r.f[(size_t) kP0]->load();
         sp.params.p[1] = r.f[(size_t) kP1]->load();
         sp.params.p[2] = r.f[(size_t) kP2]->load();
@@ -574,6 +578,7 @@ void OrogenProcessor::applyToParams (const Patch& p, const FxChain::Settings& fx
         for (int k = 0; k < 4; ++k)
             set (pre + "p" + juce::String (k), sp.params.p[k]);
         set (pre + "table", (float) sp.params.table);
+        set (pre + "wtUser", sp.params.wtUser ? 1.0f : 0.0f);
         set (pre + "attack", sp.attack);
         set (pre + "decay", sp.decay);
         set (pre + "sustain", sp.sustain);
@@ -920,6 +925,19 @@ void OrogenProcessor::restoreRack (const juce::var& rack)
             }
 }
 
+void OrogenProcessor::installUserWavetable (int slot, std::shared_ptr<const UserWavetable> table)
+{
+    if (slot < 0 || slot >= kNumSlots || ! table) return;
+    Patch current; FxChain::Settings fx;
+    collectPatch (current, fx);
+    inst.stageUserWavetable (slot, std::move (table), current);
+    wtRevision.fetch_add (1, std::memory_order_release);
+    if (auto* p = apvts.getParameter (slotPrefix (slot) + "wtUser"))
+    {
+        p->beginChangeGesture(); p->setValueNotifyingHost (1.0f); p->endChangeGesture();
+    }
+}
+
 // ---------- программы и состояние ------------------------------------------
 
 juce::StringArray OrogenProcessor::presetNames() const
@@ -939,7 +957,9 @@ void OrogenProcessor::loadPreset (int index)
     fxSettings = presets[(size_t) index].fx;
     applyToParams (patch, fxSettings);
     restoreRack (presets[(size_t) index].rack);
+    inst.stageUserWavetables (presets[(size_t) index].tables, patch);
     inst.stagePatch (patch);
+    wtRevision.fetch_add (1, std::memory_order_release);
     // FX are applied from the APVTS snapshot by the audio thread.
     stagedTypeHash = slotTypeHash();
     if (auto* ed = getActiveEditor()) ed->repaint();
@@ -965,11 +985,15 @@ bool OrogenProcessor::loadPresetFile (const juce::File& f)
     FxChain::Settings fx;
     juce::String name;
     if (! presetFromVar (parsed, p, fx, name)) return false;
+    Instrument::UserTables tables;
+    if (! userWavetablesFromVar (parsed.getProperty ("wavetables", {}), tables)) return false;
 
     patch = p;
     fxSettings = fx;
     applyToParams (patch, fxSettings);
     restoreRack (parsed.getProperty ("rack", {}));
+    inst.stageUserWavetables (tables, patch);
+    wtRevision.fetch_add (1, std::memory_order_release);
     inst.stagePatch (patch);            // движки построит message thread
     // FX are applied from the APVTS snapshot by the audio thread.
     stagedTypeHash = slotTypeHash();
@@ -983,7 +1007,11 @@ bool OrogenProcessor::savePresetFile (const juce::File& f, const juce::String& n
     collectPatch (p, fx);
     p.setName (name.toRawUTF8());
     auto preset = presetToVar (name, p, fx);
-    if (auto* obj = preset.getDynamicObject()) obj->setProperty ("rack", captureRack());
+    if (auto* obj = preset.getDynamicObject())
+    {
+        obj->setProperty ("rack", captureRack());
+        obj->setProperty ("wavetables", userWavetablesToVar (inst.getUserWavetables()));
+    }
     const auto json = juce::JSON::toString (preset, false);
     return f.replaceWithText (json);
 }
@@ -998,7 +1026,11 @@ juce::var OrogenProcessor::bankToVar() const
     for (const auto& pr : presets)
     {
         auto preset = presetToVar (pr.name, pr.patch, pr.fx);
-        if (auto* obj = preset.getDynamicObject()) obj->setProperty ("rack", pr.rack);
+        if (auto* obj = preset.getDynamicObject())
+        {
+            obj->setProperty ("rack", pr.rack);
+            obj->setProperty ("wavetables", userWavetablesToVar (pr.tables));
+        }
         list.add (preset);
     }
     o->setProperty ("programs", list);
@@ -1031,8 +1063,10 @@ bool OrogenProcessor::loadBankFile (const juce::File& f)
             FxChain::Settings fx;
             juce::String name;
             if (! presetFromVar (item, p, fx, name)) return false;
+            Instrument::UserTables tables;
+            if (! userWavetablesFromVar (item.getProperty ("wavetables", {}), tables)) return false;
             if (name.isEmpty()) name = "Program " + juce::String ((int) loaded.size() + 1);
-            loaded.push_back ({ name, p, fx, item.getProperty ("rack", {}) });
+            loaded.push_back ({ name, p, fx, item.getProperty ("rack", {}), std::move (tables) });
         }
 
         presets = std::move (loaded);
@@ -1046,8 +1080,10 @@ bool OrogenProcessor::loadBankFile (const juce::File& f)
     FxChain::Settings fx;
     juce::String name;
     if (! presetFromVar (parsed, p, fx, name)) return false;
+    Instrument::UserTables tables;
+    if (! userWavetablesFromVar (parsed.getProperty ("wavetables", {}), tables)) return false;
     presets.clear();
-    presets.push_back ({ name.isEmpty() ? juce::String ("Program 1") : name, p, fx, parsed.getProperty ("rack", {}) });
+    presets.push_back ({ name.isEmpty() ? juce::String ("Program 1") : name, p, fx, parsed.getProperty ("rack", {}), std::move (tables) });
     currentProgram = 0;
     loadPreset (0);
     return true;
@@ -1059,7 +1095,7 @@ int OrogenProcessor::addProgram (const juce::String& name)
     FxChain::Settings fx;
     collectPatch (p, fx);
     presets.push_back ({ name.isEmpty() ? juce::String ("Program ") + juce::String ((int) presets.size() + 1)
-                                         : name, p, fx, captureRack() });
+                                         : name, p, fx, captureRack(), inst.getUserWavetables() });
     return (int) presets.size() - 1;
 }
 
@@ -1069,6 +1105,7 @@ void OrogenProcessor::getStateInformation (juce::MemoryBlock& dest)
     // в сессии важно то, что реально звучит, а не файл, из которого пришли.
     juce::ValueTree state = apvts.copyState();
     state.setProperty ("patchName", juce::String (patch.name), nullptr);
+    state.setProperty ("wavetable_assets", juce::JSON::toString (userWavetablesToVar (inst.getUserWavetables()), true), nullptr);
     if (auto xml = state.createXml())
         copyXmlToBinary (*xml, dest);
 }
@@ -1079,6 +1116,15 @@ void OrogenProcessor::setStateInformation (const void* data, int sizeInBytes)
     if (xml == nullptr) return;
     auto state = juce::ValueTree::fromXml (*xml);
     if (! state.isValid()) return;
+    Instrument::UserTables tables;
+    if (state.hasProperty ("wavetable_assets"))
+    {
+        const auto dataText = state.getProperty ("wavetable_assets").toString();
+        juce::var decoded;
+        if (dataText.length() > 24 * 1024 * 1024 || juce::JSON::parse (dataText, decoded).failed()
+            || decoded.getArray() == nullptr || ! userWavetablesFromVar (decoded, tables)) return;
+        state.removeProperty ("wavetable_assets", nullptr);
+    }
 
     // JUCE при replaceState сохраняет ТЕКУЩЕЕ значение отсутствующего
     // параметра, а не default. Дополним старые сессии значениями по умолчанию
@@ -1098,7 +1144,10 @@ void OrogenProcessor::setStateInformation (const void* data, int sizeInBytes)
                             "fx_plateInputDiff2", "fx_plateOutput" })
         restoreMissingDefault (id);
     for (int s = 0; s < kNumSlots; ++s)
+    {
         restoreMissingDefault (slotPrefix (s) + "grainReverse");
+        restoreMissingDefault (slotPrefix (s) + "wtUser");
+    }
 
     // A state with NO rack power IDs predates the switch feature. In that
     // version the chain (notably Dynamics) was always active; restore all on.
@@ -1142,6 +1191,8 @@ void OrogenProcessor::setStateInformation (const void* data, int sizeInBytes)
     apvts.replaceState (state);
     collectPatch (patch, fxSettings);
     patch.setName (state.getProperty ("patchName", "Untitled").toString().toRawUTF8());
+    inst.stageUserWavetables (tables, patch);
+    wtRevision.fetch_add (1, std::memory_order_release);
     inst.stagePatch (patch);
     // FX are applied from the APVTS snapshot by the audio thread.
     stagedTypeHash = slotTypeHash();

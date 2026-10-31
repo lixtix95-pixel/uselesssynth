@@ -39,6 +39,8 @@ public:
                 delete p;
                 EngineStats::deleted.fetch_add (1, std::memory_order_relaxed);
             }
+        for (auto* old : fadingEngines)
+            if (old != nullptr) { delete old; EngineStats::deleted.fetch_add (1, std::memory_order_relaxed); }
     }
 
     void init (const EngineBank& bank, double sr, EngineRetireBin* retireBinToUse = nullptr)
@@ -77,18 +79,22 @@ public:
             auto type = p.slots[i].type;
             if ((int) type < 0 || (int) type >= (int) EngineType::Count)
                 type = EngineType::Wavetable;
-            if (stagedValid[(size_t) i] && stagedType[(size_t) i] == type) continue;
+            const auto generation = type == EngineType::Wavetable ? bank.userWtGeneration[(size_t) i] : 0;
+            if (stagedValid[(size_t) i] && stagedType[(size_t) i] == type
+                && stagedWtGeneration[(size_t) i] == generation) continue;
 
-            auto next = makeEngine (type, bank);
+            auto next = makeEngine (type, bank, i);
             if (! next) continue;
             next->setSampleRate (sampleRate);
             next->preparedSlotType = (int) type;
+            next->preparedContentGeneration = generation;
             if (auto* replaced = pending[(size_t) i].exchange (next.release(), std::memory_order_acq_rel))
             {
                 delete replaced;
                 EngineStats::deleted.fetch_add (1, std::memory_order_relaxed);
             }
             stagedType[(size_t) i] = type;
+            stagedWtGeneration[(size_t) i] = generation;
             stagedValid[(size_t) i] = true;
         }
     }
@@ -109,8 +115,14 @@ public:
     {
         uint32_t mask = 0;
         for (int i = 0; i < kSlots; ++i)
-            if (pending[(size_t) i].load (std::memory_order_acquire) != nullptr)
+        {
+            // If a voice ended while fading, the old engine can be retired now.
+            if (fadingEngines[(size_t) i] != nullptr && (! active || fadeRemaining[(size_t) i] <= 0))
+                retireFading (i);
+            if (fadingEngines[(size_t) i] == nullptr
+                && pending[(size_t) i].load (std::memory_order_acquire) != nullptr)
                 mask |= 1u << i;
+        }
         if (mask == 0) return;
         if (retireBin != nullptr && retireBin->room() < popCount (mask)) return;
 
@@ -120,6 +132,26 @@ public:
             if ((mask & (1u << i)) == 0) continue;
             EngineBase* next = pending[(size_t) i].exchange (nullptr, std::memory_order_acq_rel);
             if (next == nullptr) continue;
+            // A table replacement on a held note must not reset the slot ADSR.
+            // Crossfade both prepared engines for 5 ms and retire the old one
+            // via the same control-thread bin used by the existing handoff.
+            if (active && slotStarted[(size_t) i] && engines[(size_t) i]
+                && slotType[(size_t) i] == EngineType::Wavetable
+                && next->preparedSlotType == (int) EngineType::Wavetable
+                && next->preparedContentGeneration != engines[(size_t) i]->preparedContentGeneration)
+            {
+                fadingEngines[(size_t) i] = engines[(size_t) i].release();
+                engines[(size_t) i].reset (next);
+                next->setNoteRandom (noteRandom);
+                next->setRandomStreamSeed (noteSlotStreamSeed (noteSerial, i));
+                next->start (targetNote, velocityGain);
+                next->prepare (epCache[(size_t) i]);
+                fadeLength[(size_t) i] = std::max (1, (int) std::lround (sampleRate * 0.005));
+                fadeRemaining[(size_t) i] = fadeLength[(size_t) i];
+                lastParamsValid[(size_t) i] = false;
+                changed = true;
+                continue;
+            }
             if (engines[(size_t) i])
             {
                 EngineBase* old = engines[(size_t) i].release();
@@ -292,6 +324,7 @@ public:
                             && (weightNow > 1.0e-5f || tailLeft[(size_t) i] > 0.0f);
             if (! alive)
             {
+                if (fadingEngines[(size_t) i] != nullptr) { fadeRemaining[(size_t) i] = 0; retireFading (i); }
                 if (! envelopeAlive && slotRunning[(size_t) i]) e->stop();
                 slotRunning[(size_t) i] = false;
                 continue;
@@ -302,7 +335,19 @@ public:
             // собиралась структура + три clamp'а на слот (8 слотов × 16 голосов
             // × 48 кГц). Движки читают параметры в prepare(), render() их не трогает.
             const EngineParams& ep = epCache[(size_t) i];
-            const float sig = e->render (ep);
+            float sig = e->render (ep);
+            if (auto* old = fadingEngines[(size_t) i])
+            {
+                const int remaining = fadeRemaining[(size_t) i];
+                if (remaining > 0)
+                {
+                    const float a = 1.0f - (float) remaining / (float) fadeLength[(size_t) i];
+                    const float oldSig = old->render (ep);
+                    sig = oldSig + (sig - oldSig) * a;
+                    fadeRemaining[(size_t) i] = remaining - 1;
+                }
+                if (fadeRemaining[(size_t) i] <= 0) retireFading (i);
+            }
             if (amp <= 0.0f) { any = true; continue; }
             any = true;
 
@@ -423,7 +468,7 @@ private:
 
     static bool paramsEqual (const EngineParams& a, const EngineParams& b) noexcept
     {
-        if (a.table != b.table) return false;
+        if (a.table != b.table || a.wtUser != b.wtUser) return false;
         for (int k = 0; k < 4; ++k) if (std::fabs (a.p[k] - b.p[k]) > 1.0e-4f) return false;
         return std::fabs (a.tuneSemis - b.tuneSemis) < 1.0e-3f
             && std::fabs (a.detune - b.detune) < 1.0e-4f
@@ -584,12 +629,32 @@ private:
         }
     }
 
+    void retireFading (int slot) noexcept
+    {
+        auto*& old = fadingEngines[(size_t) slot];
+        if (old == nullptr) return;
+        if (retireBin != nullptr)
+        {
+            if (! retireBin->push (old)) return; // retry; never delete on audio
+        }
+        else
+        {
+            delete old; // standalone one-thread harness, as with ordinary swaps
+            EngineStats::deleted.fetch_add (1, std::memory_order_relaxed);
+        }
+        old = nullptr;
+        fadeRemaining[(size_t) slot] = 0;
+    }
+
     std::array<std::unique_ptr<EngineBase>, kSlots> engines;
+    std::array<EngineBase*, kSlots> fadingEngines {};
+    std::array<int, kSlots> fadeRemaining {}, fadeLength {};
     std::array<EngineType, kSlots> slotType {};
     // Ownership moves atomically between the staging and audio threads.
     std::array<std::atomic<EngineBase*>, kSlots> pending {};
     // Only the staging thread (serialized by Instrument) reads/writes these.
     std::array<EngineType, kSlots> stagedType {};
+    std::array<std::uint64_t, kSlots> stagedWtGeneration {};
     std::array<bool, kSlots> stagedValid {};
     EngineRetireBin* retireBin = nullptr;
     std::array<Adsr, kSlots> env;

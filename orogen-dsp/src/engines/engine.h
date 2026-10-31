@@ -19,6 +19,7 @@ struct EngineParams
     float tuneSemis = 0.0f;                       // полутоны
     float detune   = 0.3f;                        // 0..1 -> разброс в центах, свой на голос
     int   table    = 0;                           // выбор контента (таблица/источник/тело)
+    bool  wtUser   = false;                      // select the per-slot imported wavetable
     bool  on       = true;
     float grainReverse = 0.0f;                    // Granular: вероятность реверса нового зерна, 0..1
 };
@@ -41,6 +42,7 @@ public:
     // Written before publication to the audio thread; describes the prepared
     // slot engine in the lock-free handoff. It is not a host parameter.
     int preparedSlotType = -1;
+    std::uint64_t preparedContentGeneration = 0;
 
     virtual const char* name() const = 0;
     virtual void setSampleRate (double sr) = 0;

@@ -91,6 +91,7 @@ inline std::vector<UiTab> buildUiTabs()
             sec.ids.add (pre + "filter");
             for (int i = 0; i < slotCount; ++i) sec.ids.add (pre + slotTable[i].id);
             sec.ids.add (pre + "grainReverse"); // у Granular; у остальных движков не используется
+            sec.ids.add (pre + "wtUser");
             tab.sections.push_back (sec);
         }
         tabs.push_back (tab);

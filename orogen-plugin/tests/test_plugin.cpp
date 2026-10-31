@@ -6,6 +6,7 @@
 #include "../src/plugin/PluginEditor.h"
 #include "../src/plugin/UiParamMap.h"
 #include "../src/plugin/EngineUi.h"
+#include "../src/plugin/WavetableFile.h"
 
 #include <cstdio>
 #include <csignal>
@@ -2111,7 +2112,8 @@ static void testSourcePicker()
             setP (p, slotPrefix (slot) + "type", (float) type);
             mm->runDispatchLoopUntil (60); // message thread also covers host type automation
             const int count = type == 1 || type == 2 ? 0 : type == 8 ? 3 : 8;
-            if (source->getNumItems() == count && source->isEnabled() == (count > 0)) ++lists;
+            if (source->getNumItems() == count + (type == 0 ? 1 : 0) && source->isEnabled() == (count > 0)
+                && (type != 0 || ! source->isItemEnabled (9))) ++lists;
             if (count == 0)
             {
                 setP (p, id, 7.0f);
@@ -2890,6 +2892,27 @@ static void testAudioCallbackAllocations()
             if (block > 12) energy += (double) v * v;
         }
     }
+    // The actual publication occurs outside the monitored callback; replacing
+    // a table on a held note and its 5 ms crossfade must also allocate nothing.
+    std::vector<float> rawA (2048), rawB (2048);
+    for (int i = 0; i < 2048; ++i)
+    {
+        rawA[(size_t) i] = (float) (0.3 * std::sin (kTwoPi * i / 2048.0));
+        rawB[(size_t) i] = (float) (0.2 * std::cos (kTwoPi * 3 * i / 2048.0));
+    }
+    auto userA = makeUserWavetable (rawA, 1, "A");
+    auto userB = makeUserWavetable (rawB, 1, "B");
+    std::uint64_t swapAlloc = 0;
+    for (int update = 0; update < 20; ++update)
+    {
+        wt.installUserWavetable (0, (update & 1) ? userA : userB);
+        start();
+        for (int block = 0; block < 8; ++block) wt.processBlock (wave, noMidi);
+        swapAlloc += stop();
+        wt.engine().drainRetired();
+    }
+    check (swapAlloc == 0, "held-note user table publication/crossfade: processBlock allocations",
+           "alloc=" + juce::String ((juce::int64) swapAlloc));
     wt.releaseResources();
     check (wtAlloc == 0 && wtBad == 0 && energy > 0.001,
            "Wavetable: 256 аудиоблоков со сменой таблицы, Warp/Fold и OS без аллокаций/NaN",
@@ -3242,6 +3265,161 @@ static void testNativeFxRack (bool scrollOnly = false)
    #endif
 }
 
+static void testUserWavetableGui()
+{
+    OrogenProcessor p;
+    OrogenEditor editor (p); editor.setSize (1280, 800); editor.setVisible (true);
+    editor.setAnimationsEnabled (false);
+    auto* mm = juce::MessageManager::getInstance();
+    juce::ComboBox* source = nullptr;
+    juce::Button* load = nullptr; juce::Button* resynth = nullptr;
+    for (auto* child : editor.getChildren())
+    {
+        if (child->getName() == "Source for selected slot") source = dynamic_cast<juce::ComboBox*> (child);
+        if (child->getName() == "Import packed WAV wavetable") load = dynamic_cast<juce::Button*> (child);
+        if (child->getName() == "Resynthesize WAV recording") resynth = dynamic_cast<juce::Button*> (child);
+    }
+    check (source && load && resynth && load->isVisible() && resynth->isVisible(), "WAV WT and RESYNTH visible for Wavetable");
+    if (! source || ! load || ! resynth) return;
+    std::vector<float> data (2048);
+    for (int i=0;i<2048;++i) data[(size_t)i] = (float) (0.5 * std::sin (kTwoPi * i / 2048.0));
+    auto table = makeUserWavetable (data, 1, "GUI wave");
+    p.installUserWavetable (0, table);
+    mm->runDispatchLoopUntil (120);
+    check (source->getNumItems() == 9 && source->isItemEnabled (9) && source->getSelectedId() == 9
+           && source->getText().containsIgnoreCase ("GUI WAVE"), "import selects the named user source");
+    GestureTrace trace (p, "sA_wtUser");
+    source->setSelectedId (1, juce::sendNotificationSync);
+    const bool factory = p.apvts.getRawParameterValue ("sA_wtUser")->load() < 0.5f && trace.balanced();
+    trace.clear(); source->setSelectedId (9, juce::sendNotificationSync);
+    check (factory && p.apvts.getRawParameterValue ("sA_wtUser")->load() > 0.5f && trace.balanced(),
+           "factory and user choice both issue host gestures");
+    int sizes=0;
+    for (int width : {960,1280,1600})
+    {
+        editor.setSize (width,width*5/8);
+        if (editor.getLocalBounds().contains (source->getBounds())
+            && editor.getLocalBounds().contains (load->getBounds())
+            && editor.getLocalBounds().contains (resynth->getBounds())
+            && ! source->getBounds().intersects (load->getBounds())
+            && ! load->getBounds().intersects (resynth->getBounds())) ++sizes;
+    }
+    check (sizes == 3, "source and import controls do not overlap at 960 / 1280 / 1600");
+    setP (p, "sA_type", (float) EngineType::Harmonic);
+    mm->runDispatchLoopUntil (100);
+    check (! load->isVisible() && ! resynth->isVisible(), "WAV controls hide for other engines");
+    editor.showPage (1);
+    check (! p.engine().getUserWavetables()[1] && p.engine().getUserWavetables()[0],
+           "custom table remains isolated to its original slot");
+}
+
+static bool writeTestWav (const juce::File& file, bool packed)
+{
+    constexpr int sr = 48000;
+    const int n = packed ? 2048 * 3 : sr;
+    juce::AudioBuffer<float> samples (2, n);
+    for (int i = 0; i < n; ++i)
+    {
+        const float t = (float) i / (packed ? 2048.0f : (float) sr);
+        samples.setSample (0, i, 0.55f * std::sin ((float) kTwoPi * (packed ? 1.0f : 110.0f) * t));
+        samples.setSample (1, i, -samples.getSample (0, i)); // stereo cancellation trap
+    }
+    file.deleteFile();
+    juce::WavAudioFormat wav;
+    auto stream = file.createOutputStream();
+    if (! stream) return false;
+    std::unique_ptr<juce::AudioFormatWriter> writer (wav.createWriterFor (stream.release(), sr, 2, 16, {}, 0));
+    return writer && writer->writeFromAudioSampleBuffer (samples, 0, n);
+}
+
+static void testUserWavetablePlugin()
+{
+    std::printf ("\n--- WAV import: file, audio, project and presets ---\n");
+    const auto dir = juce::File::getSpecialLocation (juce::File::tempDirectory);
+    const auto packed = dir.getChildFile ("orogen-packed-test.wav");
+    const auto ordinary = dir.getChildFile ("orogen-recording-test.wav");
+    const auto preset = dir.getChildFile ("orogen-user-wt-test.orogenpreset");
+    const auto bank = dir.getChildFile ("orogen-user-wt-test.orogenbank");
+    check (writeTestWav (packed, true) && writeTestWav (ordinary, false), "write stereo WAV fixtures");
+    auto a = loadWavetableWav (packed, false, 2048);
+    auto b = loadWavetableWav (ordinary, true, 2048);
+    check (a.table && a.table->frames == 3, "packed WAV is split into three frames", a.error);
+    check (b.table && b.table->frames == 64, "ordinary stereo WAV becomes 64 frames", b.error);
+    const auto wrong = loadWavetableWav (ordinary, false, 2048);
+    check (! wrong.table && wrong.error.isNotEmpty(), "ordinary WAV is not silently interpreted as a packed table");
+    if (! a.table || ! b.table) return;
+    double leftRms = 0;
+    for (float v : b.table->samples) leftRms += (double) v * v;
+    leftRms = std::sqrt (leftRms / b.table->samples.size());
+    check (leftRms > 0.1, "left channel survives opposite-polarity stereo", num (leftRms, 6));
+    OrogenProcessor p;
+    p.setPlayConfigDetails (0, 2, 48000, 512); p.prepareToPlay (48000, 512);
+    soloSlot (p, 0, 0); setP (p, "sA_detune", 0); setP (p, "sA_p1", 0); setP (p, "sA_p2", 0);
+    p.installUserWavetable (0, a.table);
+    p.installUserWavetable (2, b.table);
+    check (p.apvts.getRawParameterValue ("sA_wtUser")->load() > 0.5f
+           && p.apvts.getRawParameterValue ("sC_wtUser")->load() > 0.5f,
+           "per-slot imported table selection is a host parameter");
+    juce::MemoryBlock state;
+    p.getStateInformation (state);
+    OrogenProcessor q;
+    q.setStateInformation (state.getData(), (int) state.getSize());
+    const auto restored = q.engine().getUserWavetables();
+    check (restored[0] && restored[2] && restored[0]->samples == a.table->samples
+           && restored[2]->samples == b.table->samples && ! restored[1],
+           "DAW state embeds independent A and C tables", num ((double) state.getSize(), 0) + " bytes");
+    q.setPlayConfigDetails (0, 2, 48000, 512); q.prepareToPlay (48000, 512);
+    const auto left = renderBlocks (p, 36000, 48000);
+    const auto right = renderBlocks (q, 36000, 48000);
+    double delta = 0;
+    for (int ch = 0; ch < 2; ++ch)
+        for (int i = 0; i < left.getNumSamples(); ++i)
+        {
+            const double d = left.getSample (ch, i) - right.getSample (ch, i);
+            delta += d * d;
+        }
+    delta = std::sqrt (delta / (2 * left.getNumSamples()));
+    check (rmsOf (left) > 1.0e-4 && delta < 1.0e-6, "audio survives DAW state roundtrip", "delta RMS " + num (delta, 9));
+    check (p.savePresetFile (preset, "user-waves"), "JSON preset saved");
+    OrogenProcessor r;
+    check (r.loadPresetFile (preset), "JSON preset loaded");
+    const auto fromPreset = r.engine().getUserWavetables();
+    check (fromPreset[0] && fromPreset[2] && fromPreset[0]->samples == a.table->samples
+           && fromPreset[2]->samples == b.table->samples, "JSON preset embeds both tables");
+    const int added = p.addProgram ("user tables");
+    check (p.saveBankFile (bank), "JSON bank saved");
+    OrogenProcessor t;
+    const bool loadedBank = t.loadBankFile (bank);
+    if (loadedBank) t.setCurrentProgram (added);
+    const auto fromBank = t.engine().getUserWavetables();
+    check (loadedBank && fromBank[0] && fromBank[2] && fromBank[0]->samples == a.table->samples,
+           "JSON bank restores the selected program's tables");
+    auto encoded = userWavetablesToVar (p.engine().getUserWavetables());
+    encoded.getArray()->getReference (0).getDynamicObject()->setProperty ("data", "corrupt");
+    auto destination = p.engine().getUserWavetables();
+    const bool rejected = ! userWavetablesFromVar (encoded, destination);
+    check (rejected && destination[0] == a.table && destination[2] == b.table,
+           "malformed asset is rejected transactionally");
+    auto brokenState = p.apvts.copyState();
+    brokenState.setProperty ("wavetable_assets", "{not-json", nullptr);
+    juce::MemoryBlock brokenBlob;
+    if (auto xml = brokenState.createXml()) juce::AudioProcessor::copyXmlToBinary (*xml, brokenBlob);
+    q.setStateInformation (brokenBlob.getData(), (int) brokenBlob.getSize());
+    check (q.engine().getUserWavetables()[0] != nullptr
+           && q.apvts.getRawParameterValue ("sA_wtUser")->load() > 0.5f,
+           "malformed DAW asset JSON leaves the current state untouched");
+    auto legacy = p.apvts.copyState();
+    for (int i=0;i<8;++i)
+        if (auto node = legacy.getChildWithProperty ("id", slotPrefix (i) + "wtUser"); node.isValid())
+            legacy.removeChild (node, nullptr);
+    juce::MemoryBlock oldState;
+    if (auto xml = legacy.createXml()) juce::AudioProcessor::copyXmlToBinary (*xml, oldState);
+    q.setStateInformation (oldState.getData(), (int) oldState.getSize());
+    check (q.apvts.getRawParameterValue ("sA_wtUser")->load() == 0.0f
+           && ! q.engine().getUserWavetables()[0], "legacy project resets selection and asset");
+    packed.deleteFile(); ordinary.deleteFile(); preset.deleteFile(); bank.deleteFile();
+}
+
 int main (int argc, char** argv)
 {
     // Голова без X11: GUI-инициализация здесь упала бы (нет дисплея), а
@@ -3252,6 +3430,14 @@ int main (int argc, char** argv)
     auto* mm = juce::MessageManager::getInstance();
     std::printf ("OROGEN test_plugin: старт\n");
     juce::ignoreUnused (mm);
+    if (argc > 1 && juce::String (argv[1]) == "--wavetable-import-only")
+    {
+        testUserWavetablePlugin();
+        testUserWavetableGui();
+        juce::DeletedAtShutdown::deleteAll();
+        juce::MessageManager::deleteInstance();
+        return failures == 0 ? 0 : 1;
+    }
     if (argc > 1 && juce::String (argv[1]) == "--audio-alloc-only")
     {
         testAudioCallbackAllocations();

@@ -17,6 +17,7 @@
 #include "engine.h"
 #include "halfband.h"
 #include "../content/wavetable_bank.h"
+#include "../content/wavetable_import.h"
 
 namespace orogen {
 
@@ -40,6 +41,10 @@ public:
     static constexpr float kGainTrim = 0.48f;
 
     void setBank (const WavetableBank* b) noexcept { bank = b; }
+    // Only the staging/control thread installs ownership; the audio thread
+    // reads immutable data and never copies or destroys this shared_ptr.
+    void setUserTable (std::shared_ptr<const UserWavetable> table) noexcept
+    { userTable = std::move (table); }
 
     // Качество оверсэмплинга нелинейностей:
     //   0 = Eco    (2×, финальный фильтр 127)  — ~4× дешевле, алиасинг ~-50 дБ
@@ -85,13 +90,15 @@ public:
 
     void prepare (const EngineParams& p) override
     {
-        if (bank == nullptr || bank->tables.empty())
+        const bool useUser = p.wtUser && userTable != nullptr;
+        if (! useUser && (bank == nullptr || bank->tables.empty()))
         {
             requestedTable = currentTable = nextTable = {};
             return;
         }
 
-        const Wavetable& wt = bank->tables[(size_t) clamp (p.table, 0, (int) bank->tables.size() - 1)];
+        const Wavetable& wt = useUser ? userTable->table
+            : bank->tables[(size_t) clamp (p.table, 0, (int) bank->tables.size() - 1)];
         const size_t count = std::min ({ wt.levels.size(), wt.lens.size(), wt.harms.size() });
         if (count == 0 || wt.frames < 1)
         {
@@ -327,6 +334,7 @@ private:
     }
 
     const WavetableBank* bank = nullptr;
+    std::shared_ptr<const UserWavetable> userTable;
     double sampleRate = 48000.0;
 
     int    note = 60;

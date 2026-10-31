@@ -8,6 +8,7 @@
 
 #include "UiParamMap.h"
 #include "EngineUi.h"
+#include "WavetableFile.h"
 #include "content/wavetable_bank.h"
 
 #include <array>
@@ -1906,10 +1907,11 @@ public:
         waitForThreadToExit (-1);
     }
 
-    void submit (const Patch& p, std::uint64_t generation)
+    void submit (const Patch& p, const Instrument::UserTables& tables, std::uint64_t generation)
     {
         const juce::ScopedLock guard (lock);
         pendingPatch = p;
+        pendingTables = tables;
         pendingGeneration = generation;
         hasPending = true;
         latest.store (generation, std::memory_order_release);
@@ -1937,12 +1939,14 @@ private:
         while (! threadShouldExit())
         {
             Patch patch;
+            Instrument::UserTables tables;
             std::uint64_t generation = 0;
             {
                 const juce::ScopedLock guard (lock);
                 if (hasPending)
                 {
                     patch = pendingPatch;
+                    tables = pendingTables;
                     generation = pendingGeneration;
                     hasPending = false;
                 }
@@ -1954,6 +1958,12 @@ private:
             }
 
             const double started = juce::Time::getMillisecondCounterHiRes();
+            for (size_t i = 0; i < tables.size(); ++i)
+                if (bank.userWavetables[i] != tables[i])
+                {
+                    bank.userWavetables[i] = tables[i];
+                    ++bank.userWtGeneration[i];
+                }
             voice.stageSlots (patch, bank);
             voice.applyPendingEngines();
             voice.start (patch, 60, 1.0f, 60.0f, 1);  // C4, одна нота
@@ -2018,6 +2028,7 @@ private:
     juce::CriticalSection lock;
     juce::WaitableEvent wake;
     Patch pendingPatch;
+    Instrument::UserTables pendingTables {};
     std::uint64_t pendingGeneration = 0;
     std::atomic<std::uint64_t> latest { 0 };
     bool hasPending = false, hasResult = false;
@@ -2056,6 +2067,7 @@ static std::uint64_t previewPatchHash (const Patch& patch, int selectedSlot)
         if (! slot.on) continue;
         mix ((std::uint32_t) slot.type); mix ((std::uint32_t) slot.filterType);
         mix ((std::uint32_t) slot.params.table);
+        mix (slot.params.wtUser ? 1u : 0u);
         for (float v : slot.params.p) mf (v);
         mf (slot.params.level); mf (slot.params.pan); mf (slot.params.tuneSemis); mf (slot.params.detune);
         mf (slot.params.grainReverse);
@@ -2138,6 +2150,7 @@ OrogenEditor::OrogenEditor (OrogenProcessor& p)
 OrogenEditor::~OrogenEditor()
 {
     stopTimer();
+    if (wtImportThread.joinable()) wtImportThread.join();
     releaseMain();
     if (vectorPad != nullptr) vectorPad->finishGesture();
     previewWorker.reset();                  // ждём воркер до уничтожения редактора
@@ -2174,13 +2187,42 @@ void OrogenEditor::buildCentre()
     addAndMakeVisible (sourceBox);
     sourceBox.setName ("Source for selected slot");
     sourceBox.setTextWhenNothingSelected ("NO SOURCE NEEDED");
-    sourceBox.setTooltip ("Select the selected slot's table, source, material or loop. FM and Harmonic do not use a source.");
+    sourceBox.setTooltip ("Select the selected slot's table, source, material or loop. WAV WT and RESYNTH load a user table into this slot.");
     sourceBox.onChange = [this]
     {
         const int index = sourceBox.getSelectedId() - 1;
-        if (sourceAtt != nullptr && index >= 0 && index < sourceCountForEngine (pi (slotId ("type"))))
+        const int type = pi (slotId ("type"));
+        if (type == (int) EngineType::Wavetable && sourceUserAtt != nullptr)
+        {
+            if (index == 8 && userWtPresent) { sourceUserAtt->setValueAsCompleteGesture (1.0f); return; }
+            if (index >= 0 && index < 8) sourceUserAtt->setValueAsCompleteGesture (0.0f);
+        }
+        if (sourceAtt != nullptr && index >= 0 && index < sourceCountForEngine (type))
             sourceAtt->setValueAsCompleteGesture ((float) index);
     };
+    addAndMakeVisible (wtLoadButton);
+    addAndMakeVisible (wtResynthButton);
+    wtLoadButton.setName ("Import packed WAV wavetable");
+    wtResynthButton.setName ("Resynthesize WAV recording");
+    wtLoadButton.setTooltip ("Load a packed WAV wavetable; choose the frame length first (Serum/Vital: 2048). Left channel, up to 256 frames.");
+    wtResynthButton.setTooltip ("Convert a regular WAV recording to 64 spectral frames. Left channel; maximum 120 seconds.");
+    wtLoadButton.onClick = [this]
+    {
+        juce::PopupMenu menu;
+        menu.addItem (1, "2048 samples / frame  (Serum / Vital)");
+        menu.addItem (2, "1024 samples / frame");
+        menu.addItem (3, "512 samples / frame");
+        menu.addItem (4, "256 samples / frame");
+        menu.addItem (5, "4096 samples / frame");
+        menu.addItem (6, "8192 samples / frame");
+        juce::Component::SafePointer<OrogenEditor> safe (this);
+        menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&wtLoadButton), [safe] (int id)
+        {
+            const int sizes[] = { 0, 2048, 1024, 512, 256, 4096, 8192 };
+            if (safe != nullptr && id >= 1 && id <= 6) safe->showWavetableImport (false, sizes[id]);
+        });
+    };
+    wtResynthButton.onClick = [this] { showWavetableImport (true); };
     engineBox.onChange = [this] { refreshEngineContext(); };
 
     // три ручки центра: параметры зависят от слота → привязываются в selectSlot()
@@ -2380,6 +2422,8 @@ void OrogenEditor::selectSlot (int slot)
     engineAtt.reset();
     filterAtt.reset();
     sourceAtt.reset();
+    sourceUserAtt.reset();
+    sourceUserValue = pv (slotId ("wtUser"));
     if (! paramsOpen && ! fxOpen) rebuildPreview (true);
 
     engineAtt = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (
@@ -2390,9 +2434,13 @@ void OrogenEditor::selectSlot (int slot)
     if (auto* parameter = proc.apvts.getParameter (slotId ("table")))
         sourceAtt = std::make_unique<juce::ParameterAttachment> (*parameter,
             [this] (float value) { updateSourceSelection (value); });
+    if (auto* parameter = proc.apvts.getParameter (slotId ("wtUser")))
+        sourceUserAtt = std::make_unique<juce::ParameterAttachment> (*parameter,
+            [this] (float value) { sourceUserValue = value; updateSourceSelection (pv (slotId ("table"))); });
 
     refreshEngineContext();
     if (sourceAtt != nullptr) sourceAtt->sendInitialUpdate();
+    if (sourceUserAtt != nullptr) sourceUserAtt->sendInitialUpdate();
     repaint();
 }
 
@@ -2412,6 +2460,23 @@ void OrogenEditor::refreshEngineContext()
         const int count = sourceCountForEngine (type);
         for (int i = 0; i < count; ++i)
             sourceBox.addItem (juce::String (sourceNameForEngine (type, i)).toUpperCase(), i + 1);
+        userWtPresent = false;
+        userWtName = {};
+        if (type == (int) EngineType::Wavetable)
+        {
+            auto tables = proc.engine().getUserWavetables();
+            if (const auto& table = tables[(size_t) selectedSlot])
+            {
+                userWtPresent = true;
+                userWtName = juce::String::fromUTF8 (table->name.c_str());
+            }
+            sourceBox.addItem (userWtPresent ? "USER: " + userWtName.toUpperCase() : "USER: LOAD WAV FIRST", 9);
+            sourceBox.setItemEnabled (9, userWtPresent);
+        }
+        wtLoadButton.setVisible (type == (int) EngineType::Wavetable);
+        wtResynthButton.setVisible (type == (int) EngineType::Wavetable);
+        wtLoadButton.setEnabled (! wtImportBusy);
+        wtResynthButton.setEnabled (! wtImportBusy);
         sourceBox.setEnabled (count > 0);
         updateSourceSelection (pv (slotId ("table")));
         if (centreKnobs.size() > 1 && centreBars.size() > 1)
@@ -2435,7 +2500,14 @@ void OrogenEditor::updateSourceSelection (float denormalisedValue)
     }
     // CHOP DSP clamps legacy/host table values 3..7 to loop #3. Display the
     // effective loop without rewriting the saved/automated host value.
-    const int index = juce::jlimit (0, count - 1, juce::roundToInt (denormalisedValue));
+    if (pi (slotId ("type")) == (int) EngineType::Wavetable
+        && sourceUserValue > 0.5f && userWtPresent)
+    {
+        sourceBox.setSelectedId (9, juce::dontSendNotification);
+        return;
+    }
+    const int sourceCount = sourceCountForEngine (pi (slotId ("type")));
+    const int index = juce::jlimit (0, juce::jmax (0, sourceCount - 1), juce::roundToInt (denormalisedValue));
     sourceBox.setSelectedId (index + 1, juce::dontSendNotification);
 }
 
@@ -2671,6 +2743,8 @@ void OrogenEditor::resized()
     engineBox.setBounds (R (262.0f, 92.0f, 168.0f, 20.0f));
     filterBox.setBounds (R (438.0f, 92.0f, 124.0f, 20.0f));
     sourceBox.setBounds (R (570.0f, 92.0f, 195.0f, 20.0f));
+    wtLoadButton.setBounds (R (772.0f, 92.0f, 91.0f, 20.0f));
+    wtResynthButton.setBounds (R (869.0f, 92.0f, 94.0f, 20.0f));
 
     for (int i = 0; i < centreKnobs.size(); ++i)
     {
@@ -2760,7 +2834,7 @@ void OrogenEditor::rebuildPreview (bool force)
     prevHashValid = true;
     prevStampMs = now;
     prevPending = true;
-    previewWorker->submit (patch, ++prevGeneration);
+    previewWorker->submit (patch, proc.engine().getUserWavetables(), ++prevGeneration);
     repaint (R (248.0f, 66.0f, 736.0f, 214.0f));
 }
 
@@ -2947,7 +3021,7 @@ void OrogenEditor::repaintChangedValues()
     // previewPatchHash специально игнорирует его звуковые параметры.
     VisualHash display;
     display.add ((float) selectedSlot);
-    for (const auto* field : { "on", "type", "table", "filter", "grainReverse" }) display.add (pv (slotId (field)));
+    for (const auto* field : { "on", "type", "table", "filter", "grainReverse", "wtUser" }) display.add (pv (slotId (field)));
     display.add (pv ("gl_mode")); display.add (pv ("gl_morph"));
     if (changed (display.value, displayVisualHash)) repaint (R (248.0f, 66.0f, 736.0f, 214.0f));
     visualHashesValid = true;
@@ -2962,6 +3036,16 @@ void OrogenEditor::timerCallback()
     lastTimerMs = now;
 
     bool changed = false;
+    const auto wtRevision = proc.userWavetableRevision();
+    if (wtRevision != seenWtRevision)
+    {
+        seenWtRevision = wtRevision;
+        contextEngine = -1;
+        refreshEngineContext();
+        prevHashValid = false;
+        if (! paramsOpen && ! fxOpen) rebuildPreview (true);
+        changed = true;
+    }
 
     if (animOn && dt > 0.0)
     {
@@ -3214,6 +3298,8 @@ juce::String OrogenEditor::selectedSourceLabel() const
     const int table = juce::jlimit (0, 7, pi (slotId ("table")));
     if (type == (int) EngineType::Wavetable)
     {
+        if (pv (slotId ("wtUser")) > 0.5f && userWtPresent)
+            return "USER: " + userWtName.toUpperCase();
         const auto& bank = waveStore().get();
         if (table < (int) bank.tables.size())
             return juce::String (bank.tables[(size_t) table].name.c_str()).toUpperCase()
@@ -4131,6 +4217,56 @@ void OrogenEditor::mouseUp (const juce::MouseEvent& e)
     if ((dragTarget == MainHit::fxChip || dragTarget == MainHit::fxChipPage) && ! dragMoved)
         clickMain (designPos);
     releaseMain();
+}
+
+void OrogenEditor::showWavetableImport (bool resynth, int cycleLength)
+{
+    if (wtImportBusy) return;
+    const int slot = selectedSlot; // keep the destination even if the user switches slots
+    auto chooser = std::make_shared<juce::FileChooser> (
+        resynth ? "Resynthesize an ordinary WAV recording" : "Import a packed WAV wavetable",
+        juce::File::getSpecialLocation (juce::File::userDocumentsDirectory), "*.wav");
+    juce::Component::SafePointer<OrogenEditor> safe (this);
+    chooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+        [safe, chooser, resynth, cycleLength, slot] (const juce::FileChooser& fc)
+        {
+            if (safe == nullptr || fc.getResult() == juce::File()) return;
+            safe->beginWavetableFileImport (fc.getResult(), resynth, cycleLength, slot);
+        });
+}
+
+void OrogenEditor::beginWavetableFileImport (juce::File file, bool resynth, int cycleLength, int slot)
+{
+    if (wtImportBusy) return;
+    if (wtImportThread.joinable()) wtImportThread.join();
+    wtImportBusy = true;
+    wtLoadButton.setEnabled (false); wtResynthButton.setEnabled (false);
+    wtResynthButton.setButtonText ("LOADING...");
+    juce::Component::SafePointer<OrogenEditor> safe (this);
+    wtImportThread = std::thread ([safe, file, resynth, cycleLength, slot]
+    {
+        auto result = loadWavetableWav (file, resynth, cycleLength);
+        juce::MessageManager::callAsync ([safe, result = std::move (result), slot]() mutable
+        {
+            if (safe == nullptr) return;
+            safe->wtImportBusy = false;
+            safe->wtResynthButton.setButtonText ("RESYNTH");
+            safe->wtLoadButton.setEnabled (true); safe->wtResynthButton.setEnabled (true);
+            if (! result.table)
+            {
+                juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
+                                                         "WAV import", result.error, "OK");
+                return;
+            }
+            safe->proc.installUserWavetable (slot, std::move (result.table));
+            safe->seenWtRevision = safe->proc.userWavetableRevision();
+            safe->contextEngine = -1;
+            safe->refreshEngineContext();
+            safe->prevHashValid = false;
+            if (! safe->paramsOpen && ! safe->fxOpen) safe->rebuildPreview (true);
+            safe->repaint();
+        });
+    });
 }
 
 void OrogenEditor::loadPresetFromFile()

@@ -71,6 +71,10 @@ public:
     void applyToParams (const Patch& p, const FxChain::Settings& fx);
     void collectFxCopy (int copy, FxChain::Settings& fx) const noexcept;
     FxChain::RackRanks rackRanks() const noexcept;
+    // Installation is a control/message-thread operation, after all WAV
+    // reading and spectral preparation have completed off the audio thread.
+    void installUserWavetable (int slot, std::shared_ptr<const UserWavetable> table);
+    std::uint64_t userWavetableRevision() const noexcept { return wtRevision.load (std::memory_order_acquire); }
     std::vector<int> rackOrder() const;
     int addRackEffect (int module);
     bool removeRackNode (int node);
@@ -117,6 +121,7 @@ private:
         std::atomic<float>* type = nullptr;
         std::atomic<float>* on = nullptr;
         std::atomic<float>* filter = nullptr;
+        std::atomic<float>* wtUser = nullptr;
         std::atomic<float>* grainReverse = nullptr; // добавлен в конец layout, вне старой таблицы
         std::vector<std::atomic<float>*> f;     // по порядку slotParamTable
     };
@@ -126,7 +131,7 @@ private:
     Patch patch = patchInit();
     FxChain::Settings fxSettings;
 
-    struct Preset { juce::String name; Patch patch; FxChain::Settings fx; juce::var rack; };
+    struct Preset { juce::String name; Patch patch; FxChain::Settings fx; juce::var rack; Instrument::UserTables tables {}; };
     std::vector<Preset> presets;
     int currentProgram = 0;
 
@@ -176,6 +181,7 @@ private:
     std::atomic<int> latencySamples { 0 };
     std::atomic<double> blockSeconds { 0.0 };
     std::atomic<long long> rendered { 0 };
+    std::atomic<std::uint64_t> wtRevision { 0 };
     std::atomic<float> pitchBend { 0.0f };                      // −1…+1, от MIDI
 
     double currentSampleRate = 48000.0;
