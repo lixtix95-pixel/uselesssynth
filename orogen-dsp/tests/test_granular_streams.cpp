@@ -104,12 +104,12 @@ int main()
     suite::check (forward < 1.0e-7 && backward < 1.0e-7,
                   "направление 0% и 100% не зависит от serial");
 
-    // Для восьми реальных seed из Voice считаем именно рождения и знаки
-    // скоростей, а не только изменение аудио. Позиции и Spread не должны
-    // зависеть от нового потока направления.
+    // Для восьми реальных seed считаем рождения и знаки скоростей. При
+    // Spread=0 базовые Position и скорость остаются прежними; ненулевой
+    // независимый Spread и инвариант Reverse проверяет отдельный стенд.
     GranularEngine engines[8];
     EngineParams ep; ep.p[0] = 0.4f; ep.p[1] = 0.2f; ep.p[2] = 1.0f;
-    ep.p[3] = 0.35f; ep.detune = 0.0f; ep.grainReverse = 0.5f;
+    ep.p[3] = 0.0f; ep.detune = 0.0f; ep.grainReverse = 0.5f;
     for (int s = 0; s < 8; ++s)
     {
         engines[s].setBank (&bank.smp); engines[s].setSampleRate (48000.0);
@@ -163,7 +163,7 @@ int main()
                   && agreement > 0.38 && agreement < 0.62,
                   "все восемь потоков сохраняют вероятность и различаются");
     suite::check (syncErrors == 0 && worstPos < 0.02 && worstRate == 0.0,
-                  "семена направления не меняют время, Position и Spread");
+                  "при Spread=0 семена не меняют время, Position и pitch");
     std::printf ("\n%s (провалов: %d)\n", suite::gFailures ? "ЕСТЬ ПРОВАЛЫ" : "ВСЕ ТЕСТЫ ПРОЙДЕНЫ", suite::gFailures);
     return suite::gFailures == 0 ? 0 : 1;
 }

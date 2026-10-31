@@ -7,9 +7,9 @@ INC      := -Isrc
 MONOJUICE_OBJ := build/monojuice_chorus.o build/monojuice_adapter.o
 
 TEST_BINS := build/test_wavetable build/test_fm build/test_harmonic build/test_sample \
-             build/test_granular build/test_granular_reverse build/test_granular_streams build/test_vocal_vibrato build/test_granular_vocal \
+             build/test_granular build/test_granular_reverse build/test_granular_envelope build/test_granular_streams build/test_granular_randomness build/test_vocal_vibrato build/test_granular_vocal \
              build/test_modal build/test_resynth build/test_organics \
-             build/test_instrument build/test_meters build/test_fx build/test_chop
+             build/test_instrument build/test_engine_handoff build/test_meters build/test_fx build/test_fx_bypass build/test_fx_extra build/test_fx_monohuice build/test_chop
 DEMO_BINS := build/render_demo build/render_demo_sample build/render_demo_granular build/render_demo_modal \
              build/render_demo_resynth build/render_demo_organics build/render_demo_synth build/render_demo_instrument \
              build/render_demo_fx build/render_demo_comb build/render_demo_chop
@@ -52,9 +52,17 @@ build/test_granular_reverse: tests/test_granular_reverse.cpp tests/engine_suite.
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(INC) tests/test_granular_reverse.cpp -o $@
 
+build/test_granular_envelope: tests/test_granular_envelope.cpp tests/engine_suite.h src/engines/granular.h src/engines/engine.h src/engines/mip_reader.h src/engines/sinc_interp.h src/content/sample_bank.h src/engines/vibrato_phase.h src/engines/halfband.h src/core/*.h
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) $(INC) tests/test_granular_envelope.cpp -o $@
+
 build/test_granular_streams: tests/test_granular_streams.cpp tests/engine_suite.h src/instrument/*.h src/engines/*.h src/content/*.h src/core/*.h
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(INC) tests/test_granular_streams.cpp -o $@
+
+build/test_granular_randomness: tests/test_granular_randomness.cpp tests/engine_suite.h src/instrument/*.h src/engines/*.h src/content/*.h src/core/*.h
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) $(INC) tests/test_granular_randomness.cpp -o $@
 
 build/test_vocal_vibrato: tests/test_vocal_vibrato.cpp src/content/sample_bank.h src/engines/vibrato_phase.h src/engines/halfband.h src/core/*.h
 	@mkdir -p build
@@ -95,6 +103,14 @@ build/test_granular_safety_asan: tests/test_granular_safety.cpp src/engines/gran
 asan-granular: build/test_granular_safety_asan
 	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 ./build/test_granular_safety_asan
 
+build/test_granular_envelope_asan: tests/test_granular_envelope.cpp tests/engine_suite.h src/engines/granular.h src/engines/engine.h src/engines/mip_reader.h src/engines/sinc_interp.h src/content/sample_bank.h src/engines/vibrato_phase.h src/engines/halfband.h src/core/*.h
+	@mkdir -p build
+	$(CXX) -O1 -g1 -std=c++17 -fsanitize=address,undefined -fno-omit-frame-pointer $(INC) tests/test_granular_envelope.cpp -o $@
+
+.PHONY: asan-envelope
+asan-envelope: build/test_granular_envelope_asan
+	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 ./build/test_granular_envelope_asan
+
 build/test_granular_streams_asan: tests/test_granular_streams.cpp tests/engine_suite.h src/instrument/*.h src/engines/*.h src/content/*.h src/core/*.h
 	@mkdir -p build
 	$(CXX) -O1 -g1 -std=c++17 -fsanitize=address,undefined -fno-omit-frame-pointer $(INC) tests/test_granular_streams.cpp -o $@
@@ -102,6 +118,22 @@ build/test_granular_streams_asan: tests/test_granular_streams.cpp tests/engine_s
 .PHONY: asan-streams
 asan-streams: build/test_granular_streams_asan
 	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 ./build/test_granular_streams_asan
+
+build/test_granular_randomness_asan: tests/test_granular_randomness.cpp tests/engine_suite.h src/instrument/*.h src/engines/*.h src/content/*.h src/core/*.h
+	@mkdir -p build
+	$(CXX) -O1 -g1 -std=c++17 -fsanitize=address,undefined -fno-omit-frame-pointer $(INC) tests/test_granular_randomness.cpp -o $@
+
+.PHONY: asan-randomness
+asan-randomness: build/test_granular_randomness_asan
+	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 ./build/test_granular_randomness_asan
+
+build/test_granular_vocal_asan: tests/test_granular_vocal.cpp src/engines/granular.h src/engines/mip_reader.h src/engines/sinc_interp.h src/content/sample_bank.h src/engines/vibrato_phase.h src/engines/halfband.h src/core/*.h
+	@mkdir -p build
+	$(CXX) -O1 -g1 -std=c++17 -fsanitize=address,undefined -fno-omit-frame-pointer $(INC) tests/test_granular_vocal.cpp -o $@
+
+.PHONY: asan-vocal
+asan-vocal: build/test_granular_vocal_asan
+	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 ./build/test_granular_vocal_asan
 
 build/test_meters_asan: tests/test_meters.cpp tests/engine_suite.h src/instrument/*.h src/engines/*.h src/content/*.h src/core/*.h third_party/monojuice/dsp/*.cpp third_party/monojuice/dsp/*.h
 	@mkdir -p build
@@ -155,6 +187,30 @@ build/test_fx: tests/test_fx.cpp build/verb_ref.o src/instrument/*.h src/core/*.
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(INC) tests/test_fx.cpp build/verb_ref.o $(MONOJUICE_OBJ) -o $@
 
+build/test_fx_bypass: tests/test_fx_bypass.cpp src/instrument/*.h src/core/*.h $(MONOJUICE_OBJ)
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) $(INC) tests/test_fx_bypass.cpp $(MONOJUICE_OBJ) -o $@
+
+build/test_fx_extra: tests/test_fx_extra.cpp src/instrument/*.h src/core/*.h $(MONOJUICE_OBJ)
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) $(INC) tests/test_fx_extra.cpp $(MONOJUICE_OBJ) -o $@
+
+build/test_fx_monohuice: tests/test_fx_monohuice.cpp src/instrument/*.h src/core/*.h third_party/monojuice/dsp/*.h $(MONOJUICE_OBJ)
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) $(INC) tests/test_fx_monohuice.cpp $(MONOJUICE_OBJ) -o $@
+
+build/test_fx_monohuice_asan: tests/test_fx_monohuice.cpp src/instrument/*.h src/core/*.h third_party/monojuice/dsp/*.h third_party/monojuice/dsp/ChorusCore.cpp third_party/monojuice/dsp/AudioAdapter.cpp
+	@mkdir -p build
+	$(CXX) -O1 -g1 -std=c++17 -fsanitize=address,undefined -fno-omit-frame-pointer $(INC) tests/test_fx_monohuice.cpp third_party/monojuice/dsp/ChorusCore.cpp third_party/monojuice/dsp/AudioAdapter.cpp -o $@
+
+build/test_engine_handoff: tests/test_engine_handoff.cpp src/instrument/*.h src/engines/*.h src/content/*.h src/core/*.h $(MONOJUICE_OBJ)
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) $(INC) -pthread tests/test_engine_handoff.cpp $(MONOJUICE_OBJ) -o $@
+
+build/test_engine_handoff_tsan: tests/test_engine_handoff.cpp src/instrument/*.h src/engines/*.h src/content/*.h src/core/*.h third_party/monojuice/dsp/*.cpp third_party/monojuice/dsp/*.h
+	@mkdir -p build
+	$(CXX) -O1 -g1 -std=c++17 -fsanitize=thread -fno-omit-frame-pointer -no-pie -pthread $(INC) tests/test_engine_handoff.cpp third_party/monojuice/dsp/ChorusCore.cpp third_party/monojuice/dsp/AudioAdapter.cpp -o $@
+
 build/test_instrument: tests/test_instrument.cpp src/instrument/*.h src/engines/*.h src/content/*.h src/core/*.h $(MONOJUICE_OBJ)
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(INC) tests/test_instrument.cpp $(MONOJUICE_OBJ) -o $@
@@ -179,7 +235,20 @@ build/render_demo_granular: tools/render_demo_granular.cpp src/engines/granular.
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(INC) tools/render_demo_granular.cpp -o $@
 
+# Диагностический float WAV двух слоёв через Voice; без FX/нормировки.
+build/render_granular_spread: tools/render_granular_spread.cpp src/instrument/*.h src/engines/*.h src/content/*.h src/core/*.h
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) $(INC) tools/render_granular_spread.cpp -o $@
+
 # Диагностический float WAV напрямую из движка; без нормировки/лимитера.
+build/render_granular_attack: tools/render_granular_attack.cpp src/engines/granular.h src/engines/engine.h src/engines/mip_reader.h src/engines/sinc_interp.h src/content/sample_bank.h src/engines/vibrato_phase.h src/engines/halfband.h src/core/*.h
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) $(INC) tools/render_granular_attack.cpp -o $@
+
+build/analyze_granular_peak: tools/analyze_granular_peak.cpp src/engines/granular.h src/engines/engine.h src/engines/mip_reader.h src/engines/sinc_interp.h src/content/sample_bank.h src/engines/vibrato_phase.h src/engines/halfband.h src/core/*.h
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) $(INC) tools/analyze_granular_peak.cpp -o $@
+
 build/render_granular_raw: tools/render_granular_raw.cpp src/engines/granular.h src/engines/engine.h src/engines/mip_reader.h src/engines/sinc_interp.h src/content/sample_bank.h src/engines/vibrato_phase.h src/engines/halfband.h src/core/*.h
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(INC) tools/render_granular_raw.cpp -o $@

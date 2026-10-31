@@ -24,6 +24,23 @@ public:
     static constexpr int kSlots = 8;
     static constexpr int kControlBlock = 128;
 
+    Voice()
+    {
+        for (auto& item : pending) item.store (nullptr, std::memory_order_relaxed);
+    }
+
+    // The owner must stop both threads before destroying a Voice. Pending
+    // engines were allocated by the staging thread and have not been consumed.
+    ~Voice()
+    {
+        for (auto& item : pending)
+            if (auto* p = item.load (std::memory_order_relaxed))
+            {
+                delete p;
+                EngineStats::deleted.fetch_add (1, std::memory_order_relaxed);
+            }
+    }
+
     void init (const EngineBank& bank, double sr, EngineRetireBin* retireBinToUse = nullptr)
     {
         sampleRate = sr;
@@ -37,72 +54,83 @@ public:
             gainSm[(size_t) i].reset (sr, 8.0);
             panSm[(size_t) i].reset (sr, 8.0);
             panL[(size_t) i] = panR[(size_t) i] = lastPan[(size_t) i] = 0.0f;
+            // prepare() can be called again at a different host rate with the
+            // existing Voice objects. Neither active nor pending engines may
+            // retain the previous rate. The owner stops rendering before init.
+            if (engines[(size_t) i]) engines[(size_t) i]->setSampleRate (sr);
+            if (auto* next = pending[(size_t) i].load (std::memory_order_relaxed))
+                next->setSampleRate (sr);
         }
         controlCounter = 0;
         active = false;
         (void) bank;
     }
 
-    // Подготовка движков слотов — ТОЛЬКО вне аудио-потока.
-    //
-    // Создаёт новый движок в pending[i], если тип слота отличается от того,
-    // что сейчас работает (или уже подготовлен). Работающий движок не
-    // трогается: аудио-поток продолжает его использовать, пока не вызовет
-    // applyPendingEngines(). Раньше здесь стояла замена «на месте» — и смена
-    // типа движка в работающем плагине означала аллокацию внутри processBlock.
+    // Подготовка движков — только вне аудио-потока; вызовы производителя
+    // сериализует Instrument. Работающий движок здесь никогда не читается.
+    // Каждый полностью подготовленный объект передаётся одним atomic exchange:
+    // либо аудио его забирает, либо производитель заменяет/удаляет, но не оба.
     void stageSlots (const Patch& p, const EngineBank& bank)
     {
-        uint32_t add = 0;
-        const uint32_t staged = pendingMask.load (std::memory_order_acquire);
         for (int i = 0; i < kSlots; ++i)
         {
-            const uint32_t bit = 1u << i;
-            const bool willExist = engines[(size_t) i] != nullptr || (staged & bit) != 0;
-            const EngineType willBe = (staged & bit) != 0 ? pendingType[(size_t) i]
-                                                          : slotType[(size_t) i];
-            if (willExist && willBe == p.slots[i].type) continue;
+            auto type = p.slots[i].type;
+            if ((int) type < 0 || (int) type >= (int) EngineType::Count)
+                type = EngineType::Wavetable;
+            if (stagedValid[(size_t) i] && stagedType[(size_t) i] == type) continue;
 
-            // если в pending уже лежал невостребованный движок (тип сменили дважды
-            // между двумя блоками), он удаляется здесь же — это message thread
-            if (pending[(size_t) i]) EngineStats::deleted.fetch_add (1, std::memory_order_relaxed);
-            pending[(size_t) i] = makeEngine (p.slots[i].type, bank);
-            pendingType[(size_t) i] = p.slots[i].type;
-            if (pending[(size_t) i]) pending[(size_t) i]->setSampleRate (sampleRate);
-            add |= bit;
+            auto next = makeEngine (type, bank);
+            if (! next) continue;
+            next->setSampleRate (sampleRate);
+            next->preparedSlotType = (int) type;
+            if (auto* replaced = pending[(size_t) i].exchange (next.release(), std::memory_order_acq_rel))
+            {
+                delete replaced;
+                EngineStats::deleted.fetch_add (1, std::memory_order_relaxed);
+            }
+            stagedType[(size_t) i] = type;
+            stagedValid[(size_t) i] = true;
         }
-        if (add != 0)
-            pendingMask.store (staged | add, std::memory_order_release);
     }
 
     // Сколько слотов ждёт применения (для тестов и диагностики).
-    int pendingCount() const noexcept { return popCount (pendingMask.load (std::memory_order_acquire)); }
+    int pendingCount() const noexcept
+    {
+        int count = 0;
+        for (const auto& item : pending)
+            count += item.load (std::memory_order_acquire) != nullptr ? 1 : 0;
+        return count;
+    }
 
-    // Применение подготовленных движков — ТОЛЬКО аудио-поток.
-    // Только обмен указателей и уборка старых в retire bin: ни одной аллокации.
-    // Если места в bin не хватает, обмен откладывается на следующий блок
-    // (звук при этом остаётся прежним — старые движки работают).
+    // Только аудио-поток. Снимок маски ограничивает максимальное число
+    // заменённых движков; новые публикации остаются на следующий блок.
+    // Ни создания, ни удаления в audio thread при наличии retire bin.
     void applyPendingEngines() noexcept
     {
-        const uint32_t mask = pendingMask.load (std::memory_order_acquire);
+        uint32_t mask = 0;
+        for (int i = 0; i < kSlots; ++i)
+            if (pending[(size_t) i].load (std::memory_order_acquire) != nullptr)
+                mask |= 1u << i;
         if (mask == 0) return;
-        const int n = popCount (mask);
-        if (retireBin != nullptr && retireBin->room() < n) return;   // подождём
+        if (retireBin != nullptr && retireBin->room() < popCount (mask)) return;
 
-        pendingMask.store (0, std::memory_order_release);
+        bool changed = false;
         for (int i = 0; i < kSlots; ++i)
         {
             if ((mask & (1u << i)) == 0) continue;
+            EngineBase* next = pending[(size_t) i].exchange (nullptr, std::memory_order_acq_rel);
+            if (next == nullptr) continue;
             if (engines[(size_t) i])
             {
                 EngineBase* old = engines[(size_t) i].release();
                 if (retireBin == nullptr || ! retireBin->push (old))
                 {
-                    delete old;                       // без bin: единственный путь
+                    delete old;                       // без bin: однопоточный стенд
                     EngineStats::deleted.fetch_add (1, std::memory_order_relaxed);
                 }
             }
-            engines[(size_t) i] = std::move (pending[(size_t) i]);
-            slotType[(size_t) i] = pendingType[(size_t) i];
+            engines[(size_t) i].reset (next);
+            slotType[(size_t) i] = (EngineType) next->preparedSlotType;
             env[(size_t) i].reset();
             slotRunning[(size_t) i] = false;
             slotStarted[(size_t) i] = false;
@@ -110,11 +138,11 @@ public:
             lastAmp[(size_t) i] = 0.0f;
             lastParams[(size_t) i] = EngineParams();
             lastParamsValid[(size_t) i] = false;
+            changed = true;
         }
-        // Активный голос не должен умереть в первые 1…127 отсчётов до
-        // очередного control tick: новый движок стартует на текущей ноте
-        // сразу, без повторного MIDI Note On. Отпущенные голоса не рестартуют.
-        controlCounter = 0;
+        // На удержанной ноте новый тип стартует на следующем сэмпле, не
+        // ожидая повторного MIDI Note On и следующего control tick.
+        if (changed) controlCounter = 0;
     }
 
     void setSampleRate (double sr)
@@ -127,11 +155,17 @@ public:
             gainSm[(size_t) i].reset (sr, 8.0);
             panSm[(size_t) i].reset (sr, 8.0);
             if (engines[(size_t) i]) engines[(size_t) i]->setSampleRate (sr);
-            if (pending[(size_t) i]) pending[(size_t) i]->setSampleRate (sr);
+            if (auto* next = pending[(size_t) i].load (std::memory_order_relaxed))
+                next->setSampleRate (sr);
         }
     }
 
     bool isActive() const { return active; }
+    // Read only on the audio thread, or after rendering has stopped.
+    EngineType activeSlotType (int slot) const noexcept
+    {
+        return slotType[(size_t) clamp (slot, 0, kSlots - 1)];
+    }
     int  note() const { return targetNote; }
     double age() const { return ageSamples; }
     bool isReleased() const { return released; }
@@ -418,9 +452,9 @@ private:
         tailLeft[(size_t) i] = s.tail;
         lastAmp[(size_t) i] = 0.0f;
         e->setNoteRandom (noteRandom);
-        // Разный воспроизводимый поток на каждую ноту и слот. Раньше все
-        // Granular-слоты сбрасывали RNG направления в один и тот же seed:
-        // при 50% два идентичных слоя реверсировались синхронно.
+        // Разный воспроизводимый seed на каждую ноту и слот. Granular
+        // использует независимые потоки направления и ненулевого Spread;
+        // при Spread=0 базовый Position-jitter остаётся прежним.
         e->setRandomStreamSeed (noteSlotStreamSeed (noteSerial, i));
         e->start (targetNote, velocityGain);
         EngineParams ep = slotParams (p, i);
@@ -552,10 +586,11 @@ private:
 
     std::array<std::unique_ptr<EngineBase>, kSlots> engines;
     std::array<EngineType, kSlots> slotType {};
-    // подготовленные движки (пишет message thread, забирает аудио-поток)
-    std::array<std::unique_ptr<EngineBase>, kSlots> pending;
-    std::array<EngineType, kSlots> pendingType {};
-    std::atomic<uint32_t> pendingMask { 0 };
+    // Ownership moves atomically between the staging and audio threads.
+    std::array<std::atomic<EngineBase*>, kSlots> pending {};
+    // Only the staging thread (serialized by Instrument) reads/writes these.
+    std::array<EngineType, kSlots> stagedType {};
+    std::array<bool, kSlots> stagedValid {};
     EngineRetireBin* retireBin = nullptr;
     std::array<Adsr, kSlots> env;
     std::array<SlotFilter, kSlots> filter;

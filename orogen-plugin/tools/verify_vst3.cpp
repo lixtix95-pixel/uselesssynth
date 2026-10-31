@@ -12,11 +12,12 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <set>
 
 using namespace juce;
 
-static constexpr int kNumApvtsParams = 306;   // см. Params.h / test_plugin
+static constexpr int kNumApvtsParams = 376;   // см. Params.h / test_plugin
 
 static int failures = 0;
 static void check (bool ok, const String& what, const String& detail = {})
@@ -29,6 +30,114 @@ static void check (bool ok, const String& what, const String& detail = {})
 static void check (bool ok, const char* what, const String& detail = {})
 {
     check (ok, String::fromUTF8 (what), detail);
+}
+
+// Необязательный тест сквозного пути X11 -> UI внутри VST3 -> beginEdit /
+// performEdit / endEdit -> параметры JUCE-хоста. XTEST двигает указатель,
+// поэтому включать только в отдельном Xvfb (OROGEN_GUI_XTEST=1).
+struct HostGestureTrace : AudioProcessorParameter::Listener
+{
+    AudioProcessorParameter* p = nullptr;
+    int begins = 0, ends = 0, values = 0;
+    bool active = false, valueInside = false, invalid = false;
+    explicit HostGestureTrace (AudioProcessorParameter* parameter) : p (parameter)
+    { if (p != nullptr) p->addListener (this); }
+    ~HostGestureTrace() override { if (p != nullptr) p->removeListener (this); }
+    void parameterValueChanged (int, float) override { ++values; if (active) valueInside = true; }
+    void parameterGestureChanged (int, bool starting) override
+    {
+        if (starting) { if (active) invalid = true; active = true; ++begins; }
+        else { if (! active) invalid = true; active = false; ++ends; }
+    }
+    bool balanced() const { return p != nullptr && begins == 1 && ends == 1 && ! active && ! invalid && valueInside; }
+    String info() const { return String (begins) + "/" + String (values) + "/" + String (ends); }
+};
+
+static void testHostedGuiGestures (AudioPluginFormat& format, const PluginDescription& d)
+{
+   #if JUCE_LINUX
+    if (std::getenv ("OROGEN_GUI_XTEST") == nullptr) return;
+    std::printf ("\n--- X11 → VST3 → жесты хоста ---\n");
+    DynamicLibrary x11, xtest;
+    if (! x11.open ("libX11.so.6") || ! xtest.open ("libXtst.so.6"))
+    { check (false, "XTEST: библиотеки libX11/libXtst доступны"); return; }
+    const auto openDisplay = reinterpret_cast<void* (*) (const char*)> (x11.getFunction ("XOpenDisplay"));
+    const auto closeDisplay = reinterpret_cast<int (*) (void*)> (x11.getFunction ("XCloseDisplay"));
+    const auto flushDisplay = reinterpret_cast<int (*) (void*)> (x11.getFunction ("XFlush"));
+    const auto move = reinterpret_cast<int (*) (void*, int, int, int, unsigned long)> (xtest.getFunction ("XTestFakeMotionEvent"));
+    const auto button = reinterpret_cast<int (*) (void*, unsigned int, int, unsigned long)> (xtest.getFunction ("XTestFakeButtonEvent"));
+    if (openDisplay == nullptr || closeDisplay == nullptr || flushDisplay == nullptr || move == nullptr || button == nullptr)
+    { check (false, "XTEST: функции X11 доступны"); return; }
+    void* display = openDisplay (nullptr);
+    if (display == nullptr) { check (false, "XTEST: открыт X11 display"); return; }
+    {
+        String error;
+        auto inst = format.createInstanceFromDescription (d, 48000.0, 512, error);
+        if (inst == nullptr) { check (false, "инстанс VST3 для теста UI", error); closeDisplay (display); return; }
+        auto findParam = [&] (const String& name) -> AudioProcessorParameter* {
+            for (auto* p : inst->getParameters()) if (p->getName (64) == name) return p;
+            return nullptr;
+        };
+        auto* editor = inst->createEditorAndMakeActive();
+        if (editor == nullptr) { check (false, "редактор VST3 для теста UI"); closeDisplay (display); return; }
+        editor->addToDesktop (0); editor->setTopLeftPosition (0, 0); editor->setVisible (true);
+        auto* mm = MessageManager::getInstance(); mm->runDispatchLoopUntil (700);
+        auto drag = [&] (Point<int> a, Point<int> b)
+        {
+            const auto pa = editor->localPointToGlobal (a), pb = editor->localPointToGlobal (b);
+            move (display, -1, pa.x, pa.y, 0); flushDisplay (display); mm->runDispatchLoopUntil (80);
+            button (display, 1, 1, 0); flushDisplay (display); mm->runDispatchLoopUntil (80);
+            move (display, -1, pb.x, pb.y, 0); flushDisplay (display); mm->runDispatchLoopUntil (120);
+            button (display, 1, 0, 0); flushDisplay (display); mm->runDispatchLoopUntil (180);
+        };
+        {
+            HostGestureTrace p1 (findParam ("sA_P1")), p2 (findParam ("sA_P2"));
+            drag ({ 500, 170 }, { 535, 155 });
+            check (p1.balanced() && p2.balanced(),
+                   "VST3 передаёт хосту begin/value/end для P1/P2 при drag дисплея",
+                   p1.info() + " / " + p2.info());
+        }
+        {
+            HostGestureTrace morph (findParam ("Morph")), glide (findParam ("Glide"));
+            drag ({ 1186, 715 }, { 1215, 687 });
+            check (morph.balanced() && glide.balanced(),
+                   "VST3 передаёт хосту begin/value/end для Morph/Glide на VectorPad",
+                   morph.info() + " / " + glide.info());
+        }
+        // The separate rack is tested through the hosted VST3, not through
+        // internal OrogenEditor helpers: X11 -> VST3 edit callbacks -> host.
+        {
+            const auto click = [&] (Point<int> pos) {
+                const auto pt = editor->localPointToGlobal (pos);
+                move (display, -1, pt.x, pt.y, 0); flushDisplay (display); mm->runDispatchLoopUntil (80);
+                button (display, 1, 1, 0); flushDisplay (display); mm->runDispatchLoopUntil (80);
+                button (display, 1, 0, 0); flushDisplay (display); mm->runDispatchLoopUntil (180);
+            };
+            click ({ 306, 32 }); // FX RACK
+            HostGestureTrace chorus (findParam ("CHORUS On"));
+            click ({ 211, 251 }); // Chorus OFF -> ON
+            check (chorus.balanced() && chorus.p->getValue() > 0.5f,
+                   "VST3 FX rack: Chorus ON передаёт begin/value/end хосту", chorus.info());
+            click ({ 95, 251 });  // select Chorus settings
+            auto* delay = findParam ("Chorus Delay");
+            if (delay != nullptr) delay->setValueNotifyingHost (0.5f);
+            const float before = delay != nullptr ? delay->getValue() : -1.0f;
+            HostGestureTrace knob (delay);
+            drag ({ 1150, 301 }, { 1150, 260 });
+            const float after = delay != nullptr ? delay->getValue() : -1.0f;
+            check (knob.balanced() && std::fabs (after - before) > 0.05f,
+                   "VST3 FX rack: регулятор DEL изменяет параметр хоста", knob.info() + " / " + String (before, 3) + " -> " + String (after, 3));
+        }
+        // Сначала уничтожаем hosted editor: его деструктор отсоединяет XEmbed
+        // до уничтожения родительского native peer. removeFromDesktop() раньше
+        // удалял X11-окно преждевременно и вызывал BadWindow в тестовом хосте.
+        inst->editorBeingDeleted (editor); delete editor;
+        inst.reset(); mm->runDispatchLoopUntil (150);
+    }
+    closeDisplay (display);
+   #else
+    ignoreUnused (format, d);
+   #endif
 }
 
 int main (int argc, char** argv)
@@ -106,6 +215,54 @@ int main (int argc, char** argv)
                                "Plate Input Diff 2", "Plate Output", "sA_Grain Reverse", "sH_Grain Reverse" })
         check (names.count (String (probe)) == 1, String::fromUTF8 ("виден хосту: ") + probe);
 
+    const char* rackNames[] = { "DRIVE On", "COMB On", "CHORUS On", "DELAY On", "REVERB On", "PLATE On",
+                                "EQ On", "MATERIAL On", "SPECTRE On", "ROBIN On", "GLITCH On", "DYNAMICS On", "WIDTH On" };
+    AudioProcessorParameter* rackParams[13] {};
+    AudioProcessorParameter* rackMix = nullptr;
+    AudioProcessorParameter* rackCross = nullptr;
+    for (auto* parameter : params)
+    {
+        for (int i = 0; i < 13; ++i) if (parameter->getName (64) == rackNames[i]) rackParams[i] = parameter;
+        if (parameter->getName (64) == "Drive Mix") rackMix = parameter;
+        if (parameter->getName (64) == "Comb Cross %") rackCross = parameter;
+    }
+    MemoryBlock initialState;
+    inst->getStateInformation (initialState);
+    int rackOff = 0;
+    for (auto* parameter : rackParams) if (parameter != nullptr && parameter->getValue() < 0.5f) ++rackOff;
+    check (rackOff == 13 && rackMix != nullptr && rackCross != nullptr,
+           "VST3-хост видит 13 выключенных FX и новые регуляторы", String (rackOff) + "/13");
+    for (int i = 0; i < 13; ++i) if (rackParams[i] != nullptr) rackParams[i]->setValueNotifyingHost ((i % 2) == 0 ? 1.0f : 0.0f);
+    if (rackMix) rackMix->setValueNotifyingHost (0.37f);
+    if (rackCross) rackCross->setValueNotifyingHost (0.64f);
+
+    const char* monoNames[] = { "Chorus Mix Mode", "Glitch Timing", "Glitch Tempo Sync", "Glitch Length Division",
+        "Glitch Highpass", "Comb ODIN Mix", "Spectre Reject Level dB", "Spectre Attack ms", "Spectre Release ms",
+        "Spectre Window Extended index", "Glitch Dist", "Glitch Dry Level", "Glitch Wet Level",
+        "Glitch Size Drift %", "Glitch Pitch Step semitones", "Glitch Reroll %" };
+    std::array<AudioProcessorParameter*, 16> monoParams {};
+    std::array<float, 16> monoValues {};
+    for (size_t i = 0; i < monoParams.size(); ++i)
+        for (auto* parameter : params) if (parameter->getName (64) == monoNames[i]) monoParams[i] = parameter;
+    check (monoParams[0] != nullptr && monoParams[1] != nullptr
+           && std::fabs (monoParams[0]->getDefaultValue() - 1.0f) < 1e-6f
+           && std::fabs (monoParams[1]->getDefaultValue() - 1.0f) < 1e-6f
+           && std::fabs (monoParams[0]->getValue() - 1.0f) < 1e-6f
+           && std::fabs (monoParams[1]->getValue() - 1.0f) < 1e-6f,
+           "VST3 host defaults согласованы с новыми режимами INIT");
+    // VST3's controller can temporarily echo an arbitrary normalised value
+    // even for a stepped parameter; the processor snaps it to a legal step.
+    // Use distinct, representable steps so this compares the saved values,
+    // rather than 0.20 against the actual Chorus choice 0.0, etc.
+    const std::array<float, 16> monoRequested {
+        .5f, 1.0f, 1.0f, .625f, 1.0f, .4f, .44f, .48f,
+        .52f, .625f, .6f, .64f, .68f, .72f, .75f, .8f
+    };
+    for (size_t i = 0; i < monoParams.size(); ++i) if (monoParams[i] != nullptr) {
+        monoParams[i]->setValueNotifyingHost (monoRequested[i]);
+        monoValues[i] = monoParams[i]->getValue();
+    }
+
     // --- состояние: сохранить/загрузить через настоящий VST3-хост ---
     const char* plateNames[] = { "Plate Pre Filter", "Plate Input Diff 1", "Plate Input Diff 2", "Plate Output" };
     const float plateValues[] = { 0.23f, 0.41f, 0.73f, 0.635f }; // нормализованный диапазон хоста
@@ -135,7 +292,29 @@ int main (int argc, char** argv)
         if (parameter != nullptr) parameter->setValueNotifyingHost (0.05f);
     for (auto* parameter : reverseParams)
         if (parameter != nullptr) parameter->setValueNotifyingHost (0.0f);
+    for (auto* parameter : rackParams) if (parameter != nullptr) parameter->setValueNotifyingHost (0.0f);
+    if (rackMix) rackMix->setValueNotifyingHost (0.9f);
+    if (rackCross) rackCross->setValueNotifyingHost (0.1f);
+    for (auto* parameter : monoParams) if (parameter != nullptr) parameter->setValueNotifyingHost (0.0f);
     inst->setStateInformation (state.getData(), (int) state.getSize());
+    int monoRestored = 0;
+    for (size_t i = 0; i < monoParams.size(); ++i)
+    {
+        if (monoParams[i] == nullptr)
+            std::printf ("   MonoHuice state: parameter missing: %s\n", monoNames[i]);
+        else if (std::fabs (monoParams[i]->getValue() - monoValues[i]) < .002f)
+            ++monoRestored;
+        else
+            std::printf ("   MonoHuice state: %s expected %.6f restored %.6f\n",
+                         monoNames[i], monoValues[i], monoParams[i]->getValue());
+    }
+    check (monoRestored == (int) monoParams.size(), "VST3 host state сохраняет режимы и новые ручки MonoHuice", String (monoRestored) + "/16");
+    int restoredRack = 0;
+    for (int i = 0; i < 13; ++i)
+        if (rackParams[i] != nullptr && std::fabs (rackParams[i]->getValue() - ((i % 2) == 0 ? 1.0f : 0.0f)) < 0.001f) ++restoredRack;
+    check (restoredRack == 13 && rackMix && rackCross
+           && std::fabs (rackMix->getValue() - 0.37f) < 0.002f && std::fabs (rackCross->getValue() - 0.64f) < 0.002f,
+           "VST3 host state сохраняет 13 power и новые настройки", String (restoredRack) + "/13");
     float maxStateDiff = 0.0f;
     int foundPlate = 0;
     for (int i = 0; i < 4; ++i)
@@ -184,9 +363,42 @@ int main (int argc, char** argv)
                    && std::fabs (restoredP1->getValue() - 0.713f) < 0.002f && zeros == 8,
                    "реальная сессия предыдущего VST3 сохраняет старый P1 и сбрасывает Reverse",
                    String (zeros) + "/8, P1=" + (restoredP1 != nullptr ? String (restoredP1->getValue(), 4) : "нет"));
+            int legacyFxOn = 0;
+            for (auto* parameter : rackParams) if (parameter != nullptr && parameter->getValue() > 0.5f) ++legacyFxOn;
+            check (legacyFxOn == 13 && rackMix != nullptr && std::fabs (rackMix->getValue() - 1.0f) < 0.001f,
+                   "реальная старая сессия VST3 включает прежний тракт", String (legacyFxOn) + "/13");
+            check (monoParams[0] && monoParams[1] && monoParams[0]->getValue() < .001f && monoParams[1]->getValue() < .001f,
+                   "реальная старая сессия выбирает Legacy для CHORUS и GLITCH");
+
+            // Both plugin instances render the very same legacy state/MIDI.
+            old->prepareToPlay (48000.0, 128); inst->prepareToPlay (48000.0, 128);
+            MessageManager::getInstance()->runDispatchLoopUntil (200);
+            AudioBuffer<float> x (2, 128), y (2, 128); MidiBuffer ma, mb, emptyA, emptyB;
+            ma.addEvent (MidiMessage::noteOn (1, 60, 0.8f), 0);
+            mb.addEvent (MidiMessage::noteOn (1, 60, 0.8f), 0);
+            double diff = 0.0, energy = 0.0, peakDiff = 0.0; int invalid = 0;
+            for (int b = 0; b < 360; ++b)
+            {
+                x.clear(); y.clear(); old->processBlock (x, b == 0 ? ma : emptyA); inst->processBlock (y, b == 0 ? mb : emptyB);
+                for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < 128; ++i)
+                {
+                    const double a = x.getSample (ch, i), c = y.getSample (ch, i), d = a-c;
+                    if (! std::isfinite (a) || ! std::isfinite (c)) ++invalid;
+                    diff += d*d; energy += a*a; peakDiff = std::max (peakDiff, std::fabs (d));
+                }
+            }
+            const double rms = std::sqrt (diff / (360.0 * 128.0 * 2.0));
+            const double refRms = std::sqrt (energy / (360.0 * 128.0 * 2.0));
+            check (invalid == 0 && refRms > 0.001 && rms < 1.0e-6,
+                   "старая VST3-сессия звучит как прежний плагин (одинаковый MIDI)",
+                   "delta RMS=" + String (rms, 9) + ", max=" + String (peakDiff, 9) + ", ref=" + String (refRms, 6));
+            old->releaseResources(); inst->releaseResources();
             inst->setStateInformation (state.getData(), (int) state.getSize());
         }
     }
+
+    testHostedGuiGestures (*format, d);
+    inst->setStateInformation (initialState.getData(), (int) initialState.getSize());
 
     // --- редактор ---
     check (inst->hasEditor(), "есть редактор");
@@ -417,12 +629,13 @@ int main (int argc, char** argv)
     }
     reference.reset(); reversed.reset();
 
-    // Два одинаковых Granular-слота в противоположных каналах. Только
-    // случайность направления на 50% должна их рассинхронизировать; на
-    // 0/100% одинаковые крайние режимы остаются идентичными.
-    std::printf ("\n--- Независимость Reverse A/B через реальный VST3 ---\n");
-    double stereoDiff[3] {}, corr[3] {};
+    // Два одинаковых слота в противоположных каналах. При Spread=0
+    // измеряем только независимость Reverse; при Spread=0.6 проверяем,
+    // что её же не требуется для независимых потоков положения и pitch.
+    std::printf ("\n--- Независимость Reverse/Spread A/B через реальный VST3 ---\n");
+    double stereoDiff[2][3] {}, corr[2][3] {};
     int stereoMissing = 0, stereoBad = 0, stereoCreated = 0;
+    for (int spreadCase = 0; spreadCase < 2; ++spreadCase)
     for (int mode = 0; mode < 3; ++mode)
     {
         String createError;
@@ -440,7 +653,7 @@ int main (int argc, char** argv)
             const String prefix = "s" + String::charToString ((juce_wchar) letter) + "_";
             set (prefix + "Engine", 0.5f); set (prefix + "On", 1.0f);
             set (prefix + "P1", 0.35f); set (prefix + "P2", 0.45f);
-            set (prefix + "P3", 0.7f); set (prefix + "P4", 0.3f);
+            set (prefix + "P3", 0.7f); set (prefix + "P4", spreadCase == 0 ? 0.0f : 0.6f);
             set (prefix + "Table", 0.0f); set (prefix + "Detune", 0.0f);
             set (prefix + "Grain Reverse", 0.5f * (float) mode);
             set (prefix + "Level", 0.4f); set (prefix + "Pan", letter == 'A' ? 0.0f : 1.0f);
@@ -467,16 +680,22 @@ int main (int argc, char** argv)
                 dl += (l-r)*(l-r); ll += l*l; rr += r*r; lr += l*r;
             }
         }
-        stereoDiff[mode] = std::sqrt (dl / std::max (1.0e-20, 0.5 * (ll + rr)));
-        corr[mode] = lr / std::sqrt (std::max (1.0e-20, ll * rr));
+        stereoDiff[spreadCase][mode] = std::sqrt (dl / std::max (1.0e-20, 0.5 * (ll + rr)));
+        corr[spreadCase][mode] = lr / std::sqrt (std::max (1.0e-20, ll * rr));
         stereo->releaseResources();
     }
-    std::printf ("   0/50/100%%: ΔRMS/RMS %.7f / %.7f / %.7f, корреляция %.5f / %.5f / %.5f, NaN %d\n",
-                 stereoDiff[0], stereoDiff[1], stereoDiff[2], corr[0], corr[1], corr[2], stereoBad);
-    check (stereoCreated == 3 && stereoMissing == 0 && stereoBad == 0
-           && stereoDiff[0] < 0.001 && stereoDiff[1] > 0.1 && stereoDiff[2] < 0.001,
-           "0/100% совпадают, а 50% даёт разные потоки слотов A/B через VST3",
-           String (stereoDiff[0], 6) + " / " + String (stereoDiff[1], 6) + " / " + String (stereoDiff[2], 6));
+    for (int s = 0; s < 2; ++s)
+        std::printf ("   Spread %.1f, Reverse 0/50/100%%: ΔRMS/RMS %.7f / %.7f / %.7f, корреляция %.5f / %.5f / %.5f, NaN %d\n",
+                     s ? 0.6 : 0.0, stereoDiff[s][0], stereoDiff[s][1], stereoDiff[s][2],
+                     corr[s][0], corr[s][1], corr[s][2], stereoBad);
+    check (stereoCreated == 6 && stereoMissing == 0 && stereoBad == 0
+           && stereoDiff[0][0] < 0.001 && stereoDiff[0][1] > 0.1 && stereoDiff[0][2] < 0.001,
+           "при Spread 0 Reverse 50% разносит A/B, а 0/100% совпадают через VST3",
+           String (stereoDiff[0][0], 6) + " / " + String (stereoDiff[0][1], 6) + " / " + String (stereoDiff[0][2], 6));
+    check (stereoCreated == 6 && stereoMissing == 0 && stereoBad == 0
+           && stereoDiff[1][0] > 0.1 && stereoDiff[1][1] > 0.1 && stereoDiff[1][2] > 0.1,
+           "Spread 0.6 разносит A/B при Reverse 0/50/100% через VST3",
+           String (stereoDiff[1][0], 6) + " / " + String (stereoDiff[1][1], 6) + " / " + String (stereoDiff[1][2], 6));
 
     // Фабричный Choir через реальный VST3. Это отдельный замер выхода,
     // а не обещание headroom для произвольных патчей и не замена сырому WAV.
@@ -646,6 +865,9 @@ int main (int argc, char** argv)
             for (const char* n : { "Drive", "Chorus Mix", "Reverb Mix", "Plate Mix", "Material Mix",
                                    "Spectre Mix", "Glitch Mix", "Robin Mix", "Comb Mix" })
                 setDelayParam (*q, n, 0.0f);
+            // INIT now bypasses every effect, independently of Mix. Activate
+            // Delay explicitly so this remains an audible Time automation test.
+            setDelayParam (*q, "DELAY On", 1.0f);
             setDelayParam (*q, "Delay Mix", 1.0f); setDelayParam (*q, "Delay Time", 0.0f);
             setDelayParam (*q, "Delay Fb", 0.0f);
             setDelayParam (*q, "Comp Ratio", 0.0f); setDelayParam (*q, "Comp Makeup", 0.0f);

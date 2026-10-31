@@ -30,6 +30,12 @@ struct GlitchSettings {
     float lengthDivision = 3.0f;
     float toneType = 0.0f;
     float resonance = 0.0f;
+    // Per-repeat variation (0.9.12). All zero = legacy static repeats.
+    float sizeDrift = 0.0f;         // -100..100: loop length multiplier 2^(d/100) per repeat
+    float pitchStep = 0.0f;         // semitones added per repeat
+    float pitchRandom = 0.0f;       // semitones, quantized random offset per repeat
+    float rerollProbability = 0.0f; // % chance a repeat captures a fresh slice
+    float repeatDecay = 0.0f;       // % gain lost per repeat
 };
 
 // Common interface for slot effects. Implementations allocate state in prepare()
@@ -71,6 +77,9 @@ public:
         stutterLoopsRemaining = 0;
         stutterCrossfade = 1;
         stutterDirection = 1;
+        stutterRepeatIndex = 0;
+        stutterPitchOffset = 0.0f;
+        stutterGain = 1.0f;
         triggerCountdown = 0;
         stuttering = false;
         fastEnvelope = 0.0f;
@@ -102,6 +111,11 @@ public:
         targetSettings.lengthDivision = std::clamp(value.lengthDivision, 0.0f, 8.0f);
         targetSettings.toneType = std::clamp(value.toneType, 0.0f, 1.0f);
         targetSettings.resonance = std::clamp(value.resonance, 0.0f, 95.0f);
+        targetSettings.sizeDrift = std::clamp(value.sizeDrift, -100.0f, 100.0f);
+        targetSettings.pitchStep = std::clamp(value.pitchStep, -12.0f, 12.0f);
+        targetSettings.pitchRandom = std::clamp(value.pitchRandom, 0.0f, 12.0f);
+        targetSettings.rerollProbability = std::clamp(value.rerollProbability, 0.0f, 100.0f);
+        targetSettings.repeatDecay = std::clamp(value.repeatDecay, 0.0f, 90.0f);
     }
 
     void setTempo(double bpm, bool) noexcept {
@@ -144,6 +158,16 @@ public:
                             * parameterSmoothing;
         settings.resonance += (targetSettings.resonance - settings.resonance)
                              * parameterSmoothing;
+        settings.sizeDrift += (targetSettings.sizeDrift - settings.sizeDrift)
+                             * parameterSmoothing;
+        settings.pitchStep += (targetSettings.pitchStep - settings.pitchStep)
+                             * parameterSmoothing;
+        settings.pitchRandom += (targetSettings.pitchRandom - settings.pitchRandom)
+                               * parameterSmoothing;
+        settings.rerollProbability += (targetSettings.rerollProbability
+                                      - settings.rerollProbability) * parameterSmoothing;
+        settings.repeatDecay += (targetSettings.repeatDecay - settings.repeatDecay)
+                               * parameterSmoothing;
 
         const float feedbackAmount = settings.feedback * 0.01f;
         const Frame input{
@@ -198,6 +222,11 @@ public:
                     stutterDirection = randomFloat() < settings.reverseProbability * 0.01f ? -1 : 1;
                     stutterLoopsRemaining = std::clamp(
                         static_cast<int>(std::lround(settings.repeats)), 1, 16);
+                    stutterRepeatIndex = 0;
+                    stutterGain = 1.0f;
+                    stutterPitchOffset = settings.pitchRandom > 0.0f
+                        ? std::round((randomFloat() * 2.0f - 1.0f) * settings.pitchRandom)
+                        : 0.0f;
                     stuttering = true;
                 }
             }
@@ -205,7 +234,7 @@ public:
 
         Frame shuffled = input;
         if (stuttering) {
-            const float pitchRatio = std::pow(2.0f, settings.pitchSemitones / 12.0f);
+            const float pitchRatio = std::pow(2.0f, (settings.pitchSemitones + stutterPitchOffset) / 12.0f);
             const float sourcePhase = std::fmod(
                 float(stutterLoopPosition) * pitchRatio,
                 float(std::max(1, stutterLoopLength)));
@@ -229,7 +258,7 @@ public:
                 grain = mix(grain, ringAt(stutterLoopStart + sourceStart), blend);
             }
 
-            shuffled = grain;
+            shuffled = {grain.l * stutterGain, grain.r * stutterGain};
 
             if (stutterLoopsRemaining == 1 && seam > 0
                 && stutterLoopPosition >= stutterPlaybackLength - seam) {
@@ -244,6 +273,8 @@ public:
                 stutterLoopPosition = 0;
                 if (--stutterLoopsRemaining <= 0)
                     stuttering = false;
+                else
+                    advanceRepeat(available, loopLength);
             }
         }
 
@@ -278,6 +309,45 @@ public:
     }
 
 private:
+    // Evolve the burst between repeats: decay, pitch stairs/random, size
+    // drift, or a fresh capture (re-roll). With every variation control at
+    // zero this consumes no random numbers and changes nothing, so legacy
+    // presets render bit-identically.
+    void advanceRepeat(int available, int baseLoopLength) noexcept {
+        ++stutterRepeatIndex;
+        stutterGain *= 1.0f - settings.repeatDecay * 0.01f;
+        stutterPitchOffset = settings.pitchStep * float(stutterRepeatIndex)
+            + (settings.pitchRandom > 0.0f
+                ? std::round((randomFloat() * 2.0f - 1.0f) * settings.pitchRandom)
+                : 0.0f);
+        const int size = static_cast<int>(ring.size());
+        const bool reroll = settings.rerollProbability > 0.0f
+            && available >= baseLoopLength
+            && randomFloat() < settings.rerollProbability * 0.01f;
+        if (reroll) {
+            const int maxOffset = std::min(baseLoopLength / 2, available - baseLoopLength);
+            const int allowedOffset = static_cast<int>(std::lround(
+                float(std::max(0, maxOffset)) * settings.captureOffset * 0.01f));
+            const int offset = allowedOffset > 0
+                ? static_cast<int>(randomFloat() * float(allowedOffset + 1)) : 0;
+            stutterLoopStart = (writeIndex + size - baseLoopLength + 1 - offset) % size;
+            stutterLoopLength = stutterPlaybackLength = baseLoopLength;
+            stutterDirection = randomFloat() < settings.reverseProbability * 0.01f ? -1 : 1;
+        } else if (settings.sizeDrift != 0.0f) {
+            // Never read past the write head: the loop may only grow into
+            // audio that has actually been recorded since the capture.
+            const int headDistance = (writeIndex - stutterLoopStart + size) % size;
+            const float factor = std::pow(2.0f, settings.sizeDrift * 0.01f);
+            const int newLength = std::clamp(
+                static_cast<int>(std::lround(float(stutterLoopLength) * factor)),
+                8, std::max(8, headDistance));
+            stutterLoopLength = stutterPlaybackLength = newLength;
+        }
+        const int maximumCrossfade = std::min(64, std::max(1, std::min(stutterLoopLength, stutterPlaybackLength) / 8));
+        stutterCrossfade = static_cast<int>(std::lround(
+            float(maximumCrossfade) * settings.crossfade * 0.01f));
+    }
+
     Frame ringAt(int index) const noexcept {
         const int size = static_cast<int>(ring.size());
         index %= size;
@@ -437,6 +507,9 @@ private:
     int stutterLoopsRemaining = 0;
     int stutterCrossfade = 2;
     int stutterDirection = 1;
+    int stutterRepeatIndex = 0;
+    float stutterPitchOffset = 0.0f;
+    float stutterGain = 1.0f;
     int triggerCountdown = 0;
     bool stuttering = false;
     float fastEnvelope = 0.0f;

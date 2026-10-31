@@ -52,14 +52,19 @@ public:
     void setDriveDb (float db)   { if (db != c.drive) { c.drive = db; dirty = true; } }
     void setOutputDb (float db)  { if (db != c.output) { c.output = db; dirty = true; } }
     void setDepth (float semis)  { if (semis != c.depth) { c.depth = semis; dirty = true; } }
-    void setRate (float hz)      { if (hz != c.rate) { c.rate = clamp (hz, 0.0f, 8.0f); dirty = true; } }
+    void setRate (float hz)      { if (hz != c.rate) { c.rate = clamp (hz, 0.0f, 20.0f); dirty = true; } }
     void setEnvelope (float semis) { if (semis != c.envelope) { c.envelope = semis; dirty = true; } }
     void setDecayMs (float ms)   { if (ms != c.decay) { c.decay = clamp (ms, 5.0f, 4000.0f); dirty = true; } }
 
     // --- ODIN2
     void setOdinFreq (float a, float b) { if (a != od.freqA || b != od.freqB) { od.freqA = a; od.freqB = b; dirty = true; } }
     void setOdinRes (float a, float b)  { if (a != od.resA || b != od.resB) { od.resA = clamp (a, 0.0f, 100.0f); od.resB = clamp (b, 0.0f, 100.0f); dirty = true; } }
-    void setOdinBalance (float b01)     { if (b01 != od.balance) { od.balance = clamp (b01, 0.0f, 1.0f) * 100.0f; dirty = true; } }
+    void setOdinBalance (float b01)
+    {
+        const float percent = clamp (b01, 0.0f, 1.0f) * 100.0f;
+        if (percent != od.balance) { od.balance = percent; dirty = true; }
+    }
+    void setOdinMix (float v) { const float pct = clamp (v, 0.0f, 1.0f) * 100.0f; if (pct != od.mix) { od.mix = pct; dirty = true; } }
     void setOdinRouting (int r)         { r = clamp (r, 0, 2); if (r != od.routing) { od.routing = r; dirty = true; } }
     void setOdinNegative (bool a, bool b) { if (a != od.negativeA || b != od.negativeB) { od.negativeA = a; od.negativeB = b; dirty = true; } }
 
@@ -71,6 +76,8 @@ public:
         if (pa.delayMs[(size_t) tap] != ms) { pa.delayMs[(size_t) tap] = ms; dirty = true; }
     }
     void setParMultiplier (float k)   { if (k != pa.multiplier) { pa.multiplier = clamp (k, 0.0f, 1.0f); dirty = true; } }
+    void setParRate (float hz)       { if (hz != pa.rate) { pa.rate = clamp (hz, 0.0f, 4.0f); dirty = true; } }
+    void setParSmoothMs (float ms)   { if (ms != pa.smoothMs) { pa.smoothMs = clamp (ms, 0.0f, 100000.0f); dirty = true; } }
     void setParFeedback (float pct)   { if (pct != pa.feedback) { pa.feedback = clamp (pct, 0.0f, 100.0f); dirty = true; } }
     void setParHighpass (float hz)    { if (hz != pa.highpass) { pa.highpass = std::max (0.0f, hz); dirty = true; } }
     void setParTune (float semis)     { if (semis != pa.tune) { pa.tune = semis; dirty = true; } }

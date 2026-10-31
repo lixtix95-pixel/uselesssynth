@@ -28,6 +28,9 @@ public:
     void paint (juce::Graphics&) override;
     void resized() override;
     int visiblePage() const;
+    juce::Component* fxOverlay();
+    juce::StringArray fxRackParamIds() const;
+    int fxRackSelectedModule() const;
     juce::Component* paramsOverlay();           // для стендов/тестов: оверлей параметров
     void showPage (int index);                 // 0…7 — слот, 8…11 — секция колонки,
                                                // 100+t — вкладка оверлея, 200+t*100+s — секция
@@ -60,6 +63,7 @@ public:
     int  chipPageCount() const;                         // страниц чипов FX
     int  chipCount() const;                             // всего чипов (эффекты с ручкой доли)
     float chipPageTransition() const { return chipTransition; }
+    juce::String chipPowerId (int index) const;
     juce::String chipParamId (int index) const;         // параметр чипа по порядку
 
     // --- анимации ---
@@ -104,6 +108,7 @@ private:
     class ParamCard;         // карточка в патч-колонке
     class PatchColumn;       // колонка из 4 карточек (FX / MATRIX / ARP / LFO)
     class ParamsPage;        // полный список параметров (оверлей)
+    class FxPage;            // отдельная страница эффектов
     class IconButton;        // кнопка-иконка секции
     class VectorPad;         // векторный блок справа внизу
     class PreviewWorker;     // владеет DSP-голосом вне message/audio thread
@@ -120,10 +125,12 @@ private:
     void buildBottom();
     void buildColumns();
     void buildParamsPage();
+    void buildFxPage();
     void selectSlot (int slot);
     void refreshEngineContext();
     void setSection (int index);
     void toggleParamsPage (bool shouldShow);
+    void toggleFxPage (bool shouldShow);
     void showBankMenu();
     void showIoMenu (bool saving);      // меню кнопок LOAD / SAVE
     void loadPresetFromFile();
@@ -157,6 +164,8 @@ private:
     void envNodePoints (juce::Point<float>& aEnd, juce::Point<float>& dEnd,
                         juce::Point<float>& sEnd, float& ySus) const;
     bool nudgeParam (const juce::String& id, float deltaNorm);
+    void beginDragGesture (const juce::String& id);
+    bool isDragGestureFor (const juce::AudioProcessorParameter* param) const noexcept;
     void mouseDown (const juce::MouseEvent&) override;
     void mouseDrag (const juce::MouseEvent&) override;
     void mouseUp   (const juce::MouseEvent&) override;
@@ -167,11 +176,12 @@ private:
     int selectedSlot = 0;
     int contextSlot = -1, contextEngine = -1;
     int section = 0;                 // 0 FX · 1 MATRIX · 2 ARP · 3 LFO
-    bool paramsOpen = false;
+    bool paramsOpen = false, fxOpen = false;
 
     juce::Slider masterSlider;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> masterAtt;
     juce::TextButton loadButton { "LOAD" }, saveButton { "SAVE" };
+    juce::TextButton fxRackButton { "FX RACK" }, paramsButton { "PARAMS" };
 
     // Банк программ: в шапке был только нарисованный текст имени, теперь это
     // настоящий селектор из getNumPrograms() пунктов (host-программы OROGEN).
@@ -190,15 +200,18 @@ private:
     juce::OwnedArray<juce::AudioProcessorValueTreeState::ButtonAttachment> switchAtts;
     std::unique_ptr<VectorPad> vectorPad;
     std::unique_ptr<ParamsPage> paramsPage;
+    std::unique_ptr<FxPage> fxPage;
 
     // состояние перетаскивания на главном экране
     MainHit dragTarget = MainHit::none;
     int dragIndex = -1;
     juce::Point<float> dragLast;
     bool dragMoved = false;
-    // последняя ненулевая величина каждого чипа FX (для включения по клику)
-    std::array<float, 10> chipLast { 0.45f, 0.50f, 0.40f, 0.35f, 0.45f,
-                                     0.50f, 0.45f, 0.40f, 0.45f, 0.50f };
+    // Каждая интерактивная область затрагивает максимум два параметра.
+    // Сохраняем именно указатели параметров начала drag, чтобы закрыть жесты
+    // даже при смене слота, открытии оверлея или уничтожении редактора.
+    std::array<juce::RangedAudioParameter*, 2> dragGestureParams { nullptr, nullptr };
+    int dragGestureCount = 0;
     int chipPage = 0;
     float chipTransition = 0.0f;
 

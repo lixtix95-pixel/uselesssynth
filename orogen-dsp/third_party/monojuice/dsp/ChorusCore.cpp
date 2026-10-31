@@ -8,8 +8,18 @@ void ChorusCore::setParameters(const std::array<int,8>& p) noexcept {
 void ChorusCore::setParametersF(const std::array<float,8>& p) noexcept {
  for(unsigned i=0;i<8;++i) { const float v=p[i]<0.f?0.f:(p[i]>127.f?127.f:p[i]); y[0x52c+i]=Word(v*65536.0f)&0xffffffu; }
 }
+void ChorusCore::keepDelayReadOutOfCurrentBlock() noexcept {
+ // The translated procedure reads its delay line before writing the current
+ // 16-frame block. Its DEL smoother feedback uses only the state's high word,
+ // so with DEL=0 the reset trajectory can stop at -15.02 samples instead of
+ // the intended -16. The final interpolated tap then crosses into the
+ // not-yet-written slot at offset 0 and emits a 2048-sample-old value once
+ // per block. Canonicalise only this DEL=0 boundary state; the translated
+ // procedure and every non-zero DEL trajectory remain untouched.
+ if(delayZeroGuard && readY(0x52c)==0 && readLong(0x545)>-16*one)writeLong(0x545,-16*one);
+}
 void ChorusCore::reset(const std::array<int,8>& p) noexcept {
- x.fill(0);y.fill(0);delay.fill(0);setParameters(p);initialiseProcedure();
+ x.fill(0);y.fill(0);delay.fill(0);setParameters(p);initialiseProcedure();keepDelayReadOutOfCurrentBlock();
 }
 ChorusCore::Word ChorusCore::readX(Word a) const noexcept {
  if(a<x.size())return x[a];
@@ -32,7 +42,9 @@ void ChorusCore::writeY(Word a,Word v) noexcept {
 }
 void ChorusCore::process16(const std::int32_t* in,std::int32_t* out) noexcept {
  for(unsigned i=0;i<32;++i)x[0x220+i]=Word(in[i])&0xffffffu;
+ keepDelayReadOutOfCurrentBlock();
  processProcedure();
+ keepDelayReadOutOfCurrentBlock();
  for(unsigned i=0;i<32;++i)out[i]=signed24(y[0x100+i]);
 }
 

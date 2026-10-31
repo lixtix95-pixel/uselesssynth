@@ -426,9 +426,37 @@ private:
 class FxChain
 {
 public:
+    // The order is the actual signal path, not a user-reorderable rack.
+    enum Module { Drive = 0, Comb, ChorusModule, DelayModule, ReverbModule,
+                  Plate, Equalizer, Material, Spectre, Robin, Glitch,
+                  Compressor, StereoWidth, ModuleCount };
+
     struct Settings
     {
+        // Keep standalone DSP and legacy JSON behaviour: historically every
+        // stage was present (many had mix=0). Plugin INIT explicitly clears it.
+        std::array<bool, ModuleCount> enabled {{ true, true, true, true, true, true,
+                                                 true, true, true, true, true, true, true }};
         float drive = 0.0f;
+        float driveMix = 1.0f;                  // legacy drive was fully wet
+        // Appended controls use sentinel defaults for exact old-project replay.
+        // The original host parameter ranges/IDs remain untouched.
+        int chorusMode = 0;                    // 0 legacy, 1 V1, 2 V2
+        int glitchTimingMode = 0;              // 0 legacy, 1 actual sample rate
+        bool glitchSync = false, glitchHighpass = false;
+        int glitchDivision = 3;
+        float combOdinMix = 1.0f, combDryDbExt = -61.0f, combWetDbExt = -61.0f;
+        float combDriveExt = -1.0f, combOutputExt = -31.0f;
+        float combDepthExt = -1.0f, combRateExt = -1.0f, combEnvelopeExt = -37.0f;
+        float combFreqAExt = -1.0f, combFreqBExt = -1.0f, combFeedbackExt = -1.0f;
+        float combHighpassExt = -1.0f, combTuneExt = -49.0f;
+        float spectreReject = -120.0f, spectreAttack = 0.0f, spectreRelease = 0.0f;
+        float spectreWindowExt = -1.0f, spectrePeaksExt = -1.0f, spectreWidthExt = -1.0f;
+        float spectreLowExt = -1.0f, spectreHighExt = -1.0f;
+        float glitchFoldDrive = 0.0f, glitchDryLevel = -1.0f, glitchWetLevel = -1.0f;
+        float glitchOffset = 100.0f, glitchCrossfade = 100.0f, glitchResonance = 0.0f;
+        float glitchDrift = 0.0f, glitchPitchStep = 0.0f, glitchPitchRandom = 0.0f;
+        float glitchReroll = 0.0f, glitchDecay = 0.0f, glitchLengthExt = 0.0f;
         float chorusMix = 0.0f, chorusDepth = 0.5f, chorusRate = 0.35f;
         // 0 = наш простой хорус, 1 = прошивочное ядро OS 1.32B из MonoJuice
         int   chorusModel = 0;
@@ -442,6 +470,7 @@ public:
         // Значения совпадают с прежними фиксированными коэффициентами.
         float platePreFilter = 0.85f, plateInputDiff1 = 0.75f, plateInputDiff2 = 0.625f;
         float plateOutput = 0.60f;
+        bool plateDc = true;
         // модель драйва: индекс DriveModel (0…18), 3 = Tanh
         int   driveModel = 3;
         float driveTone = 0.0f;                 // −1…+1, наклон ±8 дБ
@@ -458,6 +487,15 @@ public:
         float combDelayMs = 100.0f, combFeedback = 25.0f;
         float combHighpass = 5.0f, combTune = 0.0f;
         bool  combOversample = false, combMidSide = false;
+        // B: 0 follows legacy NEG A, 1 is positive, 2 is negative.
+        int combNegativeB = 0;
+        float combDecayMs = 180.0f;
+        // -1 means "follow the legacy shared delay"; 0 ms remains selectable.
+        float combTapA = -1.0f, combTapB = -1.0f, combTapC = -1.0f, combTapD = -1.0f;
+        float combMultiplier = 1.0f, combParRate = 0.5f, combSmoothMs = 0.0f;
+        float combCross = 0.0f, combAm = 0.0f, combLean = 0.0f;
+        float combGateDb = -140.0f, combGateMs = 10.0f, combLimiterMs = 200.0f;
+        float combDryDb = 0.0f, combWetDb = 0.0f;
 
         // MATERIAL — модальный резонатор
         float materialMix = 0.0f;
@@ -509,10 +547,23 @@ public:
         comb.prepare (sr); chorusFw.prepare (sr);
         dcCoef = (float) std::exp (-kTwoPi * 18.0 / sr);
         dcX1L = dcY1L = dcX1R = dcY1R = 0.0f;
+        processed = false;
+        for (auto& gain : moduleGain) { gain.reset (sr, 6.0); gain.snap (1.0f); }
     }
 
     void set (const Settings& s)
     {
+        for (int i = 0; i < ModuleCount; ++i)
+        {
+            const float value = s.enabled[(size_t) i] ? 1.0f : 0.0f;
+            if (! processed) moduleGain[(size_t) i].snap (value);
+            else             moduleGain[(size_t) i].setTarget (value);
+        }
+        // Latency-changing stages cannot be cross-faded with an unaligned dry
+        // signal. Their host latency changes with the switch, as it already did
+        // with mix/model changes in legacy versions.
+        if (s.chorusModel == 1) moduleGain[(size_t) ChorusModule].snap (s.enabled[(size_t) ChorusModule] ? 1.0f : 0.0f);
+        moduleGain[(size_t) Spectre].snap (s.enabled[(size_t) Spectre] ? 1.0f : 0.0f);
         shaper.setDrive (s.drive);
         chorus.setMix (s.chorusMix); chorus.setDepth (s.chorusDepth); chorus.setRate (s.chorusRate);
         // те же ручки, что у прошивочного хоруса (DEL/FB/WID/LP/INP)
@@ -523,24 +574,39 @@ public:
         chorus.setInput    ((float) s.chorusFw[(size_t) 7]);
         // прошивочный хорус работает только при ненулевом миксе: иначе он
         // вносил бы задержку 87 отсчётов «вхолостую»
-        s_chorusFw = s.chorusModel == 1 && s.chorusMix > 1.0e-4f;
+        s_chorusFw = s.enabled[(size_t) ChorusModule] && s.chorusModel == 1
+                     && (s.chorusMode != 0 || s.chorusMix > 1.0e-4f);
+        chorusFw.setMode (s.chorusMode);
         if (s_chorusFw) { chorusFw.setParameters (s.chorusFw); chorusFw.setMix (s.chorusMix); }
         else            { chorus.setMix (s.chorusMix); }
 
         comb.setModel (s.combModel);
         comb.setMix (s.combMix);
-        comb.setDriveDb (s.combDriveDb); comb.setOutputDb (s.combOutputDb);
-        comb.setDepth (s.combDepth); comb.setRate (s.combRate);
-        comb.setEnvelope (s.combEnvelope);
-        comb.setOdinFreq (s.combFreqA, s.combFreqB);
+        comb.setDriveDb (s.combDriveExt < 0 ? s.combDriveDb : s.combDriveExt);
+        comb.setOutputDb (s.combOutputExt <= -31 ? s.combOutputDb : s.combOutputExt);
+        comb.setDepth (s.combDepthExt < 0 ? s.combDepth : s.combDepthExt);
+        comb.setRate (s.combRateExt < 0 ? s.combRate : s.combRateExt);
+        comb.setEnvelope (s.combEnvelopeExt <= -37 ? s.combEnvelope : s.combEnvelopeExt); comb.setDecayMs (s.combDecayMs);
+        comb.setOdinFreq (s.combFreqAExt < 0 ? s.combFreqA : s.combFreqAExt,
+                          s.combFreqBExt < 0 ? s.combFreqB : s.combFreqBExt);
+        comb.setOdinMix (s.combOdinMix);
         comb.setOdinRes (s.combResA, s.combResB);
         comb.setOdinBalance (s.combBalance);
         comb.setOdinRouting (s.combRouting);
-        comb.setOdinNegative (s.combNegative, s.combNegative);
-        for (int i = 0; i < 4; ++i) comb.setParDelayMs (i, s.combDelayMs);
-        comb.setParFeedback (s.combFeedback);
-        comb.setParHighpass (s.combHighpass);
-        comb.setParTune (s.combTune);
+        comb.setOdinNegative (s.combNegative,
+                              s.combNegativeB == 0 ? s.combNegative : s.combNegativeB == 2);
+        const float taps[] = { s.combTapA, s.combTapB, s.combTapC, s.combTapD };
+        for (int i = 0; i < 4; ++i) comb.setParDelayMs (i, taps[i] >= 0.0f ? taps[i] : s.combDelayMs);
+        comb.setParMultiplier (s.combMultiplier); comb.setParRate (s.combParRate);
+        comb.setParSmoothMs (s.combSmoothMs); comb.setParCross (s.combCross);
+        comb.setParAm (s.combAm); comb.setParLean (s.combLean);
+        comb.setParGateDb (s.combGateDb); comb.setParGateMs (s.combGateMs);
+        comb.setParLimiterMs (s.combLimiterMs);
+        comb.setParDryWetDb (s.combDryDbExt <= -61 ? s.combDryDb : s.combDryDbExt,
+                             s.combWetDbExt <= -61 ? s.combWetDb : s.combWetDbExt);
+        comb.setParFeedback (s.combFeedbackExt < 0 ? s.combFeedback : s.combFeedbackExt);
+        comb.setParHighpass (s.combHighpassExt < 0 ? s.combHighpass : s.combHighpassExt);
+        comb.setParTune (s.combTuneExt <= -49 ? s.combTune : s.combTuneExt);
         comb.setParOversample (s.combOversample);
         comb.setParMidSide (s.combMidSide);
         s_combOn = s.combMix > 1.0e-4f;
@@ -551,12 +617,12 @@ public:
         plate.setDiffusion (s.plateDiffusion); plate.setPreDelay (s.platePredelay);
         plate.setPreFilter (s.platePreFilter);
         plate.setInputDiffusion1 (s.plateInputDiff1); plate.setInputDiffusion2 (s.plateInputDiff2);
-        plate.setOutputTrim (s.plateOutput);
+        plate.setOutputTrim (s.plateOutput); plate.setDcBlocker (s.plateDc);
         const int dm = (s.driveModel >= 0 && s.driveModel < (int) DriveModel::Count) ? s.driveModel : 3;
         if (dm != lastDriveModel) { drive.setModel ((DriveModel) dm); lastDriveModel = dm; }
         drive.setAmount (s.drive);
         drive.setTone (s.driveTone);
-        drive.setMix (s.drive > 1.0e-4f ? 1.0f : 0.0f);
+        drive.setMix (s.drive > 1.0e-4f ? s.driveMix : 0.0f);
         s_driveOn = s.drive > 1.0e-4f;
 
         material.setMode (s.materialMode);
@@ -565,18 +631,21 @@ public:
         material.setFeedback (s.materialFeedback); material.setFollow (s.materialFollow);
         material.setMix (s.materialMix);
 
-        spectre.setWindow (s.spectreWindow);
+        const int spectreWindow = s.spectreWindowExt < 0 ? s.spectreWindow : (int) std::lround (s.spectreWindowExt);
+        spectre.setWindow (spectreWindow);
         spectre.setProminence (s.spectreProminence);
         spectre.setShift (s.spectreShift);
-        spectre.setPeaks (s.spectrePeaks);
-        spectre.setWidth (s.spectreWidth);
+        spectre.setPeaks (s.spectrePeaksExt < 0 ? s.spectrePeaks : (int) std::lround (s.spectrePeaksExt));
+        spectre.setWidth (s.spectreWidthExt < 0 ? s.spectreWidth : (int) std::lround (s.spectreWidthExt));
+        spectre.setReject (s.spectreReject); spectre.setAttack (s.spectreAttack); spectre.setRelease (s.spectreRelease);
         spectre.setFreeze (s.spectreFreeze);
-        spectre.setRange (s.spectreLow, s.spectreHigh);      // 0 = без ограничения
+        spectre.setRange (s.spectreLowExt < 0 ? s.spectreLow : s.spectreLowExt,
+                          s.spectreHighExt < 0 ? s.spectreHigh : s.spectreHighExt);      // 0 = без ограничения
         s_spectreClassic = s.spectreModel == 1;
         if (s_spectreClassic)
         {
             spectre.setMix (0.0f);                  // EXTENDED выключен
-            spectreClassic.setWindow (s.spectreWindow);
+            spectreClassic.setWindow (spectreWindow);
             spectreClassic.setProminence (s.spectreProminence);
             spectreClassic.setMix (s.spectreMix);
         }
@@ -585,26 +654,35 @@ public:
             spectre.setMix (s.spectreMix);
             spectreClassic.setMix (0.0f);
         }
-        s_spectreOn = s.spectreMix > 1.0e-4f;
+        s_spectreOn = s.enabled[(size_t) Spectre] && s.spectreMix > 1.0e-4f;
 
         robin.setSemitones (s.robinSemis);
         robin.setSize (s.robinSize);
         robin.setSpread (s.robinSpread);
-        robin.setMix (s.robinMix);
-        s_robinOn = s.robinMix > 1.0e-4f;
+        robinBaseMix = clamp (s.robinMix, 0.0f, 1.0f);
+        robin.setMix (robinBaseMix * moduleGain[(size_t) Robin].getCurrent());
 
+        glitch.setTimingMode (s.glitchTimingMode);
         glitch.setChance (s.glitchChance);
-        glitch.setLengthMs (s.glitchLengthMs);
+        glitch.setLengthMs (s.glitchLengthExt <= 0 ? s.glitchLengthMs : s.glitchLengthExt);
         glitch.setRepeats (s.glitchRepeats);
         glitch.setReverse (s.glitchReverse);
         glitch.setPitch (s.glitchPitch);
         glitch.setFeedback (s.glitchFeedback);
-        glitch.setFold (s.glitchFold);
-        glitch.setTone (s.glitchTone);
-        glitch.setMix (s.glitchMix);
+        glitch.setFold (s.glitchFold); glitch.setFoldDrive (s.glitchFoldDrive);
+        glitch.setTone (s.glitchTone); glitch.setToneHighpass (s.glitchHighpass);
+        glitch.setResonance (s.glitchResonance);
+        glitch.setOffset (s.glitchOffset); glitch.setCrossfade (s.glitchCrossfade);
+        glitch.setSync (s.glitchSync, s.glitchDivision);
+        glitch.setDrift (s.glitchDrift); glitch.setPitchStep (s.glitchPitchStep);
+        glitch.setPitchRandom (s.glitchPitchRandom); glitch.setReroll (s.glitchReroll);
+        glitch.setDecay (s.glitchDecay);
+        glitch.setLevels (s.glitchMix, s.glitchDryLevel, s.glitchWetLevel);
         dyn.setThreshold (s.compThreshold); dyn.setRatio (s.compRatio); dyn.setMakeup (s.compMakeup);
         width = clamp (s.width, 0.0f, 1.5f);
     }
+
+    void setTempo (double bpm) { glitch.setTempo (bpm); }
 
     // Суммарная транспортная задержка цепочки, в сэмплах.
     //
@@ -630,22 +708,47 @@ public:
         const float dl = l - dcX1L + dcCoef * dcY1L; dcX1L = l; dcY1L = dl; l = dl;
         const float dr = r - dcX1R + dcCoef * dcY1R; dcX1R = r; dcY1R = dr; r = dr;
 
-        if (s_driveOn) { drive.process (l, r); }
-        if (s_combOn && ! innerOnly) comb.process (l, r);
-        if (s_chorusFw) chorusFw.process (l, r); else chorus.process (l, r);
-        delay.process (l, r);
-        reverb.process (l, r);
-        plate.process (l, r);
-        eq.process (l, r);
-        material.process (l, r);
-        if (s_spectreOn) { if (s_spectreClassic) spectreClassic.process (l, r); else spectre.process (l, r); }
-        robin.process (l, r);          // всегда: держит постоянную латентность
-        glitch.process (l, r);
-        dyn.process (l, r);
-        Dynamics::limit (l, r, 0.98f);
+        processed = true;
+        // Smooth power switching without changing any saved wet/mix values.
+        // When fully bypassed, expensive DSP is skipped; existing delay/reverb
+        // state is retained (and therefore may resume when re-enabled).
+        const auto stage = [&] (Module which, auto&& processStage)
+        {
+            const float gain = moduleGain[(size_t) which].next();
+            if (gain <= 0.0f) return;
+            if (gain >= 1.0f) { processStage(); return; }
+            const float dryL = l, dryR = r;
+            processStage();
+            l = dryL + (l - dryL) * gain;
+            r = dryR + (r - dryR) * gain;
+        };
+        stage (Drive, [&] { if (s_driveOn) drive.process (l, r); });
+        stage (Comb, [&] { if (s_combOn && ! innerOnly) comb.process (l, r); });
+        stage (ChorusModule, [&] { if (s_chorusFw) chorusFw.process (l, r); else chorus.process (l, r); });
+        // Keep the delay clock/history running while bypassed, just as the
+        // legacy mix=0 path did. Otherwise a frozen echo returns minutes later.
+        {
+            const float gain = moduleGain[(size_t) DelayModule].next();
+            const float dryL = l, dryR = r;
+            delay.process (l, r);
+            if (gain <= 0.0f) { l = dryL; r = dryR; }
+            else if (gain < 1.0f) { l = dryL + (l - dryL) * gain; r = dryR + (r - dryR) * gain; }
+        }
+        stage (ReverbModule, [&] { reverb.process (l, r); });
+        stage (Plate, [&] { plate.process (l, r); });
+        stage (Equalizer, [&] { eq.process (l, r); });
+        stage (Material, [&] { material.process (l, r); });
+        stage (Spectre, [&] { if (s_spectreOn) { if (s_spectreClassic) spectreClassic.process (l, r); else spectre.process (l, r); } });
+        // ROBIN's dry delay is mandatory even when bypassed; fade its wet mix.
+        robin.setMix (robinBaseMix * moduleGain[(size_t) Robin].next());
+        robin.process (l, r);
+        stage (Glitch, [&] { glitch.process (l, r); });
+        stage (Compressor, [&] { dyn.process (l, r); });
+        Dynamics::limit (l, r, 0.98f); // fixed output safety, not the compressor
 
-        // стерео-ширина: mid/side
-        const float mid = (l + r) * 0.5f, side = (l - r) * 0.5f * width;
+        const float gain = moduleGain[(size_t) StereoWidth].next();
+        const float effectiveWidth = gain >= 1.0f ? width : gain <= 0.0f ? 1.0f : 1.0f + (width - 1.0f) * gain;
+        const float mid = (l + r) * 0.5f, side = (l - r) * 0.5f * effectiveWidth;
         l = mid + side; r = mid - side;
     }
 
@@ -668,7 +771,10 @@ private:
     FirmwareChorusFx chorusFw;
     int lastDriveModel = -1;
     bool s_driveOn = false, s_combOn = false, s_chorusFw = false;
-    bool s_spectreOn = false, s_spectreClassic = false, s_robinOn = false;
+    bool s_spectreOn = false, s_spectreClassic = false;
+    std::array<SmoothedValue, ModuleCount> moduleGain {};
+    bool processed = false;
+    float robinBaseMix = 0.0f;
     bool useWdf = true;
     double sampleRate = 48000.0;
     float width = 1.0f;

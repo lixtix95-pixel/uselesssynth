@@ -5,22 +5,13 @@
 // недопустима (может ждать мьютекс аллокатора, может отдать страницы ядра,
 // задержка блока вырастает непредсказуемо).
 //
-// Схема (single producer / single consumer на каждой стороне):
-//   1. message thread строит новый движок в «подготовленном» слоте и ставит бит
-//      в pendingMask — аудио-поток в этот момент ещё видит старый движок;
-//   2. аудио-поток в начале блока меняет местами unique_ptr (только указатели,
-//      без аллокации) и отдаёт старый движок в retire bin;
-//   3. message thread забирает из retire bin и удаляет — освобождение памяти
-//      уже вне аудио-потока.
-//
-// Инварианты, на которых это держится:
-//   * владелец движка в любой момент ровно один (unique_ptr либо в engines,
-//     либо в pending, либо сырой указатель в retire bin);
-//   * pendingMask меняется только атомарно (release при записи, acquire при
-//     обмене), движок не публикуется до полной готовности;
-//   * retire bin фиксированного размера и не переполняется: аудио-поток
-//     проверяет место до обмена и, если места нет, откладывает обмен на
-//     следующий блок (движки продолжают звучать как прежде).
+// Схема: готовый объект публикуется атомарным обменом указателя в каждом
+// слоте. Аудио-поток забирает его другим atomic exchange, а заменённый
+// работающий объект отдаёт в SPSC retire bin для удаления вне аудио-потока.
+// Обновление непрочитанного pending-объекта и подхват на аудио-потоке не
+// могут владеть одним и тем же указателем. Производители сериализуются вне
+// аудио-потока. Если retire bin заполнен, обмен откладывается до следующего
+// блока, старые движки продолжают звучать.
 #pragma once
 
 #include <array>
@@ -54,7 +45,7 @@ public:
     int room() const noexcept
     {
         const int tail = tailIdx.load (std::memory_order_relaxed);
-        const int head = headIdx.load (std::memory_order_relaxed);
+        const int head = headIdx.load (std::memory_order_acquire);
         return kCapacity - (tail - head);
     }
 
@@ -63,7 +54,7 @@ public:
     bool push (void* owner) noexcept
     {
         const int tail = tailIdx.load (std::memory_order_relaxed);
-        const int head = headIdx.load (std::memory_order_relaxed);
+        const int head = headIdx.load (std::memory_order_acquire);
         if (tail - head >= kCapacity) return false;
         slots[(size_t) (tail % kCapacity)].store (owner, std::memory_order_relaxed);
         tailIdx.store (tail + 1, std::memory_order_release);

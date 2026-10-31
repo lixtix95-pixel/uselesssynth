@@ -24,6 +24,7 @@ static void crashTrace (int sig)
 #endif
     std::_Exit (3);
 }
+#include <algorithm>
 #include <cmath>
 #include <functional>
 #include <vector>
@@ -209,7 +210,7 @@ static void testEditorControlLifetime()
     int alive = 0;
     for (const auto& ref : refs) if (ref.getComponent() != nullptr) ++alive;
     std::printf ("   после закрытия осталось %d из %zu\n", alive, refs.size());
-    check (refs.size() == 306 && alive == 0,
+    check (refs.size() == (size_t) p.getParameters().size() && alive == 0,
            "закрытие редактора уничтожает все контролы PARAMS",
            juce::String (alive) + "/" + juce::String ((int) refs.size()));
 }
@@ -928,7 +929,7 @@ static void testGuiRegressions()
     }
     std::printf ("   PARAMS: шрифт %.1f px, %d вариантов, max %.1f/%d px (%s), не-монохромных пикселей %lld на 6 страницах\n",
                  Palette::paramLabelSize, measured, widest, captionWidth, longest.toRawUTF8(), nonMono);
-    check (measured >= 306 && captionWidth > 0 && tooWide == 0,
+    check (measured >= p.getParameters().size() && captionWidth > 0 && tooWide == 0,
            "все подписи параметров и девять контекстов помещаются в колонку",
            juce::String (tooWide) + " обрезаны");
     check (nonMono == 0, "шесть страниц PARAMS монохромны, включая поля и полосу прокрутки",
@@ -1380,6 +1381,7 @@ static void testDelayProcessorRegression()
         for (const char* id : { "fx_drive", "fx_chorusMix", "fx_reverbMix", "fx_plateMix",
                                 "fx_materialMix", "fx_spectreMix", "fx_glitchMix", "fx_robinMix", "fx_combMix" })
             setP (*pr, id, 0.0f);
+        setP (*pr, "fx_delayOn", 1.0f);
         setP (*pr, "fx_delayMix", 1.0f); setP (*pr, "fx_delayTime", 0.02f); setP (*pr, "fx_delayFb", 0.0f);
         setP (*pr, "fx_compRatio", 1.0f); setP (*pr, "fx_compMakeup", 0.0f);
     }
@@ -1608,6 +1610,8 @@ static void testNativeAnimationPaint()
     editor.addToDesktop (0); editor.setTopLeftPosition (0, 0); editor.setVisible (true);
     juce::MessageManager::getInstance()->runDispatchLoopUntil (1800);
     int badFrames = 0, testedFrames = 0, movingCases = 0, totalCases = 0, efficientCases = 0, sampleHoldWraps = 0;
+    int backendMismatchFrames = 0, backendMismatchPixels = 0, nativeReferenceChecks = 0;
+    const bool forceNativeReference = std::getenv ("OROGEN_FORCE_NATIVE_REFERENCE") != nullptr;
     for (const int width : { 960, 1280, 1600 })
     {
         const int height = width * 5 / 8;
@@ -1641,6 +1645,7 @@ static void testNativeAnimationPaint()
                 { juce::Graphics g (fresh); editor.paintEntireComponent (g, true); }
                 editor.recording = true;
                 int frameStale = 0;
+                juce::Point<int> firstStale (-1, -1);
                 if (! live.isValid() || live.getWidth() != width || live.getHeight() != height) ++frameStale;
                 else for (int y = y0; y < y1; ++y) for (int x = x0; x < x1; ++x)
                 {
@@ -1651,8 +1656,50 @@ static void testNativeAnimationPaint()
                     maxChannelDiff = std::max (maxChannelDiff, diff);
                     // RGB нативного X11 и ARGB-буфер могут отличаться на 1–2
                     // LSB из-за округления нескольких альфа-наложений.
-                    if (diff > 2) ++frameStale; else if (diff != 0) ++near;
+                    if (diff > 2)
+                    {
+                        if (frameStale == 0) firstStale = { x, y };
+                        if (frameStale < 3)
+                            std::printf ("   RGB/ARGB frame %d, (%d,%d): native %d/%d/%d, offscreen %d/%d/%d\n",
+                                         frame, x, y, (int) a.getRed(), (int) a.getGreen(), (int) a.getBlue(),
+                                         (int) b.getRed(), (int) b.getGreen(), (int) b.getBlue());
+                        ++frameStale;
+                    }
+                    else if (diff != 0) ++near;
                     if (previous.isValid() && a != previous.getPixelAt (x, y)) ++movement;
+                }
+                if ((firstStale.x >= 0 || forceNativeReference) && live.isValid() && editor.getPeer() != nullptr)
+                {
+                    // Растеризаторы X11 RGB и offscreen ARGB иногда отличаются
+                    // более чем на 2 LSB даже после полного repaint. При таком
+                    // несовпадении проверяем настоящий stale на том же native
+                    // backend: без обработки таймера полностью перерисовываем
+                    // окно и сравниваем его с прежним снимком, а не смягчаем
+                    // порог или автоматически считаем несовпадение безвредным.
+                    const int offscreenDiff = frameStale;
+                    editor.recording = false;
+                    editor.repaint(); editor.getPeer()->performAnyPendingRepaintsNow();
+                    const auto full = juce::createSnapshotOfNativeWindow (editor.getPeer()->getNativeHandle());
+                    editor.recording = true;
+                    if (full.isValid() && full.getWidth() == width && full.getHeight() == height)
+                    {
+                        int actualStale = 0;
+                        for (int yy = y0; yy < y1; ++yy) for (int xx = x0; xx < x1; ++xx)
+                        {
+                            const auto a = live.getPixelAt (xx, yy), b = full.getPixelAt (xx, yy);
+                            const int diff = std::max ({ std::abs ((int) a.getRed() - (int) b.getRed()),
+                                                         std::abs ((int) a.getGreen() - (int) b.getGreen()),
+                                                         std::abs ((int) a.getBlue() - (int) b.getBlue()) });
+                            if (diff > 2) ++actualStale;
+                        }
+                        ++nativeReferenceChecks;
+                        if (offscreenDiff > 0 && actualStale == 0)
+                        { ++backendMismatchFrames; backendMismatchPixels += offscreenDiff; }
+                        frameStale = actualStale;
+                        if (offscreenDiff > 0 || actualStale > 0)
+                            std::printf ("   RGB/ARGB %d px; эталон native после полного repaint: stale %d px\n",
+                                         offscreenDiff, actualStale);
+                    }
                 }
                 previous = live;
                 stale += frameStale;
@@ -1673,6 +1720,10 @@ static void testNativeAnimationPaint()
                          editor.lanePaintMs, stale, near, maxChannelDiff, movement);
         }
     }
+    std::printf ("   сравнений с native repaint %d; совпадение при несовпадении RGB/ARGB: %d кадров, %d пикселей\n",
+                 nativeReferenceChecks, backendMismatchFrames, backendMismatchPixels);
+    if (forceNativeReference)
+        check (nativeReferenceChecks == 72, "эталон native проверен на каждом кадре", juce::String (nativeReferenceChecks) + "/72");
     check (badFrames == 0 && testedFrames == 72,
            "частичная анимация совпадает со свежим кадром при трёх масштабах и S&H wrap",
            juce::String (badFrames) + "/" + juce::String (testedFrames) + " кадров с отличиями");
@@ -1721,6 +1772,864 @@ static void testNativeAnimationPaint()
    #endif
 }
 
+// Нативный ComponentPeer доставляет mouseDown/drag/up реальным вложенным
+// контролам слота, а не вызывает selectSlot() напрямую. Это важно: иначе
+// слайдеры/кнопка могут перехватывать клик, оставляя выбранным другой слот.
+static void testNativeSlotControls()
+{
+   #if JUCE_LINUX || JUCE_BSD
+    if (std::getenv ("OROGEN_GUI_NATIVE") == nullptr) return;
+    std::printf ("\n--- Нативный GUI: выбор слота через его контролы ---\n");
+    OrogenProcessor p;
+    p.setCurrentProgram (0);
+    OrogenEditor editor (p);
+    editor.setSize (1280, 800);
+    editor.setAnimationsEnabled (false);
+    editor.addToDesktop (0); editor.setTopLeftPosition (0, 0); editor.setVisible (true);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil (500);
+    auto* peer = editor.getPeer();
+    juce::ComboBox* engine = nullptr;
+    for (auto* c : editor.getChildren())
+        if (auto* box = dynamic_cast<juce::ComboBox*> (c))
+            if (box->getTooltip().startsWith ("Engine type")) engine = box;
+
+    int hits = 0, selected = 0, changed = 0, isolated = 0, bindings = 0, engines = 0;
+    juce::int64 when = juce::Time::getCurrentTime().toMilliseconds();
+    auto deliver = [&] (juce::Point<float> pt, bool down)
+    {
+        if (peer == nullptr) return;
+        peer->handleMouseEvent (juce::MouseInputSource::mouse, pt,
+                                juce::ModifierKeys (down ? juce::ModifierKeys::leftButtonModifier : 0),
+                                juce::MouseInputSource::defaultPressure,
+                                juce::MouseInputSource::defaultOrientation, when++);
+    };
+    const std::array<juce::Point<int>, 3> sizes { juce::Point<int> (960, 600),
+                                                  juce::Point<int> (1280, 800),
+                                                  juce::Point<int> (1600, 1000) };
+    for (const auto size : sizes)
+    {
+        editor.setSize (size.x, size.y);
+        juce::MessageManager::getInstance()->runDispatchLoopUntil (120);
+        const float sx = (float) editor.getWidth() / 1280.0f;
+        const float sy = (float) editor.getHeight() / 800.0f;
+        for (int slot = 0; slot < 8; ++slot)
+          for (int field = 0; field < 3; ++field)
+          {
+            editor.showPage ((slot + 1) % 8);
+            const auto prefix = slotPrefix (slot);
+            const juce::String id = prefix + (field == 0 ? "on" : field == 1 ? "level" : "tune");
+            for (int s = 0; s < 8; ++s)
+                setP (p, slotPrefix (s) + (field == 0 ? "on" : field == 1 ? "level" : "tune"),
+                      field == 0 ? 0.0f : field == 1 ? 0.10f : -12.0f);
+            std::array<float, 8> before {};
+            for (int s = 0; s < 8; ++s)
+                before[(size_t) s] = p.apvts.getRawParameterValue (
+                    slotPrefix (s) + (field == 0 ? "on" : field == 1 ? "level" : "tune"))->load();
+            const float y = (66.0f + 70.0f * (float) slot + (field == 0 ? 47.0f : field == 1 ? 45.0f : 55.0f)) * sy;
+            const float x = (field == 0 ? 35.0f : 125.0f) * sx;
+            const float dragX = 195.0f * sx;
+            auto* hit = editor.getComponentAt (juce::roundToInt (x), juce::roundToInt (y));
+            if ((field == 0 && dynamic_cast<juce::ToggleButton*> (hit) != nullptr)
+                || (field != 0 && dynamic_cast<juce::Slider*> (hit) != nullptr)) ++hits;
+            when += 500; // не превращаем соседние действия в double click
+            deliver ({ x, y }, false); deliver ({ x, y }, true);
+            if (field != 0) deliver ({ dragX, y }, true);
+            deliver ({ field == 0 ? x : dragX, y }, false);
+            const bool isSelected = editor.visiblePage() % 8 == slot;
+            if (isSelected) ++selected;
+            if (std::fabs (p.apvts.getRawParameterValue (id)->load() - before[(size_t) slot]) > 0.01f) ++changed;
+            bool otherSlotsUnchanged = true;
+            for (int s = 0; s < 8; ++s) if (s != slot)
+                otherSlotsUnchanged = otherSlotsUnchanged && p.apvts.getRawParameterValue (
+                    slotPrefix (s) + (field == 0 ? "on" : field == 1 ? "level" : "tune"))->load() == before[(size_t) s];
+            if (otherSlotsUnchanged) ++isolated;
+            if (isSelected && editor.mainScreenParamIds().contains (prefix + "p0")) ++bindings;
+            if (isSelected && engine != nullptr)
+            {
+                std::array<int, 8> typeBefore {};
+                for (int s = 0; s < 8; ++s)
+                    typeBefore[(size_t) s] = (int) p.apvts.getRawParameterValue (slotPrefix (s) + "type")->load();
+                const int type = (typeBefore[(size_t) slot] + 1) % 9;
+                engine->setSelectedItemIndex (type, juce::sendNotificationSync);
+                bool typeIsolated = true;
+                for (int s = 0; s < 8; ++s) if (s != slot)
+                    typeIsolated = typeIsolated && (int) p.apvts.getRawParameterValue (
+                        slotPrefix (s) + "type")->load() == typeBefore[(size_t) s];
+                Patch patch; FxChain::Settings fx;
+                p.collectPatch (patch, fx);
+                if (typeIsolated && (int) p.apvts.getRawParameterValue (prefix + "type")->load() == type
+                    && (int) patch.slots[slot].type == type) ++engines;
+            }
+          }
+    }
+    std::printf ("   960/1280/1600: цель %d/72, выбранный слот %d/72, изменение %d/72, изоляция %d/72, привязки %d/72, выбор движка %d/72\n",
+                 hits, selected, changed, isolated, bindings, engines);
+    check (hits == 72 && changed == 72 && isolated == 72,
+           "кнопка и оба слайдера A–H получают события и меняют только свой параметр");
+    check (selected == 72 && bindings == 72,
+           "управление любой карточкой выбирает её слот и перепривязывает центр");
+    check (engines == 72, "селектор после клика меняет движок выбранного слота");
+    editor.removeFromDesktop();
+   #endif
+}
+
+// Дополнительная X11-проверка реального пути через выпадающее меню: в отличие
+// от setSelectedItemIndex(), здесь XTEST посылает движение и два синтетических
+// щелчка серверу X11. Проверка добровольная (OROGEN_GUI_XTEST=1); libXtst
+// загружается динамически и не является зависимостью плагина/Windows-сборки.
+static void testNativeEngineMenu (bool force = false)
+{
+   #if JUCE_LINUX
+    if (! force && std::getenv ("OROGEN_GUI_XTEST") == nullptr) return;
+    std::printf ("\n--- X11: выбор всех движков реальными событиями мыши ---\n");
+    juce::DynamicLibrary x11, xtest;
+    if (! x11.open ("libX11.so.6") || ! xtest.open ("libXtst.so.6"))
+    {
+        check (false, "для XTEST нужны libX11 и libXtst");
+        return;
+    }
+    const auto openDisplay = reinterpret_cast<void* (*) (const char*)> (x11.getFunction ("XOpenDisplay"));
+    const auto closeDisplay = reinterpret_cast<int (*) (void*)> (x11.getFunction ("XCloseDisplay"));
+    const auto flushDisplay = reinterpret_cast<int (*) (void*)> (x11.getFunction ("XFlush"));
+    const auto movePointer = reinterpret_cast<int (*) (void*, int, int, int, unsigned long)> (
+        xtest.getFunction ("XTestFakeMotionEvent"));
+    const auto mouseButton = reinterpret_cast<int (*) (void*, unsigned int, int, unsigned long)> (
+        xtest.getFunction ("XTestFakeButtonEvent"));
+    if (openDisplay == nullptr || closeDisplay == nullptr || flushDisplay == nullptr
+        || movePointer == nullptr || mouseButton == nullptr)
+    {
+        check (false, "функции X11/XTEST доступны");
+        return;
+    }
+    void* display = openDisplay (nullptr);
+    if (display == nullptr) { check (false, "XTEST подключён к дисплею"); return; }
+
+    {
+        OrogenProcessor p;
+        p.setCurrentProgram (0);
+        OrogenEditor editor (p);
+        editor.setSize (1280, 800); editor.setAnimationsEnabled (false);
+        editor.addToDesktop (0); editor.setTopLeftPosition (0, 0); editor.setVisible (true);
+        auto* mm = juce::MessageManager::getInstance();
+        mm->runDispatchLoopUntil (500);
+        juce::ComboBox* engine = nullptr;
+        for (auto* c : editor.getChildren())
+            if (auto* b = dynamic_cast<juce::ComboBox*> (c))
+                if (b->getTooltip().startsWith ("Engine type")) engine = b;
+        auto click = [&] (juce::Point<int> pt, int settleMs)
+        {
+            movePointer (display, -1, pt.x, pt.y, 0); flushDisplay (display);
+            mm->runDispatchLoopUntil (45);
+            mouseButton (display, 1, 1, 0); flushDisplay (display);
+            mm->runDispatchLoopUntil (60);
+            mouseButton (display, 1, 0, 0); flushDisplay (display);
+            mm->runDispatchLoopUntil (settleMs);
+        };
+        int cards = 0, opened = 0, clicked = 0, types = 0, isolated = 0, patches = 0;
+        if (engine != nullptr)
+            for (int slot = 0; slot < 8; ++slot)
+            {
+                editor.showPage ((slot + 1) % 8);
+                // Тоже реальный X11-клик: потом меню должно менять именно этот слот.
+                click (editor.localPointToGlobal (juce::Point<int> (35, 113 + 70 * slot)), 180);
+                const bool cardSelected = editor.visiblePage() % 8 == slot;
+                if (cardSelected) ++cards;
+                for (int target = 0; target < 9; ++target)
+                {
+                    const auto id = slotPrefix (slot) + "type";
+                    setP (p, id, (float) ((target + 1) % 9));
+                    mm->runDispatchLoopUntil (40);
+                    std::array<int, 8> before {};
+                    for (int s = 0; s < 8; ++s)
+                        before[(size_t) s] = (int) p.apvts.getRawParameterValue (slotPrefix (s) + "type")->load();
+                    const bool wasDifferent = engine->getSelectedItemIndex() == (target + 1) % 9;
+                    click (engine->getScreenBounds().getCentre(), 350);
+                    auto* menu = juce::Component::getCurrentlyModalComponent();
+                    if (menu == nullptr || menu->getName() != "menu")
+                    {
+                        std::printf ("   меню не открылось: слот %d, цель %d\n", slot, target);
+                        juce::PopupMenu::dismissAllActiveMenus();
+                        continue;
+                    }
+                    ++opened;
+                    juce::Component* item = nullptr;
+                    const auto text = engine->getItemText (target);
+                    for (auto* child : menu->getChildren())
+                        if (auto* access = child->getAccessibilityHandler())
+                            if (access->getTitle() == text) { item = child; break; }
+                    if (item == nullptr)
+                    {
+                        std::printf ("   пункт не найден: %s\n", text.toRawUTF8());
+                        juce::PopupMenu::dismissAllActiveMenus();
+                        continue;
+                    }
+                    ++clicked;
+                    click (item->getScreenBounds().getCentre(), 160);
+                    const int after = (int) p.apvts.getRawParameterValue (id)->load();
+                    bool others = true;
+                    for (int s = 0; s < 8; ++s) if (s != slot)
+                        others = others && (int) p.apvts.getRawParameterValue (
+                            slotPrefix (s) + "type")->load() == before[(size_t) s];
+                    Patch patch; FxChain::Settings fx; p.collectPatch (patch, fx);
+                    if (cardSelected && wasDifferent && engine->getSelectedItemIndex() == target && after == target) ++types;
+                    if (others) ++isolated;
+                    if ((int) patch.slots[slot].type == target) ++patches;
+                    if (! cardSelected || ! wasDifferent || after != target)
+                        std::printf ("   слот %d: до %d, цель %d, после %d, выбран %d\n",
+                                     slot, before[(size_t) slot], target, after, (int) cardSelected);
+                }
+            }
+        std::printf ("   карточки %d/8, меню %d/72, пункты %d/72, тип %d/72, изоляция %d/72, Patch %d/72\n",
+                     cards, opened, clicked, types, isolated, patches);
+        check (cards == 8 && opened == 72 && clicked == 72 && types == 72 && isolated == 72 && patches == 72,
+               "мышь X11 выбирает 9 движков для каждого из 8 слотов, сохраняя изоляцию и Patch");
+        juce::PopupMenu::dismissAllActiveMenus();
+        editor.removeFromDesktop();
+    }
+    closeDisplay (display);
+   #else
+    if (force) check (false, "XTEST проверка доступна только на Linux/X11");
+   #endif
+}
+
+// Проверяем контракт автоматизации хоста: begin -> value -> end на каждом
+// управляемом параметре, не только то, что APVTS изменил значение.
+struct GestureTrace : juce::AudioProcessorParameter::Listener
+{
+    juce::RangedAudioParameter* param = nullptr;
+    std::vector<char> events;
+    explicit GestureTrace (OrogenProcessor& p, const juce::String& id)
+        : param (p.apvts.getParameter (id))
+    {
+        if (param != nullptr) param->addListener (this);
+    }
+    ~GestureTrace() override { if (param != nullptr) param->removeListener (this); }
+    void parameterValueChanged (int, float) override { events.push_back ('v'); }
+    void parameterGestureChanged (int, bool starting) override { events.push_back (starting ? 'b' : 'e'); }
+    bool balanced() const
+    {
+        return param != nullptr && ! events.empty() && events.front() == 'b' && events.back() == 'e'
+            && std::count (events.begin(), events.end(), 'b') == 1
+            && std::count (events.begin(), events.end(), 'e') == 1
+            && std::count (events.begin(), events.end(), 'v') >= 1;
+    }
+    void clear() { events.clear(); }
+    juce::String sequence() const
+    {
+        juce::String s; for (char c : events) s += juce::String::charToString ((juce::juce_wchar) c);
+        return s.isEmpty() ? juce::String ("empty") : s;
+    }
+};
+
+static void testHostGestureContracts()
+{
+    std::printf ("\n--- GUI: жесты автоматизации хоста ---\n");
+    OrogenProcessor p; p.setCurrentProgram (0);
+    OrogenEditor editor (p); editor.setSize (1280, 800); editor.setAnimationsEnabled (false);
+    auto mid = [&] (const juce::String& id) {
+        if (auto* q = p.apvts.getParameter (id)) q->setValueNotifyingHost (0.5f);
+    };
+
+    mid ("sA_p0"); mid ("sA_p1");
+    GestureTrace pos (p, "sA_p0"), size (p, "sA_p1");
+    const auto displayHit = editor.beginMainDrag ({ 500.0f, 170.0f });
+    editor.dragMain ({ 535.0f, 162.0f }); editor.releaseMain();
+    check (displayHit == OrogenEditor::MainHit::display && pos.balanced() && size.balanced(),
+           "дисплей группирует P1 и P2 в два полных жеста хоста",
+           pos.sequence() + " / " + size.sequence());
+
+    const juce::String fxId = editor.chipParamId (0);
+    const juce::String powerId = editor.chipPowerId (0);
+    mid (fxId); GestureTrace fx (p, fxId), power (p, powerId);
+    const bool directClick = editor.clickMain ({ 275.0f, 615.0f });
+    const bool directFxOk = power.balanced(); power.clear();
+    const auto chipHit = editor.beginMainDrag ({ 275.0f, 615.0f });
+    editor.clickMain ({ 275.0f, 615.0f }); editor.releaseMain();
+    const bool mouseClickFxOk = power.balanced(); power.clear();
+    mid (fxId); fx.clear();
+    editor.beginMainDrag ({ 275.0f, 615.0f }); editor.dragMain ({ 300.0f, 615.0f }); editor.releaseMain();
+    check (directClick && chipHit == OrogenEditor::MainHit::fxChip && directFxOk
+           && mouseClickFxOk && fx.balanced() && power.events.empty(),
+           "FX-чип: клик жест power, drag жест mix без вложенных begin/end",
+           juce::String ((int) directFxOk) + "/" + juce::String ((int) mouseClickFxOk) + "/" + fx.sequence());
+
+    int modOk = 0;
+    for (int i = 0; i < 8; ++i)
+    {
+        const auto id = "mod" + juce::String (i + 1) + "_amt";
+        mid (id); GestureTrace mod (p, id);
+        const float x = 262.0f + (736.0f - 28.0f) / 8.0f * ((float) i + 0.5f);
+        const auto hit = editor.beginMainDrag ({ x, 320.0f });
+        editor.dragMain ({ x, 312.0f }); editor.releaseMain();
+        if (hit == OrogenEditor::MainHit::modNode && mod.balanced()) ++modOk;
+    }
+    check (modOk == 8, "все восемь узлов мод-матрицы посылают жесты хосту", juce::String (modOk) + "/8");
+
+    mid ("lfo1_rate"); mid ("lfo1_amount");
+    GestureTrace rate (p, "lfo1_rate"), amount (p, "lfo1_amount");
+    const auto lfoHit = editor.beginMainDrag ({ 600.0f, 372.0f });
+    editor.dragMain ({ 630.0f, 364.0f }); editor.releaseMain();
+    check (lfoHit == OrogenEditor::MainHit::lfoLane && rate.balanced() && amount.balanced(),
+           "дорожка LFO группирует Rate и Amount", rate.sequence() + " / " + amount.sequence());
+
+    for (const char* id : { "sA_attack", "sA_decay", "sA_sustain", "sA_release" }) mid (id);
+    GestureTrace attack (p, "sA_attack"), decay (p, "sA_decay");
+    GestureTrace sustain (p, "sA_sustain"), release (p, "sA_release");
+    const auto findNode = [&editor] (OrogenEditor::MainHit want) {
+        for (float x = 262.0f; x < 960.0f; x += 1.0f)
+            for (float y = 410.0f; y < 462.0f; y += 1.0f)
+            {
+                int index = -1;
+                if (editor.hitMain ({ x, y }, index) == want) return juce::Point<float> (x, y);
+            }
+        return juce::Point<float> (-1.0f, -1.0f);
+    };
+    const auto dragNode = [&editor, &findNode] (OrogenEditor::MainHit hit, juce::Point<float> delta) {
+        const auto pt = findNode (hit);
+        if (pt.x < 0.0f) return false;
+        const bool ok = editor.beginMainDrag (pt) == hit;
+        editor.dragMain (pt + delta); editor.releaseMain(); return ok;
+    };
+    const bool nodes = dragNode (OrogenEditor::MainHit::envAttack, { 20.0f, 0.0f })
+                    && dragNode (OrogenEditor::MainHit::envDecay, { 20.0f, 0.0f })
+                    && dragNode (OrogenEditor::MainHit::envSustain, { 20.0f, -8.0f });
+    check (nodes && attack.balanced() && decay.balanced() && sustain.balanced() && release.balanced(),
+           "узлы ADSR передают жесты всех четырёх параметров",
+           attack.sequence() + "/" + decay.sequence() + "/" + sustain.sequence() + "/" + release.sequence());
+
+    pos.clear(); size.clear(); mid ("sA_p0"); mid ("sA_p1"); mid ("sB_p0"); mid ("sB_p1");
+    pos.clear(); size.clear(); GestureTrace otherPos (p, "sB_p0"), otherSize (p, "sB_p1");
+    const float beforeB0 = otherPos.param->getValue(), beforeB1 = otherSize.param->getValue();
+    editor.beginMainDrag ({ 500.0f, 170.0f }); editor.dragMain ({ 520.0f, 160.0f });
+    editor.showPage (1); // при смене слота не продолжать старый жест на новом слоте
+    const bool movedAfterSwitch = editor.dragMain ({ 540.0f, 150.0f }); editor.releaseMain();
+    check (! movedAfterSwitch && pos.balanced() && size.balanced() && otherPos.events.empty() && otherSize.events.empty()
+           && otherPos.param->getValue() == beforeB0 && otherSize.param->getValue() == beforeB1,
+           "смена слота завершает старый drag, не меняя новый слот",
+           pos.sequence() + "/" + size.sequence() + "/" + otherPos.sequence() + "/" + otherSize.sequence());
+
+    editor.showPage (0); pos.clear(); size.clear();
+    editor.beginMainDrag ({ 500.0f, 170.0f }); editor.dragMain ({ 520.0f, 160.0f });
+    editor.showPage (100); // оверлей перехватит мышь: жест нельзя оставить открытым
+    const bool movedUnderOverlay = editor.dragMain ({ 540.0f, 150.0f }); editor.releaseMain();
+    check (! movedUnderOverlay && pos.balanced() && size.balanced(),
+           "открытие оверлея завершает активный жест", pos.sequence() + "/" + size.sequence());
+
+    // Редактор может быть закрыт хостом во время drag; конец тоже обязателен.
+    OrogenProcessor q; q.setCurrentProgram (0); GestureTrace close0 (q, "sA_p0"), close1 (q, "sA_p1");
+    {
+        OrogenEditor closing (q); closing.setAnimationsEnabled (false);
+        close0.clear(); close1.clear();
+        closing.beginMainDrag ({ 500.0f, 170.0f }); closing.dragMain ({ 530.0f, 160.0f });
+    }
+    check (close0.balanced() && close1.balanced(), "закрытие редактора завершает незаконченный жест",
+           close0.sequence() + "/" + close1.sequence());
+}
+
+// VectorPad — настоящий дочерний Component, поэтому события идут через peer.
+static void testNativeVectorGesture()
+{
+   #if JUCE_LINUX || JUCE_BSD
+    if (std::getenv ("OROGEN_GUI_NATIVE") == nullptr) return;
+    OrogenProcessor p; p.setCurrentProgram (0);
+    OrogenEditor editor (p); editor.setSize (1280, 800); editor.setAnimationsEnabled (false);
+    editor.addToDesktop (0); editor.setTopLeftPosition (0, 0); editor.setVisible (true);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil (350);
+    auto* peer = editor.getPeer();
+    if (auto* q = p.apvts.getParameter ("gl_morph")) q->setValueNotifyingHost (0.2f);
+    if (auto* q = p.apvts.getParameter ("gl_glide")) q->setValueNotifyingHost (0.2f);
+    GestureTrace morph (p, "gl_morph"), glide (p, "gl_glide");
+    juce::int64 now = juce::Time::getCurrentTime().toMilliseconds();
+    auto ev = [&] (juce::Point<float> pt, bool down) {
+        if (peer != nullptr)
+            peer->handleMouseEvent (juce::MouseInputSource::mouse, pt,
+                juce::ModifierKeys (down ? juce::ModifierKeys::leftButtonModifier : 0),
+                juce::MouseInputSource::defaultPressure, juce::MouseInputSource::defaultOrientation, now++);
+    };
+    ev ({ 1186.0f, 715.0f }, false); ev ({ 1186.0f, 715.0f }, true);
+    ev ({ 1215.0f, 687.0f }, true); ev ({ 1215.0f, 687.0f }, false);
+    check (peer != nullptr && morph.balanced() && glide.balanced(),
+           "нативный VectorPad группирует Morph и Glide для хоста",
+           morph.sequence() + "/" + glide.sequence());
+
+    morph.clear(); glide.clear();
+    ev ({ 1180.0f, 708.0f }, false); ev ({ 1180.0f, 708.0f }, true);
+    editor.showPage (100); // закрывает и активный VectorPad, не только drag дисплея
+    const auto morphAfterOverlay = morph.sequence(), glideAfterOverlay = glide.sequence();
+    ev ({ 1200.0f, 690.0f }, true); ev ({ 1200.0f, 690.0f }, false);
+    check (morph.balanced() && glide.balanced() && morph.sequence() == morphAfterOverlay
+           && glide.sequence() == glideAfterOverlay,
+           "открытие PARAMS завершает жест VectorPad без изменений после закрытия",
+           morph.sequence() + "/" + glide.sequence());
+    editor.removeFromDesktop();
+
+    morph.clear(); glide.clear();
+    {
+        auto closing = std::make_unique<OrogenEditor> (p);
+        closing->setSize (1280, 800); closing->setAnimationsEnabled (false);
+        closing->addToDesktop (0); closing->setTopLeftPosition (0, 0); closing->setVisible (true);
+        juce::MessageManager::getInstance()->runDispatchLoopUntil (200);
+        auto* closingPeer = closing->getPeer();
+        if (closingPeer != nullptr)
+        {
+            closingPeer->handleMouseEvent (juce::MouseInputSource::mouse, { 1190.0f, 705.0f },
+                juce::ModifierKeys(), juce::MouseInputSource::defaultPressure,
+                juce::MouseInputSource::defaultOrientation, now++);
+            closingPeer->handleMouseEvent (juce::MouseInputSource::mouse, { 1190.0f, 705.0f },
+                juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier), juce::MouseInputSource::defaultPressure,
+                juce::MouseInputSource::defaultOrientation, now++);
+        }
+        closing.reset();
+    }
+    check (morph.balanced() && glide.balanced(), "закрытие редактора завершает жест VectorPad",
+           morph.sequence() + "/" + glide.sequence());
+   #endif
+}
+
+// FX rack: state migration, complete control map, and native GUI events.
+static void testFxRackStateAndMap()
+{
+    std::printf ("\n--- FX rack: defaults, state, migration, coverage ---\n");
+    OrogenProcessor p;
+    Patch patch; FxChain::Settings start; p.collectPatch (patch, start);
+    int initiallyOff = 0;
+    for (int i = 0; i < FxChain::ModuleCount; ++i)
+        if (! start.enabled[(size_t) i] && p.apvts.getRawParameterValue (kFxModules[i].onId)->load() < 0.5f) ++initiallyOff;
+    check (initiallyOff == FxChain::ModuleCount, "INIT: все 13 FX действительно выключены", juce::String (initiallyOff) + "/13");
+
+    auto* chorusModeDefault = p.apvts.getParameter ("fx_chorusMode");
+    auto* glitchTimingDefault = p.apvts.getParameter ("fx_glitchTimingMode");
+    check (start.chorusModel == 1 && start.chorusMode == 2 && start.glitchTimingMode == 1
+           && chorusModeDefault != nullptr && glitchTimingDefault != nullptr
+           && chorusModeDefault->convertFrom0to1 (chorusModeDefault->getDefaultValue()) == 2.0f
+           && glitchTimingDefault->convertFrom0to1 (glitchTimingDefault->getDefaultValue()) == 1.0f,
+           "новый INIT и host defaults: Firmware V2 и физически корректное время GLITCH");
+    int extraCount = 0; const auto* extra = fxExtraParamTable (extraCount);
+    for (int i = 0; i < FxChain::ModuleCount; ++i) setP (p, kFxModules[i].onId, i % 2 == 0 ? 1.0f : 0.0f);
+    for (int i = 0; i < extraCount; ++i)
+        if (auto* q = p.apvts.getParameter (juce::String ("fx_") + extra[i].id))
+            q->setValueNotifyingHost (0.17f + 0.013f * (float) i);
+    setP (p, "fx_plateDc", 0.0f); setP (p, "fx_combNegativeB", 2.0f);
+    setP (p, "fx_chorusMode", 1.0f); setP (p, "fx_glitchTimingMode", 1.0f);
+    setP (p, "fx_glitchSync", 1.0f); setP (p, "fx_glitchDivision", 7.0f); setP (p, "fx_glitchHighpass", 1.0f);
+    setP (p, "fx_chorusMix", 0.673f); setP (p, "fx_chorusOn", 0.0f);
+    FxChain::Settings before; p.collectPatch (patch, before);
+    juce::MemoryBlock state; p.getStateInformation (state);
+    OrogenProcessor restored; restored.setStateInformation (state.getData(), (int) state.getSize());
+    FxChain::Settings after; restored.collectPatch (patch, after);
+    int changed = 0;
+    for (int i = 0; i < FxChain::ModuleCount; ++i) if (before.enabled[(size_t) i] != after.enabled[(size_t) i]) ++changed;
+    for (int i = 0; i < extraCount; ++i) if (std::fabs (before.*(extra[i].field) - after.*(extra[i].field)) > 1.0e-4f) ++changed;
+    if (before.plateDc != after.plateDc || before.combNegativeB != after.combNegativeB) ++changed;
+    if (before.chorusMode != after.chorusMode || before.glitchTimingMode != after.glitchTimingMode
+        || before.glitchSync != after.glitchSync || before.glitchDivision != after.glitchDivision
+        || before.glitchHighpass != after.glitchHighpass) ++changed;
+    if (std::fabs (after.chorusMix - 0.673f) > 0.001f || after.enabled[(size_t) FxChain::ChorusModule]) ++changed;
+    check (changed == 0, "состояние DAW сохраняет power и все добавленные контролы, включая OFF + ненулевой mix", juce::String (changed) + " различий");
+
+    auto json = presetToVar ("rack-test", patch, before);
+    Patch fromJsonPatch; FxChain::Settings fromJson; juce::String presetName;
+    const bool jsonOk = presetFromVar (json, fromJsonPatch, fromJson, presetName);
+    changed = 0;
+    for (int i = 0; i < FxChain::ModuleCount; ++i) if (before.enabled[(size_t) i] != fromJson.enabled[(size_t) i]) ++changed;
+    for (int i = 0; i < extraCount; ++i) if (std::fabs (before.*(extra[i].field) - fromJson.*(extra[i].field)) > 1.0e-4f) ++changed;
+    if (before.plateDc != fromJson.plateDc || before.combNegativeB != fromJson.combNegativeB) ++changed;
+    if (before.chorusMode != fromJson.chorusMode || before.glitchTimingMode != fromJson.glitchTimingMode
+        || before.glitchSync != fromJson.glitchSync || before.glitchDivision != fromJson.glitchDivision
+        || before.glitchHighpass != fromJson.glitchHighpass) ++changed;
+    check (jsonOk && changed == 0, "JSON-пресет сохраняет power и все новые контролы", juce::String (changed) + " различий");
+
+    // Emulate a project saved before power/extra parameters existed. Loading
+    // over already-edited modern values must not inherit those values.
+    auto legacy = p.apvts.copyState();
+    const auto erase = [&legacy] (const juce::String& id) {
+        auto child = legacy.getChildWithProperty ("id", id);
+        if (child.isValid()) legacy.removeChild (child, nullptr);
+    };
+    for (const auto& module : kFxModules) erase (module.onId);
+    for (int i = 0; i < extraCount; ++i) erase (juce::String ("fx_") + extra[i].id);
+    erase ("fx_plateDc"); erase ("fx_combNegativeB");
+    for (const char* id : { "fx_chorusMode", "fx_glitchTimingMode", "fx_glitchSync", "fx_glitchDivision", "fx_glitchHighpass" }) erase (id);
+    juce::MemoryBlock oldState;
+    if (auto xml = legacy.createXml()) juce::AudioProcessor::copyXmlToBinary (*xml, oldState);
+    restored.setStateInformation (oldState.getData(), (int) oldState.getSize());
+    FxChain::Settings old; restored.collectPatch (patch, old);
+    int onCount = 0, defaultCount = 0;
+    for (bool enabled : old.enabled) if (enabled) ++onCount;
+    for (int i = 0; i < extraCount; ++i) if (std::fabs (old.*(extra[i].field) - extra[i].def) <= 0.001f) ++defaultCount;
+    check (onCount == 13 && defaultCount == extraCount && old.plateDc && old.combNegativeB == 0
+           && old.chorusMode == 0 && old.glitchTimingMode == 0 && !old.glitchSync && old.glitchDivision == 3 && !old.glitchHighpass,
+           "старая DAW-сессия: прежний тракт ON, новые поля в совместимых значениях",
+           juce::String (onCount) + "/13, " + juce::String (defaultCount) + "/" + juce::String (extraCount));
+    auto* fxObject = json.getDynamicObject()->getProperty ("fx").getDynamicObject();
+    for (const auto& module : kFxModules) fxObject->removeProperty (module.onId);
+    for (int i = 0; i < extraCount; ++i) fxObject->removeProperty (extra[i].id);
+    fxObject->removeProperty ("plateDc"); fxObject->removeProperty ("combNegativeB");
+    for (const char* id : { "chorusMode", "glitchTimingMode", "glitchSync", "glitchDivision", "glitchHighpass" }) fxObject->removeProperty (id);
+    FxChain::Settings oldJson; const bool oldOk = presetFromVar (json, fromJsonPatch, oldJson, presetName);
+    onCount = 0; defaultCount = 0;
+    for (bool enabled : oldJson.enabled) if (enabled) ++onCount;
+    for (int i = 0; i < extraCount; ++i) if (std::fabs (oldJson.*(extra[i].field) - extra[i].def) <= 0.001f) ++defaultCount;
+    check (oldOk && onCount == 13 && defaultCount == extraCount && oldJson.plateDc && oldJson.combNegativeB == 0
+           && oldJson.chorusMode == 0 && oldJson.glitchTimingMode == 0 && !oldJson.glitchSync && oldJson.glitchDivision == 3 && !oldJson.glitchHighpass,
+           "старый JSON-пресет сохраняет прежнюю цепь и умолчания");
+
+    // A partially corrupted *new* state must not silently enable a missing FX.
+    auto partial = p.apvts.copyState();
+    auto deleted = partial.getChildWithProperty ("id", "fx_delayOn"); partial.removeChild (deleted, nullptr);
+    juce::MemoryBlock partialBlob;
+    if (auto xml = partial.createXml()) juce::AudioProcessor::copyXmlToBinary (*xml, partialBlob);
+    setP (restored, "fx_delayOn", 1.0f);
+    restored.setStateInformation (partialBlob.getData(), (int) partialBlob.getSize());
+    FxChain::Settings partialFx; restored.collectPatch (patch, partialFx);
+    check (! partialFx.enabled[(size_t) FxChain::DelayModule], "неполное новое состояние не включает отсутствующий FX");
+
+    OrogenEditor editor (p); editor.setSize (1280, 800); editor.setAnimationsEnabled (false);
+    const auto all = editor.fxRackParamIds();
+    juce::StringArray expected;
+    const auto tabs = buildUiTabs();
+    for (const auto& section : tabs[1].sections) expected.addArray (section.ids);
+    int missing = 0, duplicates = 0, wrongPage = 0;
+    for (const auto& id : expected)
+    {
+        int n = 0; for (const auto& actual : all) if (id == actual) ++n;
+        if (n == 0) ++missing; if (n != 1) ++duplicates;
+    }
+    for (int i = 0; i < FxChain::ModuleCount; ++i)
+    {
+        editor.showPage (50 + i);
+        auto* overlay = editor.fxOverlay();
+        juce::StringArray actual;
+        std::function<void (juce::Component&)> walk = [&] (juce::Component& c) {
+            for (auto* child : c.getChildren())
+            {
+                if (! effectivelyVisible (*child, overlay)) continue;
+                if (dynamic_cast<juce::Slider*> (child) != nullptr || dynamic_cast<juce::ComboBox*> (child) != nullptr
+                    || dynamic_cast<juce::Button*> (child) != nullptr)
+                {
+                    const auto id = child->getProperties().getWithDefault ("paramId", {}).toString();
+                    if (id.isNotEmpty()) actual.addIfNotAlreadyThere (id);
+                }
+                walk (*child);
+            }
+        };
+        if (overlay != nullptr) walk (*overlay);
+        for (const auto& section : tabs[1].sections)
+            if (section.title == kFxModules[i].section)
+                for (const auto& id : section.ids) if (! actual.contains (id)) ++wrongPage;
+    }
+    check (missing == 0 && duplicates == 0 && all.size() == expected.size() && wrongPage == 0,
+           "каждый FX-параметр имеет реальный контрол на странице своего эффекта",
+           juce::String (all.size()) + "/" + juce::String (expected.size()) + ", отсутствует " + juce::String (wrongPage));
+
+    std::function<juce::Slider* (juce::Component&, const juce::String&)> sliderFor;
+    sliderFor = [&] (juce::Component& c, const juce::String& id) -> juce::Slider* {
+        for (auto* child : c.getChildren()) {
+            if (! effectivelyVisible (*child, editor.fxOverlay())) continue;
+            if (auto* sl = dynamic_cast<juce::Slider*> (child))
+                if (sl->getProperties().getWithDefault ("paramId", {}).toString() == id) return sl;
+            if (auto* result = sliderFor (*child, id)) return result;
+        }
+        return nullptr;
+    };
+    setP (p, "fx_chorusModel", 1); editor.showPage (52);
+    auto* speed = sliderFor (*editor.fxOverlay(), "fx_chorusRate");
+    auto* depth = sliderFor (*editor.fxOverlay(), "fx_chorusDepth");
+    check (speed != nullptr && depth != nullptr && speed->getTextFromValue (2.0) == "127"
+           && std::fabs (speed->getValueFromText ("127") - 2.0) < 1e-6
+           && depth->getTextFromValue (1.0) == "127"
+           && std::fabs (depth->getValueFromText ("64") - 64.0 / 127.0) < 1e-6,
+           "CHORUS firmware: DEP и SPD показывают и принимают шкалу 0–127");
+    editor.showPage (58);
+    auto* window = sliderFor (*editor.fxOverlay(), "fx_spectreWindowExt");
+    check (window != nullptr && window->getTextFromValue (-1) == "FOLLOW"
+           && window->getTextFromValue (7) == "65536" && window->getValueFromText ("65536") == 7,
+           "SPECTRE: FOLLOW и окно 65536 читаются и вводятся");
+    editor.showPage (60);
+    auto* dry = sliderFor (*editor.fxOverlay(), "fx_glitchDryLevel");
+    check (dry != nullptr && dry->getTextFromValue (-1) == "FOLLOW"
+           && dry->getTextFromValue (.75).startsWith ("75")
+           && std::fabs (dry->getValueFromText ("75") - .75) < 1e-6
+           && dry->getValueFromText ("FOLLOW") == -1,
+           "GLITCH: независимый DRY показывает проценты и сбрасывается в FOLLOW");
+    auto* mix = sliderFor (*editor.fxOverlay(), "fx_glitchMix");
+    auto* chance = sliderFor (*editor.fxOverlay(), "fx_glitchChance");
+    check (mix != nullptr && chance != nullptr && mix->getTextFromValue (.4).startsWith ("40.0 %")
+           && chance->getTextFromValue (.35).startsWith ("35.0 %")
+           && std::fabs (mix->getValueFromText ("40") - .4) < 1e-6
+           && std::fabs (chance->getValueFromText ("35") - .35) < 1e-6,
+           "GLITCH MIX и CHANCE показывают и принимают проценты без изменения параметров хоста");
+    auto* length = sliderFor (*editor.fxOverlay(), "fx_glitchLengthExt");
+    check (length != nullptr && length->getTextFromValue (0) == "FOLLOW"
+           && std::fabs (length->getInterval() - 1.0) < 1e-6
+           && std::fabs (length->getValueFromText ("1") - 1.0) < 1e-6
+           && std::fabs (length->getValueFromText ("500") - 500.0) < 1e-6,
+           "GLITCH LENGTH EXT: FOLLOW или действительные 1–500 мс с шагом 1 мс");
+}
+
+// The DAW parameter path must reach the audio callback, not merely the DSP
+// adapter or the JSON serializer. Change one choice while audio is running;
+// then repeat with two actual AudioPlayHead tempo values.
+static void testMonoFxProcessorAudio()
+{
+    std::printf ("\n--- MonoHuice FX: live AudioProcessor automation and host tempo ---\n");
+    class Head : public juce::AudioPlayHead {
+    public:
+        double bpm = 120.0;
+        juce::Optional<PositionInfo> getPosition() const override {
+            PositionInfo position; position.setBpm (bpm); position.setIsPlaying (true); return position;
+        }
+    };
+    auto run = [] (bool tempo) {
+        OrogenProcessor a, b; Head ha, hb;
+        auto config = [] (OrogenProcessor& p) {
+            p.setPlayConfigDetails (0, 2, 48000.0, 128); p.prepareToPlay (48000.0, 128);
+            p.setCurrentProgram (0); soloSlot (p, 0, (int) EngineType::Wavetable);
+            setP (p, "sA_attack", .005f); setP (p, "sA_sustain", 1.0f);
+            setP (p, "fx_glitchOn", 1.0f); setP (p, "fx_glitchMix", .9f);
+            setP (p, "fx_glitchChance", 1.0f); setP (p, "fx_glitchLengthMs", 24.0f);
+            setP (p, "fx_glitchRepeats", 7.0f); setP (p, "fx_glitchFold", 2.0f);
+            setP (p, "fx_glitchTone", 5000.0f); setP (p, "fx_glitchTimingMode", 1.0f);
+        };
+        config (a); config (b); a.setPlayHead (&ha); b.setPlayHead (&hb);
+        if (tempo) { setP (a, "fx_glitchSync", 1); setP (b, "fx_glitchSync", 1);
+                     setP (a, "fx_glitchDivision", 6); setP (b, "fx_glitchDivision", 6); }
+        juce::AudioBuffer<float> x (2,128), y (2,128); juce::MidiBuffer ma, mb, noneA, noneB;
+        ma.addEvent (juce::MidiMessage::noteOn (1,60,.8f),0);
+        mb.addEvent (juce::MidiMessage::noteOn (1,60,.8f),0);
+        double energy=0, diff=0; int bad=0;
+        for (int block=0;block<900;++block) {
+            if (block==250) { if (tempo) ha.bpm=73; else setP (a, "fx_glitchHighpass", 1); }
+            a.processBlock (x, block==0 ? ma : noneA); b.processBlock (y, block==0 ? mb : noneB);
+            if (block>=300) for (int ch=0;ch<2;++ch) for (int i=0;i<128;++i) {
+                const double av=x.getSample(ch,i), bv=y.getSample(ch,i), d=av-bv;
+                if (!std::isfinite(av) || !std::isfinite(bv)) ++bad;
+                diff+=d*d; energy+=bv*bv;
+            }
+        }
+        a.setPlayHead (nullptr); b.setPlayHead (nullptr); a.releaseResources(); b.releaseResources();
+        const double d=std::sqrt(diff/(600.0*128.0*2.0)), level=std::sqrt(energy/(600.0*128.0*2.0));
+        check (bad==0 && level>1e-5 && d>1e-5,
+               tempo ? "изменение BPM хоста меняет синхронизированный GLITCH"
+                     : "переключение GLITCH highpass в работающем AudioProcessor меняет звук",
+               "delta RMS " + num (d,9) + ", level " + num (level,6));
+    };
+    run (false); run (true);
+    {
+        OrogenProcessor p; p.setPlayConfigDetails (0, 2, 48000, 128); p.prepareToPlay (48000, 128);
+        p.setCurrentProgram (0); setP (p, "fx_chorusOn", 1);
+        juce::AudioBuffer<float> block (2, 128); juce::MidiBuffer empty;
+        p.processBlock (block, empty); const int withChorus = p.reportedLatency();
+        p.setCurrentProgram (1); p.processBlock (block, empty); const int withoutChorus = p.reportedLatency();
+        check (withChorus == 1111 && withoutChorus == 1024,
+               "смена программы применяет FX на следующем аудиоблоке и обновляет latency",
+               juce::String (withChorus) + " -> " + juce::String (withoutChorus));
+        p.releaseResources();
+    }
+}
+
+static void testNativeFxRack (bool scrollOnly = false)
+{
+   #if JUCE_LINUX
+    std::printf ("\n--- FX rack: реальные XTEST-клики и drag ---\n");
+    juce::DynamicLibrary x11, xtest;
+    if (! x11.open ("libX11.so.6") || ! xtest.open ("libXtst.so.6")) { check (false, "X11/XTEST библиотеки"); return; }
+    const auto openDisplay = reinterpret_cast<void* (*) (const char*)> (x11.getFunction ("XOpenDisplay"));
+    const auto closeDisplay = reinterpret_cast<int (*) (void*)> (x11.getFunction ("XCloseDisplay"));
+    const auto flushDisplay = reinterpret_cast<int (*) (void*)> (x11.getFunction ("XFlush"));
+    const auto move = reinterpret_cast<int (*) (void*, int, int, int, unsigned long)> (xtest.getFunction ("XTestFakeMotionEvent"));
+    const auto button = reinterpret_cast<int (*) (void*, unsigned int, int, unsigned long)> (xtest.getFunction ("XTestFakeButtonEvent"));
+    const auto keyEvent = reinterpret_cast<int (*) (void*, unsigned int, int, unsigned long)> (xtest.getFunction ("XTestFakeKeyEvent"));
+    const auto keyCode = reinterpret_cast<unsigned char (*) (void*, unsigned long)> (x11.getFunction ("XKeysymToKeycode"));
+    if (!openDisplay || !closeDisplay || !flushDisplay || !move || !button || !keyEvent || !keyCode) { check (false, "XTEST symbols"); return; }
+    void* display = openDisplay (nullptr);
+    if (!display) { check (false, "XTEST display"); return; }
+    {
+        OrogenProcessor p; p.setCurrentProgram (0);
+        OrogenEditor editor (p); editor.setSize (1280, 800); editor.setAnimationsEnabled (false);
+        editor.addToDesktop (0); editor.setTopLeftPosition (0, 0); editor.setVisible (true);
+        auto* mm = juce::MessageManager::getInstance(); mm->runDispatchLoopUntil (350);
+        const auto click = [&] (juce::Point<int> pt) {
+            move (display, -1, pt.x, pt.y, 0); flushDisplay (display); mm->runDispatchLoopUntil (20);
+            button (display, 1, 1, 0); flushDisplay (display); mm->runDispatchLoopUntil (25);
+            button (display, 1, 0, 0); flushDisplay (display); mm->runDispatchLoopUntil (55);
+        };
+        std::function<juce::Button* (juce::Component&, const juce::String&)> findButton;
+        findButton = [&] (juce::Component& c, const juce::String& text) -> juce::Button* {
+            for (auto* child : c.getChildren()) {
+                if (auto* b = dynamic_cast<juce::Button*> (child)) if (b->getButtonText() == text) return b;
+                if (auto* found = findButton (*child, text)) return found;
+            }
+            return nullptr;
+        };
+        auto* nav = findButton (editor, "FX RACK");
+        if (nav) click (nav->getScreenBounds().getCentre());
+        check (editor.fxOverlay() && editor.fxOverlay()->isVisible(), "кнопка FX RACK открывает отдельную страницу");
+        int selected = 0, toggles = 0, isolated = 0, retained = 0, gestures = 0;
+        const std::array<int, 3> widths { 960, 1280, 1600 };
+        for (int width : widths)
+        {
+            if (scrollOnly) break;
+            editor.setSize (width, width * 5 / 8); mm->runDispatchLoopUntil (120);
+            const float scale = (float) width / 1280.0f;
+            for (int i = 0; i < FxChain::ModuleCount; ++i)
+            {
+                setP (p, kFxModules[i].onId, 0.0f); mm->runDispatchLoopUntil (12);
+                std::array<float, FxChain::ModuleCount> states {};
+                for (int j = 0; j < FxChain::ModuleCount; ++j) states[(size_t) j] = p.apvts.getRawParameterValue (kFxModules[j].onId)->load();
+                const float saved = p.apvts.getRawParameterValue ("fx_chorusMix")->load();
+                const auto select = editor.localPointToGlobal (juce::Point<int> (juce::roundToInt (94*scale), juce::roundToInt ((164.0f + 43.0f*i)*scale)));
+                click (select);
+                if (editor.fxRackSelectedModule() == i) ++selected;
+                GestureTrace trace (p, kFxModules[i].onId);
+                const auto power = editor.localPointToGlobal (juce::Point<int> (juce::roundToInt (211*scale), juce::roundToInt ((164.0f + 43.0f*i)*scale)));
+                click (power);
+                const bool on = p.apvts.getRawParameterValue (kFxModules[i].onId)->load() > 0.5f;
+                const bool hasGesture = trace.balanced(); trace.clear();
+                bool others = true;
+                for (int j = 0; j < FxChain::ModuleCount; ++j) if (j != i)
+                    if (std::fabs (p.apvts.getRawParameterValue (kFxModules[j].onId)->load() - states[(size_t) j]) > 0.001f) others = false;
+                click (power);
+                const bool off = p.apvts.getRawParameterValue (kFxModules[i].onId)->load() < 0.5f;
+                if (on && off) ++toggles;
+                if (others) ++isolated;
+                if (std::fabs (saved - p.apvts.getRawParameterValue ("fx_chorusMix")->load()) < 1.0e-6f) ++retained;
+                if (hasGesture && trace.balanced()) ++gestures;
+            }
+        }
+        const int total = 3 * FxChain::ModuleCount;
+        std::printf ("   3 размера: select %d/%d, ON/OFF %d/%d, изоляция %d/%d, настройки %d/%d, host gestures %d/%d\n",
+                     selected,total,toggles,total,isolated,total,retained,total,gestures,total);
+        if (! scrollOnly)
+            check (selected == total && toggles == total && isolated == total && retained == total && gestures == total,
+                   "XTEST выбирает и переключает все 13 эффектов без потери настроек");
+
+        editor.setSize (1280, 800); editor.showPage (52); mm->runDispatchLoopUntil (180);
+        std::function<juce::Slider* (juce::Component&, const juce::String&)> findSlider;
+        findSlider = [&] (juce::Component& c, const juce::String& id) -> juce::Slider* {
+            for (auto* child : c.getChildren()) {
+                if (! effectivelyVisible (*child, editor.fxOverlay())) continue;
+                if (auto* sl = dynamic_cast<juce::Slider*> (child))
+                    if (sl->getProperties().getWithDefault ("paramId", {}).toString() == id) return sl;
+                if (auto* found = findSlider (*child, id)) return found;
+            }
+            return nullptr;
+        };
+        auto* slider = findSlider (*editor.fxOverlay(), "fx_chorusDelay");
+        setP (p, "fx_chorusDelay", 60.0f); mm->runDispatchLoopUntil (80);
+        GestureTrace knob (p, "fx_chorusDelay");
+        const float before = p.apvts.getRawParameterValue ("fx_chorusDelay")->load();
+        if (slider != nullptr)
+        {
+            auto pt = slider->getScreenBounds().getCentre(); pt.y -= 15;
+            move (display, -1, pt.x, pt.y, 0); flushDisplay (display); mm->runDispatchLoopUntil (25);
+            button (display, 1, 1, 0); flushDisplay (display); mm->runDispatchLoopUntil (30);
+            move (display, -1, pt.x, pt.y - 45, 0); flushDisplay (display); mm->runDispatchLoopUntil (60);
+            button (display, 1, 0, 0); flushDisplay (display); mm->runDispatchLoopUntil (100);
+        }
+        const float after = p.apvts.getRawParameterValue ("fx_chorusDelay")->load();
+        check (slider != nullptr && std::fabs (before - after) > 1.0f && knob.balanced(),
+               "XTEST drag изменяет настоящий параметр Chorus DEL и сообщает жест хосту",
+               num (before, 1) + " -> " + num (after, 1) + " / " + knob.sequence());
+
+        // Real keyboard input into the numeric value beneath the knob.
+        juce::Label* valueLabel = nullptr;
+        if (slider != nullptr)
+            for (auto* child : slider->getChildren())
+                if (auto* label = dynamic_cast<juce::Label*> (child)) { valueLabel = label; break; }
+        knob.clear();
+        if (valueLabel != nullptr)
+        {
+            click (valueLabel->getScreenBounds().getCentre());
+            click (valueLabel->getScreenBounds().getCentre());
+            auto send = [&] (unsigned long sym, bool down) { keyEvent (display, keyCode (display, sym), down ? 1 : 0, 0); };
+            send (0xffe3, true); send ('a', true); send ('a', false); send (0xffe3, false); // Ctrl+A
+            send ('3', true); send ('3', false); send ('7', true); send ('7', false);
+            send (0xff0d, true); send (0xff0d, false); // Return
+            flushDisplay (display); mm->runDispatchLoopUntil (200);
+        }
+        const float typed = p.apvts.getRawParameterValue ("fx_chorusDelay")->load();
+        check (valueLabel != nullptr && std::fabs (typed - 37.0f) < 0.1f,
+               "значение Chorus DEL вводится с клавиатуры в поле под ручкой", num (typed, 1) + " / " + knob.sequence());
+
+        // New independent DRY uses percent display while the host parameter
+        // stays normalized. Enter 75 through the real X11 text field.
+        editor.showPage (60); setP (p, "fx_glitchDryLevel", -1.0f); mm->runDispatchLoopUntil (150);
+        auto* glitchDry = findSlider (*editor.fxOverlay(), "fx_glitchDryLevel");
+        juce::Label* dryLabel = nullptr;
+        if (glitchDry != nullptr) for (auto* child : glitchDry->getChildren())
+            if (auto* label = dynamic_cast<juce::Label*> (child)) { dryLabel = label; break; }
+        GestureTrace dryGesture (p, "fx_glitchDryLevel");
+        if (dryLabel != nullptr)
+        {
+            click (dryLabel->getScreenBounds().getCentre()); click (dryLabel->getScreenBounds().getCentre());
+            auto send = [&] (unsigned long sym, bool down) { keyEvent (display, keyCode (display, sym), down ? 1 : 0, 0); };
+            send (0xffe3, true); send ('a', true); send ('a', false); send (0xffe3, false);
+            send ('7', true); send ('7', false); send ('5', true); send ('5', false);
+            send (0xff0d, true); send (0xff0d, false); flushDisplay (display); mm->runDispatchLoopUntil (200);
+        }
+        const float dryTyped = p.apvts.getRawParameterValue ("fx_glitchDryLevel")->load();
+        check (dryLabel != nullptr && std::fabs (dryTyped - .75f) < .002f && dryGesture.balanced(),
+               "XTEST вводит GLITCH DRY 75% и передаёт host gesture", num (dryTyped, 3) + " / " + dryGesture.sequence());
+
+        // COMB contains more controls than fit in the viewport. Wheel-scroll
+        // to its last row and drag Wet dB, not merely check a hidden child.
+        editor.showPage (51); mm->runDispatchLoopUntil (100);
+        std::function<juce::Viewport* (juce::Component&)> findViewport;
+        findViewport = [&] (juce::Component& c) -> juce::Viewport* {
+            for (auto* child : c.getChildren()) {
+                if (auto* viewport = dynamic_cast<juce::Viewport*> (child)) return viewport;
+                if (auto* found = findViewport (*child)) return found;
+            }
+            return nullptr;
+        };
+        auto* viewport = findViewport (*editor.fxOverlay());
+        auto* wetDb = findSlider (*editor.fxOverlay(), "fx_combWetDb");
+        if (viewport != nullptr)
+        {
+            const auto bounds = viewport->getScreenBounds();
+            std::printf ("   COMB selected %d, view %dx%d, content %dx%d, scrollbar %d, Y %d\n",
+                         editor.fxRackSelectedModule(), viewport->getViewWidth(), viewport->getViewHeight(),
+                         viewport->getViewedComponent() != nullptr ? viewport->getViewedComponent()->getWidth() : -1,
+                         viewport->getViewedComponent() != nullptr ? viewport->getViewedComponent()->getHeight() : -1,
+                         (int) viewport->getVerticalScrollBar().isVisible(), viewport->getViewPositionY());
+            const auto scrollPos = viewport->getVerticalScrollBar().getScreenBounds().getCentre();
+            std::printf ("   viewport screen %d,%d %dx%d, scrollbar centre %d,%d\n",
+                         bounds.getX(), bounds.getY(), bounds.getWidth(), bounds.getHeight(), scrollPos.x, scrollPos.y);
+            move (display, -1, scrollPos.x, scrollPos.y, 0); flushDisplay (display); mm->runDispatchLoopUntil (80);
+            for (int i = 0; i < 30; ++i)
+            {
+                button (display, 5, 1, 0); button (display, 5, 0, 0);
+                flushDisplay (display); mm->runDispatchLoopUntil (15);
+            }
+            mm->runDispatchLoopUntil (150);
+        }
+        const bool scrolled = viewport != nullptr && viewport->getViewPositionY() > 0;
+        const bool lastVisible = viewport != nullptr && wetDb != nullptr
+            && viewport->getScreenBounds().intersects (wetDb->getScreenBounds());
+        setP (p, "fx_combWetDb", 0.0f); mm->runDispatchLoopUntil (80);
+        GestureTrace combWet (p, "fx_combWetDb");
+        if (lastVisible)
+        {
+            auto pt = wetDb->getScreenBounds().getCentre(); pt.y -= 15;
+            move (display, -1, pt.x, pt.y, 0); flushDisplay (display); mm->runDispatchLoopUntil (20);
+            button (display, 1, 1, 0); flushDisplay (display); mm->runDispatchLoopUntil (30);
+            move (display, -1, pt.x, pt.y - 40, 0); flushDisplay (display); mm->runDispatchLoopUntil (60);
+            button (display, 1, 0, 0); flushDisplay (display); mm->runDispatchLoopUntil (100);
+        }
+        const float wetValue = p.apvts.getRawParameterValue ("fx_combWetDb")->load();
+        check (scrolled && lastVisible && std::fabs (wetValue) > 0.1f && combWet.balanced(),
+               "колесо прокручивает длинный COMB к нижним настройкам и ручка работает",
+               juce::String ((int) scrolled) + "/" + juce::String ((int) lastVisible) + ", wet=" + num (wetValue, 1) + " / " + combWet.sequence());
+        auto* back = findButton (*editor.fxOverlay(), "<  SYNTH");
+        if (back) click (back->getScreenBounds().getCentre());
+        check (! editor.fxOverlay()->isVisible(), "кнопка SYNTH возвращает на главный экран");
+        editor.removeFromDesktop();
+    }
+    closeDisplay (display);
+   #endif
+}
+
 int main (int argc, char** argv)
 {
     // Голова без X11: GUI-инициализация здесь упала бы (нет дисплея), а
@@ -1731,6 +2640,22 @@ int main (int argc, char** argv)
     auto* mm = juce::MessageManager::getInstance();
     std::printf ("OROGEN test_plugin: старт\n");
     juce::ignoreUnused (mm);
+    if (argc > 1 && juce::String (argv[1]) == "--fx-scroll-only")
+    {
+        testNativeFxRack (true);
+        juce::DeletedAtShutdown::deleteAll();
+        juce::MessageManager::deleteInstance();
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "--fx-rack-only")
+    {
+        testFxRackStateAndMap();
+        testMonoFxProcessorAudio();
+        testNativeFxRack();
+        juce::DeletedAtShutdown::deleteAll();
+        juce::MessageManager::deleteInstance();
+        return failures == 0 ? 0 : 1;
+    }
     if (argc > 1 && juce::String (argv[1]) == "--delay-only")
     {
         testDelayProcessorRegression();
@@ -1779,9 +2704,32 @@ int main (int argc, char** argv)
         std::printf ("\nНативные метры GUI: провалов %d\n", failures);
         return failures == 0 ? 0 : 1;
     }
+    if (argc > 1 && juce::String (argv[1]) == "--gestures-only")
+    {
+        testHostGestureContracts();
+        testNativeVectorGesture();
+        juce::DeletedAtShutdown::deleteAll();
+        juce::MessageManager::deleteInstance();
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "--x11-engine-only")
+    {
+        testNativeEngineMenu (true);
+        juce::DeletedAtShutdown::deleteAll();
+        juce::MessageManager::deleteInstance();
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "--slot-ui-only")
+    {
+        testNativeSlotControls();
+        juce::DeletedAtShutdown::deleteAll();
+        juce::MessageManager::deleteInstance();
+        return failures == 0 ? 0 : 1;
+    }
     if (argc > 1 && juce::String (argv[1]) == "--gui-only")
     {
         testGuiRegressions();
+        testNativeSlotControls();
         juce::DeletedAtShutdown::deleteAll();
         juce::MessageManager::deleteInstance();
         std::printf ("\nGUI-регрессии: провалов %d\n", failures);
@@ -1795,7 +2743,9 @@ int main (int argc, char** argv)
         OrogenProcessor p;
         const int count = p.getParameters().size();
         std::printf ("   параметров: %d, программ: %d\n", count, p.getNumPrograms());
-        check (count == 306, "все параметры объявлены", num (count, 0));
+        int extraFxCount = 0; fxExtraParamTable (extraFxCount);
+        const int expectedCount = 306 + FxChain::ModuleCount + extraFxCount + 2 + 5;
+        check (count == expectedCount, "все параметры объявлены", num (count, 0));
 
         // Снимок последовательности ID rev21 до добавления Plate. Хэшируем
         // первые 294 ID с '\\n' между ними: даже перестановка не пройдёт.
@@ -1823,15 +2773,36 @@ int main (int argc, char** argv)
         }
         check (count >= 298 && legacyIdsPresent && legacyHash == 0x93f40b47085118c4ull,
                "порядок и ID всех 298 старых параметров сохранены");
-        bool reverseIds = count == 306;
-        for (int s = 0; s < 8 && count == 306; ++s)
+        bool reverseIds = count >= 306;
+        for (int s = 0; s < 8 && count >= 306; ++s)
         {
             const auto expected = slotPrefix (s) + "grainReverse";
             auto* prm = dynamic_cast<juce::RangedAudioParameter*> (p.getParameters()[298 + s]);
             reverseIds = reverseIds && prm != nullptr && prm->getParameterID() == expected
                          && std::fabs (prm->getDefaultValue()) < 1.0e-7f;
         }
-        check (reverseIds, "8 ID Grain Reverse добавлены в конец с default 0");
+        check (reverseIds, "8 ID Grain Reverse остались на индексах 298–305 с default 0");
+        for (int i = 298; i < 306 && i < count; ++i)
+        {
+            auto* prm = dynamic_cast<juce::AudioProcessorParameterWithID*> (p.getParameters()[i]);
+            if (prm == nullptr) { legacyIdsPresent = false; break; }
+            const auto id = prm->paramID + "\n";
+            for (const unsigned char* b = (const unsigned char*) id.toRawUTF8(); *b != 0; ++b)
+                legacyHash = (legacyHash ^ *b) * 1099511628211ull;
+        }
+        check (count >= 306 && legacyIdsPresent && legacyHash == 0x2fd7cb0d2217a1ecull,
+               "порядок и ID всех 306 прежних параметров сохранены");
+        bool fxIndices = count >= 338;
+        auto hasId = [&] (int index, const juce::String& id) {
+            if (index >= count) return false;
+            auto* prm = dynamic_cast<juce::AudioProcessorParameterWithID*> (p.getParameters()[index]);
+            return prm != nullptr && prm->paramID == id;
+        };
+        for (int i = 0; i < FxChain::ModuleCount; ++i) fxIndices = fxIndices && hasId (306 + i, kFxModules[i].onId);
+        const auto* legacyFxExtra = fxExtraParamTable (extraFxCount);
+        for (int i = 0; i < 17; ++i) fxIndices = fxIndices && hasId (319 + i, juce::String ("fx_") + legacyFxExtra[i].id);
+        fxIndices = fxIndices && hasId (336, "fx_plateDc") && hasId (337, "fx_combNegativeB");
+        check (fxIndices, "порядок всех первых 338 ID сохранён при добавлении ручек MonoHuice");
 
         juce::StringArray ids;
         bool allHaveId = true;
@@ -2362,6 +3333,7 @@ int main (int argc, char** argv)
         check (p.reportedLatency() == 1024, "базовая задержка = ROBIN 1024",
                num (p.reportedLatency(), 0));
 
+        setP (p, "fx_spectreOn", 1.0f);
         auto* sw = p.apvts.getParameter ("fx_spectreMix");
         sw->setValueNotifyingHost (1.0f);
         p.apvts.getParameter ("fx_spectreWindow")->setValueNotifyingHost (
@@ -2577,8 +3549,8 @@ int main (int argc, char** argv)
         check (dupes == 0, "в карте нет повторов", num ((double) dupes, 0));
         check (missing.isEmpty(), "каждый параметр APVTS есть в карте", num ((double) missing.size(), 0));
         check (extra.isEmpty(), "в карте нет несуществующих параметров", num ((double) extra.size(), 0));
-        check (mapIds.size() == apvtsIds.size() && apvtsIds.size() == 306,
-               "покрытие 306/306", juce::String (mapIds.size()) + " / " + juce::String (apvtsIds.size()));
+        check (mapIds.size() == apvtsIds.size() && apvtsIds.size() == p.getParameters().size(),
+               "покрытие всех параметров", juce::String (mapIds.size()) + " / " + juce::String (apvtsIds.size()));
 
         // --- управление в оверлее реально создаётся для каждого параметра ---
         juce::AudioProcessorEditor* ed = p.createEditor();
@@ -2752,6 +3724,7 @@ int main (int argc, char** argv)
             return renderWithSetup (p, 24000, sr, [=] (OrogenProcessor& pr)
             {
                 soloSlot (pr, 0, 0);
+                setP (pr, "fx_chorusOn", 1.0f);
                 setP (pr, "fx_chorusModel", 1.0f);      // Firmware OS 1.32B
                 setP (pr, "fx_chorusMix", 1.0f);
                 setP (pr, "fx_chorusDepth", 0.8f);
@@ -2783,6 +3756,7 @@ int main (int argc, char** argv)
             return renderWithSetup (p, 24000, sr, [=] (OrogenProcessor& pr)
             {
                 soloSlot (pr, 0, 0);
+                setP (pr, "fx_glitchOn", 1.0f);
                 setP (pr, "fx_glitchMix", 1.0f);
                 setP (pr, "fx_glitchChance", 1.0f);
                 setP (pr, "fx_glitchFeedback", fb);
@@ -2802,6 +3776,7 @@ int main (int argc, char** argv)
             return renderWithSetup (p, 24000, sr, [=] (OrogenProcessor& pr)
             {
                 soloSlot (pr, 0, 0);
+                setP (pr, "fx_spectreOn", 1.0f);
                 setP (pr, "fx_spectreMix", 1.0f);
                 setP (pr, "fx_spectreLow", lo);
                 setP (pr, "fx_spectreHigh", hi);
@@ -2839,13 +3814,15 @@ int main (int argc, char** argv)
         };
         constexpr int nCases = (int) (sizeof (cases) / sizeof (cases[0]));
 
-        // сухой сигнал: все миксы в ноль
+        // Test WIDTH using a genuinely stereo signal: a centred single
+        // wavetable is mono, for which width has no audible side component.
         auto dryRender = [&]
         {
             OrogenProcessor p;
             return renderWithSetup (p, 24000, sr, [] (OrogenProcessor& pr)
             {
                 soloSlot (pr, 0, 0);
+                setP (pr, "sA_pan", 0.45f);
                 for (const char* id : { "fx_drive", "fx_chorusMix", "fx_delayMix", "fx_reverbMix",
                                         "fx_plateMix", "fx_materialMix", "fx_spectreMix",
                                         "fx_glitchMix", "fx_robinMix", "fx_combMix",
@@ -2892,12 +3869,14 @@ int main (int argc, char** argv)
             auto b = renderWithSetup (p, 24000, sr, [&] (OrogenProcessor& pr)
             {
                 soloSlot (pr, 0, 0);
+                setP (pr, "sA_pan", 0.45f);
                 for (const char* id : { "fx_drive", "fx_chorusMix", "fx_delayMix", "fx_reverbMix",
                                         "fx_plateMix", "fx_materialMix", "fx_spectreMix",
                                         "fx_glitchMix", "fx_robinMix", "fx_combMix",
                                         "fx_eqLow", "fx_eqHigh", "fx_compThreshold" })
                     setP (pr, id, 0.0f);
                 setP (pr, "fx_width", 1.0f);
+                setP (pr, juce::String (cases[i].prefix) + "On", 1.0f);
                 setP (pr, cases[i].id, cases[i].value);
                 prepareFx (pr, cases[i].name);
             });
@@ -3290,7 +4269,7 @@ int main (int argc, char** argv)
                     juce::StringArray bad;
                     for (int i = 0; i < 5; ++i)
                     {
-                        const juce::String idS = ore->chipParamId (i);
+                        const juce::String idS = ore->chipPowerId (i);
                         const char* ids[1] = { idS.toRawUTF8() };
                         const juce::Point<float> chip (254.0f + 146.0f * (float) i + 60.0f, 615.0f);
                         // приводим смесь к нулю: тест проверяет именно жест, а не патч
@@ -3330,12 +4309,12 @@ int main (int argc, char** argv)
 
                     // чип второй страницы (GLITCH) обязан работать
                     ore->clickMain ({ 886.0f + 39.0f, 586.0f });         // на страницу 2
-                    if (auto* prm = p.apvts.getParameter ("fx_glitchMix"))
+                    if (auto* prm = p.apvts.getParameter ("fx_glitchOn"))
                         prm->setValueNotifyingHost (0.0f);
                     ore->clickMain ({ 254.0f + 146.0f * 2.0f + 60.0f, 615.0f });   // третий чип 2-й стр.
-                    const float gOn = norm ("fx_glitchMix");
+                    const float gOn = norm ("fx_glitchOn");
                     ore->clickMain ({ 254.0f + 146.0f * 2.0f + 60.0f, 615.0f });
-                    const float gOff = norm ("fx_glitchMix");
+                    const float gOff = norm ("fx_glitchOn");
                     std::printf ("   чип GLITCH со 2-й страницы: %.3f -> %.3f\n", (double) gOn, (double) gOff);
                     check (gOn > 0.01f && gOff < 0.01f, "чип со второй страницы включает эффект",
                            num ((double) gOn, 3));
@@ -3615,33 +4594,41 @@ int main (int argc, char** argv)
                     // банк — это список программ, поэтому проверяем через программу:
                     // сохраняем текущий патч как программу, затем возим банк туда-обратно
                     const auto quick = ore->quickBankFile();
-                    quick.deleteFile();
+                    // Никогда не удаляем/не перезаписываем реальный банк пользователя.
+                    // Для повторяемого теста задайте отдельный XDG_CONFIG_HOME.
+                    if (quick.exists())
+                    {
+                        check (false, "проверка быстрого банка: файл уже существует, данные не тронуты",
+                               quick.getFullPathName());
+                    }
+                    else
+                    {
+                        if (auto* pm = p.apvts.getParameter ("sB_cutoff"))
+                            pm->setValueNotifyingHost (0.8f);
+                        const int idx = ore->addProgramFromCurrent ("QUICK TEST");
 
-                    if (auto* pm = p.apvts.getParameter ("sB_cutoff"))
-                        pm->setValueNotifyingHost (0.8f);
-                    const int idx = ore->addProgramFromCurrent ("QUICK TEST");
+                        const bool saved = ore->saveBankQuick();
+                        const auto size = quick.getSize();
 
-                    const bool saved = ore->saveBankQuick();
-                    const auto size = quick.getSize();
+                        // портим патч и загружаем банк «одним пунктом меню»
+                        if (auto* pm = p.apvts.getParameter ("sB_cutoff"))
+                            pm->setValueNotifyingHost (0.1f);
+                        const float broken = p.apvts.getParameter ("sB_cutoff")->getValue();
 
-                    // портим патч и загружаем банк «одним пунктом меню»
-                    if (auto* pm = p.apvts.getParameter ("sB_cutoff"))
-                        pm->setValueNotifyingHost (0.1f);
-                    const float broken = p.apvts.getParameter ("sB_cutoff")->getValue();
+                        const bool loaded = ore->loadBankQuick();
+                        const int found = p.presetNames().indexOf ("QUICK TEST");
+                        if (found >= 0) p.setCurrentProgram (found);
+                        const float back = p.apvts.getParameter ("sB_cutoff")->getValue();
 
-                    const bool loaded = ore->loadBankQuick();
-                    const int found = p.presetNames().indexOf ("QUICK TEST");
-                    if (found >= 0) p.setCurrentProgram (found);
-                    const float back = p.apvts.getParameter ("sB_cutoff")->getValue();
-
-                    std::printf ("   быстрый банк: %s, %lld байт, программа #%d, sB_cutoff %.3f -> %.3f\n",
-                                 quick.getFullPathName().toRawUTF8(), (long long) size, found,
-                                 (double) broken, (double) back);
-                    check (saved && loaded && size > 1000 && found == idx
-                             && std::abs (back - 0.8f) < 0.02f,
-                           "быстрое сохранение и загрузка банка",
-                           num ((double) back, 3));
-                    quick.deleteFile();
+                        std::printf ("   быстрый банк: %s, %lld байт, программа #%d, sB_cutoff %.3f -> %.3f\n",
+                                     quick.getFullPathName().toRawUTF8(), (long long) size, found,
+                                     (double) broken, (double) back);
+                        check (saved && loaded && size > 1000 && found == idx
+                                 && std::abs (back - 0.8f) < 0.02f,
+                               "быстрое сохранение и загрузка банка",
+                               num ((double) back, 3));
+                        quick.deleteFile();
+                    }
                 }
 
                 // ---- 11. Анимации: фаза воспроизводима, кадры различаются ----
@@ -3790,23 +4777,33 @@ int main (int argc, char** argv)
                                 // звук каждого движка, выбранного мышью в селекторе
                                 juce::Array<juce::AudioBuffer<float>> audio;
                                 juce::Array<double> rms;
+                                int selectedByGui = 0;
                                 for (int t = 0; t < 9; ++t)
                                 {
                                     q.setPlayConfigDetails (0, 2, sr, 512);
                                     q.prepareToPlay (sr, 512);
                                     q.setCurrentProgram (0);
-                                    soloSlot (q, 0, t);
+                                    // Стартуем с ДРУГОГО типа, иначе тест мог
+                                    // засчитать звук, заранее заданный через APVTS,
+                                    // даже если селектор ничего не переключает.
+                                    soloSlot (q, 0, (t + 1) % 9);
+                                    juce::MessageManager::getInstance()->runDispatchLoopUntil (80);
+                                    const int before = eng->getSelectedItemIndex();
                                     eng->setSelectedItemIndex (t, juce::sendNotificationSync);
                                     const int typeFromParam = (int) std::lround (
                                         q.apvts.getParameter ("sA_type")->convertFrom0to1 (
                                             q.apvts.getParameter ("sA_type")->getValue()));
+                                    if (before == (t + 1) % 9 && typeFromParam == t) ++selectedByGui;
                                     juce::MessageManager::getInstance()->runDispatchLoopUntil (80);
                                     auto buf = renderBlocks (q, 20000, sr);
                                     audio.add (buf);
                                     rms.add (rmsOf (buf));
-                                    if (typeFromParam != t)
-                                        std::printf ("   [внимание] селектор %d, параметр %d\n", t, typeFromParam);
+                                    if (before != (t + 1) % 9 || typeFromParam != t)
+                                        std::printf ("   [внимание] до %d, селектор %d, параметр %d\n", before, t, typeFromParam);
                                 }
+                                check (selectedByGui == 9,
+                                       "все девять типов действительно переключены через GUI",
+                                       juce::String (selectedByGui) + " / 9");
 
                                 // все 36 пар должны отличаться (как в блоке 7, но через GUI)
                                 int pairs = 0, distinct = 0;
@@ -4019,6 +5016,10 @@ int main (int argc, char** argv)
     }
 
     testGuiRegressions();
+    testHostGestureContracts();
+    testNativeSlotControls();
+    testNativeVectorGesture();
+    testNativeEngineMenu();
     testNativeMeterPaint();
     testNativeAnimationPaint();
     testEditorControlLifetime();

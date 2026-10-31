@@ -563,11 +563,12 @@ void OrLookAndFeel::drawButtonBackground (juce::Graphics& g, juce::Button& b,
                                           const juce::Colour&, bool highlighted, bool down)
 {
     const auto r = b.getLocalBounds().toFloat().reduced (0.5f);
-    auto border = Palette::line;
+    const bool navigation = (bool) b.getProperties().getWithDefault ("nav", false);
+    auto border = navigation ? Palette::lineHi : Palette::line;
     if (b.getToggleState())            border = Palette::lineHi;
     if (highlighted || down)           border = Palette::lineHi;
 
-    draw::panel (g, r, 2.5f, down ? Palette::panelAlt : juce::Colours::transparentBlack, border);
+    draw::panel (g, r, 2.5f, down || navigation ? Palette::panelAlt : juce::Colours::transparentBlack, border);
 }
 
 void OrLookAndFeel::drawToggleButton (juce::Graphics& g, juce::ToggleButton& b,
@@ -594,9 +595,10 @@ juce::Font OrLookAndFeel::getLabelFont (juce::Label&)
     return orFont (9.5f);
 }
 
-juce::Font OrLookAndFeel::getTextButtonFont (juce::TextButton&, int)
+juce::Font OrLookAndFeel::getTextButtonFont (juce::TextButton& button, int)
 {
-    return orFont (9.0f);
+    const bool navigation = (bool) button.getProperties().getWithDefault ("nav", false);
+    return orFont (navigation ? 10.0f : 9.0f, navigation);
 }
 
 juce::Font OrLookAndFeel::getPopupMenuFont()

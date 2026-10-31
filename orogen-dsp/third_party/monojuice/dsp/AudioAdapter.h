@@ -17,6 +17,7 @@ public:
  // don't zipper. Steady state and reset() stay bit-exact with the DSP core.
  // Direct mode (pre-fix CHORUS v1): writes reach the core immediately.
  void setSmoothing(bool on) noexcept { if(smooth==on)return; smooth=on; if(!smooth){ current=target; core.setParametersF(current); } }
+ void setDelayZeroGuard(bool on) noexcept { core.setDelayZeroGuard(on); }
  void setParameters(const std::array<int,8>& p) noexcept { const auto f=floatParams(p); target=f; if(!smooth){ current=f; core.setParameters(p); } }
  void setParametersF(const std::array<float,8>& p) noexcept { auto f=p; for(auto& v:f)v=std::clamp(v,0.f,127.f); target=f; if(!smooth){ current=f; core.setParametersF(f); } }
  void processFrame(float inL,float inR,float& outL,float& outR,bool bypass) noexcept;

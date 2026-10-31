@@ -11,6 +11,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 
 namespace orogen {
 
@@ -26,6 +27,9 @@ public:
 
     void prepare (double sr, int voices = kMaxVoices)
     {
+        // Host must stop the audio callback during prepare. Serialize this with
+        // UI/state staging, which may otherwise be active on another thread.
+        const std::lock_guard<std::mutex> lock (stageMutex);
         sampleRate = sr;
         bank.build (sr);
         drainRetired();
@@ -49,6 +53,8 @@ public:
 
     void setSampleRate (double sr)
     {
+        // Like prepare(), this is a stopped-audio operation.
+        const std::lock_guard<std::mutex> lock (stageMutex);
         sampleRate = sr;
         for (auto& v : voices) v.setSampleRate (sr);
         fx.prepare (sr);
@@ -67,8 +73,10 @@ public:
     // setPatch()    — оба шага сразу, для стендов и тестов (один поток).
     void stagePatch (const Patch& p)
     {
-        patch = p;
-        for (auto& v : voices) v.stageSlots (patch, bank);
+        // Only producers take this lock; the audio callback never waits on it.
+        // The audio-owned patch must not be written from the staging thread.
+        const std::lock_guard<std::mutex> lock (stageMutex);
+        for (auto& v : voices) v.stageSlots (p, bank);
     }
 
     void applyPatch (const Patch& p) noexcept
@@ -80,7 +88,7 @@ public:
     void setPatch (const Patch& p)
     {
         stagePatch (p);
-        for (auto& v : voices) v.applyPendingEngines();
+        applyPatch (p);
     }
 
     // Заменённые движки живут в retire bin до drainRetired(). Если объект
@@ -92,6 +100,9 @@ public:
     // удалённых объектов (для тестов и диагностики).
     int drainRetired()
     {
+        // prepare/state calls and the UI timer can both request cleanup.
+        // The SPSC bin still has one consumer at a time; audio never locks.
+        const std::lock_guard<std::mutex> lock (retireMutex);
         int total = 0;
         void* buf[64];
         for (int n; (n = retireBin.drain (buf, 64)) > 0; )
@@ -129,7 +140,7 @@ public:
     Arpeggiator& arp() { return arpeggiator; }
     const Arpeggiator& arp() const { return arpeggiator; }
     void setArp (const ArpSettings& s) { arpeggiator.setSettings (s); }
-    void setTempo (double bpm) { arpeggiator.setBpm (bpm); }
+    void setTempo (double bpm) { arpeggiator.setBpm (bpm); fx.setTempo (bpm); }
 
     void noteOn (int note, float velocity)
     {
@@ -316,6 +327,8 @@ private:
     // deque, а не vector: Voice неперемещаемый (атомарный флаг подмены движков),
     // а deque никогда не переносит элементы — адреса стабильны.
     std::deque<Voice> voices;
+    std::mutex stageMutex;  // producers / stopped-audio setup only
+    std::mutex retireMutex; // serializes non-audio bin consumers
     Patch patch = patchInit();
     FxChain fx;
     FxChain::Settings fxSettings;

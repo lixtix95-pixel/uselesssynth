@@ -38,6 +38,10 @@ class EngineBase
 public:
     virtual ~EngineBase() = default;
 
+    // Written before publication to the audio thread; describes the prepared
+    // slot engine in the lock-free handoff. It is not a host parameter.
+    int preparedSlotType = -1;
+
     virtual const char* name() const = 0;
     virtual void setSampleRate (double sr) = 0;
     // Устойчивое значение ±1 для данной ноты/голоса. По умолчанию движки,

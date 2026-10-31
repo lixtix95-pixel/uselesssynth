@@ -53,9 +53,13 @@ public:
         noteRandom = clamp (value, -1.0f, 1.0f);
     }
 
-    // Отдельный seed направления не трогает генератор позиции и Spread.
-    // Самостоятельный Granular без голоса получает прежний поток (seed 0).
-    void setRandomStreamSeed (uint32_t seed) noexcept override { directionStreamSeed = seed; }
+    // Пара note-on/slot задаёт независимые потоки направления и Spread.
+    // Без вызова этого метода автономный Granular сохраняет старый поток.
+    void setRandomStreamSeed (uint32_t seed) noexcept override
+    {
+        streamSeed = seed;
+        hasStreamSeed = true;
+    }
 
     void start (int midiNote, float velocity) override
     {
@@ -68,8 +72,14 @@ public:
         for (auto& g : grains) g.active = false;
         needSnap = true;
         active = true;
+        // Базовый джиттер Position оставляем прежним: при Spread=0 старые
+        // проекты не меняются. Pitch Spread и дополнительный Position Spread
+        // получают свои потоки на ноту/слот; при отсутствии внешнего seed
+        // автономный стенд сохраняет прежнюю последовательность целиком.
         rng = Rng { 0x51F3A7u };
-        directionRng = Rng { 0xB79D31u ^ directionStreamSeed }; // независим от RNG позиции и питча
+        pitchSpreadRng = Rng { noteSlotStreamSeed (streamSeed ^ 0x6D2B79F5u, 0) };
+        positionSpreadRng = Rng { noteSlotStreamSeed (streamSeed ^ 0xA511E9B3u, 1) };
+        directionRng = Rng { 0xB79D31u ^ streamSeed };
     }
 
     void stop() override
@@ -187,8 +197,13 @@ private:
         for (auto& x : grains) if (! x.active) { g = &x; break; }
         if (g == nullptr) return;                       // все заняты — зерно пропускается
 
-        // питч зерна: базовый рейт ноты + случайный спред (до ±7 полутонов)
-        const float jitter = spread * 7.0f * rng.nextBipolar();
+        // Первую пробу старого потока потребляем всегда, чтобы последующий
+        // базовый Position-jitter не менялся при Spread=0. В Voice случайный
+        // pitch на слот/ноту отдельный; сам коэффициент Spread остаётся
+        // непрерывным при автоматизации от нуля.
+        const float legacyPitch = rng.nextBipolar();
+        const float randomPitch = hasStreamSeed ? pitchSpreadRng.nextBipolar() : legacyPitch;
+        const float jitter = spread * 7.0f * randomPitch;
         const float rate = baseRate * (float) std::pow (2.0, (double) jitter / 12.0);
 
         // Учитываем ВСЕ 32/64 отвода выбранного sinc, а не только центр.
@@ -220,8 +235,12 @@ private:
         // почти убивало влияние Position. На краях отражаем позицию обратно,
         // а не переносим маленький отрицательный джиттер на противоположный край.
         const float jitterRange = 0.5f * g->dur * rate;
-        const float posJit = rng.nextBipolar() * jitterRange
-                           + spread * 0.25f * rng.nextBipolar() * startRange;
+        // Порядок проб фиксирован явно. Базовый джиттер прежний, а добавка
+        // Spread различается по слоту и ноте; при нулевом Spread она равна 0.
+        const float basePosition = rng.nextBipolar();
+        const float legacySpread = rng.nextBipolar();
+        const float randomSpread = hasStreamSeed ? positionSpreadRng.nextBipolar() : legacySpread;
+        const float posJit = basePosition * jitterRange + spread * 0.25f * randomSpread * startRange;
         float positionInRange = posT * startRange + posJit;
         const float foldedRange = 2.0f * startRange;
         positionInRange = std::fmod (positionInRange, foldedRange);
@@ -249,17 +268,19 @@ private:
         // квадратом окна Ханна. Иначе тихая первая 10-мс ячейка поднимает
         // громкую атаку в середине того же зерна в несколько раз. Результат
         // вычисляется только при spawn, действующие зёрна не перенормируются.
-        // Не усиливаем затухающий участок сильнее прежнего: используем большее
-        // из RMS в начале и RMS под окном. Это не выходной лимитер.
+        // Не усиливаем переходы сильнее, чем допускают RMS на обоих краях
+        // и RMS под окном. Это не выходной лимитер.
         // Запись короче 10 мс не имеет ячеек env. envAt() в этом случае
         // возвращает условную единицу, а не RMS; из-за неё разница в один
         // отсчёт на границе 10 мс меняла gain зерна до 12 дБ. Для короткой
         // записи используем заранее рассчитанный RMS целого источника.
-        // В реверсе первая проба берётся с верхнего края. Проверяем и нижний:
-        // тихий старт не должен усилить громкую атаку на противоположном
-        // конце в несколько раз. Прямой путь остаётся побайтно прежним.
-        float local = shot->env.empty() ? bodyRms : shot->envAt (reverse ? (float) g->pos : pos);
-        if (reverse && ! shot->env.empty()) local = std::max (local, shot->envAt (pos));
+        // Одно и то же зерно с симметричным окном должно получать одинаковую
+        // компенсацию при прямом и обратном чтении. Проверяем ОБА края для
+        // обоих направлений: иначе тихий прямой старт может усилить громкую
+        // атаку на верхнем краю в четыре раза по сравнению с реверсом.
+        float local = shot->env.empty() ? bodyRms : shot->granularEnvAt ((double) pos);
+        if (! shot->env.empty())
+            local = std::max (local, shot->granularEnvAt (pos + readSpan));
         // Взвешивание Hann² обходит ячейки в порядке фактического чтения.
         if (! shot->env.empty() && shot->envStep > 0)
         {
@@ -286,7 +307,7 @@ private:
                 else
                 {
                     const float samplePhase = reverse ? 1.0f - phase : phase;
-                    const float env = shot->envAt (pos + samplePhase * readSpan);
+                    const float env = shot->granularEnvAt (pos + samplePhase * readSpan);
                     energy = (double) env * env;
                 }
                 const double weight = (double) window * window;
@@ -331,10 +352,12 @@ private:
     float  noteRandom = 0.5f;
     float  baseRate = 1.0f, spread = 0.0f, sizeSec = 0.08f, density = 20.0f, bodyRms = 1.0f;
     float  reverseChance = 0.0f;
-    uint32_t directionStreamSeed = 0;
+    uint32_t streamSeed = 0;
+    bool hasStreamSeed = false;
     float  spawnAcc = 0.0f, dcX = 0.0f, dcY = 0.0f, dcCoef = 0.999f;
     SmoothedValue posSm, sizeSm, gainSm;
     Rng rng { 0x51F3A7u }, directionRng { 0xB79D31u };
+    Rng pitchSpreadRng { 1u }, positionSpreadRng { 1u };
 };
 
 } // namespace orogen

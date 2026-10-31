@@ -133,6 +133,11 @@ private:
     // nullptr (это API только для параметров, созданных самим APVTS), поэтому
     // перечисления читаются через RangedAudioParameter::convertFrom0to1.
     std::array<juce::RangedAudioParameter*, 14> fxChoiceRefs { };
+    std::array<std::atomic<float>*, FxChain::ModuleCount> fxEnableRefs {};
+    std::vector<std::atomic<float>*> fxExtraRefs;
+    juce::RangedAudioParameter* fxPlateDcRef = nullptr;
+    juce::RangedAudioParameter* fxCombNegativeBRef = nullptr;
+    std::array<juce::RangedAudioParameter*, 5> fxMonoChoiceRefs {};
 
     // арпеджиатор: 5 перечислений (on, mode, div, octaves, latch) + 2 float
     std::array<juce::RangedAudioParameter*, 5> arpRefs { };

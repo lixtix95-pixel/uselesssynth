@@ -167,8 +167,8 @@ int main()
                   && response > 0 && response <= 600 && equalBits (firstControl, firstLive),
                   "автоматизация меняет только новые зёрна, без скачка текущего");
 
-    // Отдельно проверяем начало обратного прохода для компенсации огибающей:
-    // заведомо громкая последняя 10-мс ячейка не должна считаться тихим стартом.
+    // Проверяем компенсацию на двух крайних 10-мс ячейках: один и тот же
+    // громкий край учитывается независимо от направления чтения зерна.
     SampleBank envBank; envBank.shots.push_back (stationary (sr, 2.0));
     EngineParams ep; ep.p[0] = 0.4f; ep.p[1] = 1.0f; ep.p[2] = 0.0f;
     ep.p[3] = 0.0f; ep.detune = 0.0f;
@@ -193,8 +193,9 @@ int main()
     const auto a = GranularTestProbe::cursor (fwd, 0), b = GranularTestProbe::cursor (rev, 0);
     const double ampRatio = b.amp / std::max (1.0e-20, a.amp);
     std::printf ("   env на верхнем краю: amp reverse/forward %.6f\n", ampRatio);
-    suite::check (location.active && a.active && b.active && b.rate < 0.0 && ampRatio < 0.5,
-                  "компенсация учитывает фактическое начало обратного прохода");
+    suite::check (location.active && a.active && b.active && b.rate < 0.0
+                  && std::fabs (ampRatio - 1.0) < 0.01,
+                  "громкий верхний край одинаково учитывается в обоих направлениях");
 
     // Обратное зерно может закончиться на громкой атаке при тихом старте.
     // Окно Ханна ослабляет край, но компенсация не должна поднять всю
@@ -209,8 +210,9 @@ int main()
     const auto loudLowRev = GranularTestProbe::cursor (rev, 0);
     const double loudLowRatio = loudLowRev.amp / std::max (1.0e-20, loudLowFwd.amp);
     std::printf ("   env на нижнем краю: amp reverse/forward %.6f\n", loudLowRatio);
-    suite::check (loudLowFwd.active && loudLowRev.active && loudLowRev.rate < 0.0 && loudLowRatio <= 1.01,
-                  "реверс не усиливает громкий противоположный край зерна");
+    suite::check (loudLowFwd.active && loudLowRev.active && loudLowRev.rate < 0.0
+                  && std::fabs (loudLowRatio - 1.0) < 0.01,
+                  "громкий нижний край одинаково учитывается в обоих направлениях");
 
     std::printf ("\n=================================================\n%s (провалов: %d)\n",
                  suite::gFailures ? "ЕСТЬ ПРОВАЛЫ" : "ВСЕ ТЕСТЫ ПРОЙДЕНЫ", suite::gFailures);

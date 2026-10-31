@@ -81,6 +81,10 @@ struct OneShot
     // банка: средняя энергия произвольного отрезка затем считается за O(1),
     // без аллокаций и без пропуска коротких всплесков на длинных источниках.
     std::vector<double> envEnergyPrefix;
+    // Последняя неполная 10-мс ячейка хранится отдельно: старый env и
+    // bodyRms остаются неизменными для остальных движков и старых проектов.
+    float envTailRms = 0.0f;
+    size_t envTailSamples = 0;
 
     // Медиана огибающей по первым 60 % (атака и хвост не в счёт), считается
     // ОДИН РАЗ при сборке банка. Раньше она считалась в bodyLevel() на каждый
@@ -96,6 +100,16 @@ struct OneShot
         return env[(size_t) i];
     }
 
+    // Только Granular использует хвост при компенсации зёрен. Обычный envAt
+    // не меняется: другие движки сохраняют прежнее поведение.
+    inline float granularEnvAt (double pos) const noexcept
+    {
+        if (envTailSamples > 0 && ! env.empty() && envStep > 0
+            && pos >= (double) env.size() * (double) envStep)
+            return envTailRms;
+        return envAt ((float) pos);
+    }
+
     inline double meanEnvEnergy (double from, double to) const noexcept
     {
         if (env.empty()) return 1.0;
@@ -104,12 +118,17 @@ struct OneShot
         // должен читать неинициализированный префикс: остаётся прежняя проба.
         if (envEnergyPrefix.size() != env.size() + 1 || to <= from)
         {
-            const double v = envAt ((float) ((from + to) * 0.5));
+            const double v = granularEnvAt ((from + to) * 0.5);
             return v * v;
         }
         const auto integral = [this] (double x) noexcept {
             const double first = env.front(), last = env.back();
             if (x <= 0.0) return x * first * first;
+            // Когда есть неполная финальная ячейка, её энергия начинается
+            // ПОСЛЕ всех полных, а не продолжается значением предыдущей.
+            if (envTailSamples > 0 && x >= (double) env.size())
+                return envEnergyPrefix[env.size()] + (x - (double) env.size())
+                     * (double) envTailRms * envTailRms;
             const size_t lastIndex = env.size() - 1;
             if (x >= (double) lastIndex)
                 return envEnergyPrefix[lastIndex] + (x - (double) lastIndex) * last * last;
@@ -132,6 +151,8 @@ inline void computeEnvelope (OneShot& s, double sr = kSampleRate)
     const auto& l0 = s.levels[0];
     s.env.clear();
     s.envEnergyPrefix.clear();
+    s.envTailRms = 0.0f;
+    s.envTailSamples = 0;
     if (l0.empty() || s.envStep <= 0) return;
     s.env.reserve (l0.size() / (size_t) s.envStep + 1);
     for (size_t p = 0; p + (size_t) s.envStep <= l0.size(); p += (size_t) s.envStep)
@@ -150,6 +171,17 @@ inline void computeEnvelope (OneShot& s, double sr = kSampleRate)
         for (float v : l0) acc += (double) v * v;
         s.bodyRms = std::max (1.0e-4f, (float) std::sqrt (acc / std::max<size_t> (1, l0.size())));
         return;
+    }
+
+    // RMS неполной ячейки считаем один раз при построении банка, не в
+    // аудиопотоке. Полные ячейки, медиану и точки петли не трогаем.
+    const size_t tailStart = s.env.size() * (size_t) s.envStep;
+    s.envTailSamples = l0.size() - tailStart;
+    if (s.envTailSamples > 0)
+    {
+        double acc = 0.0;
+        for (size_t i = tailStart; i < l0.size(); ++i) acc += (double) l0[i] * l0[i];
+        s.envTailRms = (float) std::sqrt (acc / (double) s.envTailSamples);
     }
 
     s.envEnergyPrefix.resize (s.env.size() + 1, 0.0);

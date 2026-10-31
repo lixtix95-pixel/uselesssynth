@@ -1,7 +1,7 @@
 // Карта «параметр → место в интерфейсе».
 //
 // Единственное место, где сказано, на какой странице и в какой секции живёт
-// каждый из 306 параметров. Редактор строит по ней оверлеи, а тест
+// каждый параметр. Редактор строит по ней оверлеи, а тест
 // (tests/test_plugin.cpp, блок 9) проверяет, что покрытие полное: каждый
 // параметр APVTS встречается в карте ровно один раз. Так «забытый» параметр
 // ловится тестом, а не пользователем.
@@ -34,7 +34,9 @@ namespace detail
                  "fx_spectreModel", "fx_spectreWindow", "fx_spectrePeaks",
                  "fx_spectreWidth", "fx_spectreFreeze",
                  "fx_combModel", "fx_combRouting", "fx_combNegative",
-                 "fx_combOversample", "fx_combMidSide", "fx_materialFollow" };
+                 "fx_combOversample", "fx_combMidSide", "fx_materialFollow",
+                 "fx_plateDc", "fx_combNegativeB", "fx_chorusMode", "fx_glitchTimingMode",
+                 "fx_glitchSync", "fx_glitchDivision", "fx_glitchHighpass" };
     }
 
     // Секция эффекта по префиксу параметра. Порядок правил важен: первый
@@ -99,6 +101,10 @@ inline std::vector<UiTab> buildUiTabs()
         UiTab tab { "FX", {} };
         juce::StringArray all = detail::fxChoiceIds();
         for (int i = 0; i < fxCount; ++i) all.add (juce::String ("fx_") + fxTable[i].id);
+        for (const auto& module : kFxModules) all.add (module.onId);
+        int extraCount = 0;
+        const auto* extra = fxExtraParamTable (extraCount);
+        for (int i = 0; i < extraCount; ++i) all.add (juce::String ("fx_") + extra[i].id);
 
         juce::StringArray titles;
         for (const auto& id : all)

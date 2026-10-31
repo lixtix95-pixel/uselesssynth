@@ -165,13 +165,24 @@ public:
         dcX1L = dcY1L = dcX1R = dcY1R = 0.0f;
         preGain = preGainSm = 1.0f;
         postGainSm = outLevel = 1.0f;
+        gainNeedsSnap = true;
         inRms = outRms = 0.0f;
         up.reset(); down.reset();
         wdf.reset();
     }
 
     // amount 0..1 — предгейн в диапазоне профиля модели
-    void setAmount (float a) { amount = clamp (a, 0.0f, 1.0f); updateGains (true); }
+    void setAmount (float a)
+    {
+        const float next = clamp (a, 0.0f, 1.0f);
+        // FxChain::set() also runs when another effect's power/parameter
+        // changes. Re-snapping the adaptive output gain for an unchanged
+        // amount caused a discontinuity even though Drive was not edited.
+        if (next == amount && ! gainNeedsSnap) return;
+        amount = next;
+        updateGains (true);
+        gainNeedsSnap = false;
+    }
     // tone -1..+1 — наклон ±8 дБ вокруг toneSplitHz профиля
     void setTone (float t) { tone = clamp (t, -1.0f, 1.0f); }
     void setMix (float m) { mix = clamp (m, 0.0f, 1.0f); }
@@ -183,6 +194,7 @@ public:
         toneCoef = 1.0f - std::exp (-kTwoPi * toneSplit / (float) sr);
         wdf.setDrive (amount);
         updateGains (true);
+        gainNeedsSnap = false;
     }
     DriveModel getModel() const { return model; }
 
@@ -372,6 +384,7 @@ private:
     DriveModel model = DriveModel::Tanh;
     double sr = 48000.0;
     float amount = 0.35f, tone = 0.0f, mix = 1.0f;
+    bool gainNeedsSnap = true;
     float preGain = 1.0f, preGainSm = 1.0f, postGainSm = 1.0f, outLevel = 1.0f;
     float toneSplit = 800.0f, toneCoef = 0.1f, gainCoef = 0.001f;
     float toneLowL = 0.0f, toneLowR = 0.0f;

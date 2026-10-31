@@ -29,19 +29,19 @@ namespace
     // Все эффекты, у которых есть ручка доли (mix): 10 штук, по 5 на страницу.
     // EQ, DYNAMICS и WIDTH доли не имеют — они всегда в цепи и правятся в
     // колонке FX CHAIN, поэтому чипов у них нет.
-    struct ChipDef { const char* name; int glyph; const char* id; float onValue; };
+    struct ChipDef { const char* name; int glyph; const char* id; const char* onId; };
     const ChipDef kChips[] =
     {
-        { "DRIVE",   0, "fx_drive",       0.45f },
-        { "CHORUS",  1, "fx_chorusMix",   0.50f },
-        { "DELAY",   2, "fx_delayMix",    0.40f },
-        { "REVERB",  3, "fx_reverbMix",   0.35f },
-        { "PLATE",   3, "fx_plateMix",    0.40f },
-        { "MATERIAL",4, "fx_materialMix", 0.45f },
-        { "SPECTRE", 5, "fx_spectreMix",  0.50f },
-        { "GLITCH",  6, "fx_glitchMix",   0.40f },
-        { "ROBIN",   7, "fx_robinMix",    0.45f },
-        { "COMB",    8, "fx_combMix",     0.45f }
+        { "DRIVE",   0, "fx_drive",       "fx_driveOn" },
+        { "CHORUS",  1, "fx_chorusMix",   "fx_chorusOn" },
+        { "DELAY",   2, "fx_delayMix",    "fx_delayOn" },
+        { "REVERB",  3, "fx_reverbMix",   "fx_reverbOn" },
+        { "PLATE",   3, "fx_plateMix",    "fx_plateOn" },
+        { "MATERIAL",4, "fx_materialMix", "fx_materialOn" },
+        { "SPECTRE", 5, "fx_spectreMix",  "fx_spectreOn" },
+        { "GLITCH",  6, "fx_glitchMix",   "fx_glitchOn" },
+        { "ROBIN",   7, "fx_robinMix",    "fx_robinOn" },
+        { "COMB",    8, "fx_combMix",     "fx_combOn" }
     };
     constexpr int kChipTotal = (int) (sizeof (kChips) / sizeof (kChips[0]));
     constexpr int kChipsPerPage = 5;
@@ -235,11 +235,24 @@ public:
         tune.setTextBoxStyle (juce::Slider::NoTextBox, true, 0, 0);
         addAndMakeVisible (level);
         addAndMakeVisible (tune);
+        // Дочерние контролы сами получают mouseDown и не передают его
+        // родительской карточке. Следим за ними как MouseListener: нажатие
+        // ON/LEVEL/TUNE выбирает этот же слот, не отменяя действие контрола.
+        onToggle.addMouseListener (this, false);
+        level.addMouseListener (this, false);
+        tune.addMouseListener (this, false);
 
         levelAtt = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
             p.apvts, pre + "level", level);
         tuneAtt = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
             p.apvts, pre + "tune", tune);
+    }
+
+    ~SlotCard() override
+    {
+        onToggle.removeMouseListener (this);
+        level.removeMouseListener (this);
+        tune.removeMouseListener (this);
     }
 
     void mouseDown (const juce::MouseEvent&) override { if (selectFn) selectFn (idx); }
@@ -651,6 +664,7 @@ class OrogenEditor::VectorPad : public juce::Component
 {
 public:
     explicit VectorPad (OrogenProcessor& p) : proc (p) {}
+    ~VectorPad() override { finishGesture(); }
 
     void setAnimPhase (float p) { animPhase = p; }
 
@@ -696,8 +710,24 @@ public:
                        Palette::textFaint, 6.5f, juce::Justification::centred);
     }
 
-    void mouseDown (const juce::MouseEvent& e) override { apply (e.position); }
-    void mouseDrag (const juce::MouseEvent& e) override { apply (e.position); }
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        finishGesture();
+        gesturing = true;
+        if (auto* pm = proc.apvts.getParameter ("gl_morph")) pm->beginChangeGesture();
+        if (auto* pg = proc.apvts.getParameter ("gl_glide")) pg->beginChangeGesture();
+        apply (e.position);
+    }
+    void mouseDrag (const juce::MouseEvent& e) override { if (gesturing) apply (e.position); }
+    void mouseUp (const juce::MouseEvent&) override { finishGesture(); }
+
+    void finishGesture()
+    {
+        if (! gesturing) return;
+        gesturing = false;
+        if (auto* pm = proc.apvts.getParameter ("gl_morph")) pm->endChangeGesture();
+        if (auto* pg = proc.apvts.getParameter ("gl_glide")) pg->endChangeGesture();
+    }
 
     float animPhase = 0.0f;
 
@@ -716,6 +746,507 @@ private:
     }
 
     OrogenProcessor& proc;
+    bool gesturing = false;
+};
+
+//============================================================================
+// Dedicated effects rack: the left column is the real, fixed DSP order. Power
+// and every control are APVTS attachments, including the extended COMB controls.
+//============================================================================
+class OrogenEditor::FxPage : public juce::Component
+{
+    class RackLookAndFeel : public OrLookAndFeel
+    {
+    public:
+        juce::Font getComboBoxFont (juce::ComboBox&) override { return orFont (12.0f); }
+        juce::Font getLabelFont (juce::Label&) override { return orFont (12.0f); }
+        juce::Font getTextButtonFont (juce::TextButton&, int) override { return orFont (12.0f, true); }
+    };
+    class PowerButton : public juce::Button
+    {
+    public:
+        explicit PowerButton (const juce::String& name) : juce::Button (name)
+        {
+            setClickingTogglesState (true);
+            setTooltip ("Switch this effect on or off; its settings are retained");
+        }
+        void paintButton (juce::Graphics& g, bool over, bool down) override
+        {
+            const bool on = getToggleState();
+            auto box = getLocalBounds().toFloat().reduced (0.5f);
+            draw::panel (g, box, 3.0f, on ? juce::Colour (0xff272727) : Palette::panel,
+                         on || over || down ? Palette::lineHi : Palette::lineMid);
+            const float sz = juce::jmax (8.0f, juce::jmin (12.0f, box.getHeight() * 0.32f));
+            draw::led (g, { box.getX() + box.getHeight() * 0.34f, box.getCentreY() },
+                       juce::jmax (2.0f, box.getHeight() * 0.085f), on);
+            g.setColour (on ? Palette::text : Palette::paramLabel);
+            g.setFont (orFont (sz, true));
+            g.drawText (on ? "ON" : "OFF", box.withTrimmedLeft (box.getHeight() * 0.47f).toNearestInt(),
+                        juce::Justification::centred, false);
+        }
+    };
+
+    class SelectButton : public juce::Button
+    {
+    public:
+        SelectButton (int n, const juce::String& title) : juce::Button (title), number (n) {}
+        void setSelected (bool b) { selected = b; repaint(); }
+        void paintButton (juce::Graphics& g, bool over, bool down) override
+        {
+            auto box = getLocalBounds().toFloat().reduced (0.5f);
+            draw::panel (g, box, 3.0f, selected ? juce::Colour (0xff1b1b1b)
+                                                : over || down ? Palette::panelAlt : Palette::panel,
+                         selected ? Palette::lineHi : Palette::line);
+            const float scale = juce::jlimit (0.70f, 2.0f, box.getHeight() / 39.0f);
+            if (selected)
+            {
+                g.setColour (Palette::text);
+                g.fillRoundedRectangle (box.getX() + 1.0f, box.getY() + 7.0f * scale,
+                                        2.0f * scale, box.getHeight() - 14.0f * scale, 1.0f);
+            }
+            g.setColour (Palette::textFaint);
+            g.setFont (orFont (10.0f * scale));
+            g.drawText (juce::String (number + 1).paddedLeft ('0', 2),
+                        juce::Rectangle<float> (box.getX() + 10 * scale, box.getY(), 23 * scale, box.getHeight()),
+                        juce::Justification::centredLeft, false);
+            g.setColour (selected ? Palette::text : Palette::paramLabel);
+            g.setFont (orFont (12.0f * scale, selected));
+            g.drawText (getButtonText(),
+                        juce::Rectangle<float> (box.getX() + 34 * scale, box.getY(),
+                                                box.getWidth() - 42 * scale, box.getHeight()),
+                        juce::Justification::centredLeft, false);
+        }
+    private:
+        int number;
+        bool selected = false;
+    };
+
+    class Control : public juce::Component
+    {
+    public:
+        Control (OrogenProcessor& p, const juce::String& paramId, const juce::String& group)
+            : id (paramId)
+        {
+            auto* param = p.apvts.getParameter (id);
+            if (param == nullptr) return;
+            label = param->getName (80);
+            // Show the actual unit/routing hints rather than cryptic host IDs.
+            if (id == "fx_combTapA") label = "TAP A";
+            if (id == "fx_combTapB") label = "TAP B";
+            if (id == "fx_combTapC") label = "TAP C";
+            if (id == "fx_combTapD") label = "TAP D";
+            if (id == "fx_combNegative") label = "NEGATIVE A";
+            if (id == "fx_combNegativeB") label = "NEGATIVE B";
+            if (id == "fx_chorusDelay") label = "DELAY / DEL";
+            if (id == "fx_chorusDepth") label = "DEPTH / DEP";
+            if (id == "fx_chorusRate") label = "RATE / SPD";
+            if (id == "fx_chorusMix") label = "MIX";
+            if (id == "fx_chorusFeedback") label = "FEEDBACK / FB";
+            if (id == "fx_chorusWidth") label = "WIDTH / WID";
+            if (id == "fx_chorusLowpass") label = "LOWPASS / LP";
+            if (id == "fx_chorusInput") label = "INPUT / INP";
+            if (id == "fx_glitchLengthMs") label = "LENGTH / MS";
+            if (id == "fx_glitchRepeats") label = "REPEATS";
+            if (id == "fx_glitchReverse") label = "REVERSE";
+            if (id == "fx_glitchFeedback") label = "FEEDBACK";
+            if (id == "fx_spectreWindow") label = "WINDOW / SAMPLES";
+            if (id == "fx_spectreWindowExt") label = "WINDOW EXT / SAMPLES";
+            // Drop redundant group names to leave more room for meaningful text.
+            if (label.startsWithIgnoreCase (group + " ")) label = label.substring (group.length() + 1);
+            label = label.toUpperCase();
+            auto tip = param->getName (80) + " / " + id;
+            if (id.startsWith ("fx_combTap")) tip += " / -1 follows the shared delay";
+            if (id == "fx_combNegativeB") tip += " / Follow A preserves the original link";
+            if (id.endsWith ("Ext") || id == "fx_glitchDryLevel" || id == "fx_glitchWetLevel")
+                tip += " / FOLLOW uses the original parameter; type FOLLOW or double-click to reset";
+            if (id == "fx_spectreWindowExt") tip += " / 512 to 65536 samples";
+            if (id == "fx_chorusMode") tip += " / Legacy preserves old OROGEN; V1 internal mix; V2 external mix";
+            if (id == "fx_glitchTimingMode") tip += " / Host rate is correct; Legacy preserves old OROGEN timing";
+            getProperties().set ("paramId", id);
+            if (auto* choice = dynamic_cast<juce::AudioParameterChoice*> (param))
+            {
+                combo = std::make_unique<juce::ComboBox>();
+                int n = 1;
+                for (const auto& item : choice->getAllValueStrings()) combo->addItem (item, n++);
+                combo->setTooltip (tip);
+                combo->getProperties().set ("paramId", id);
+                addAndMakeVisible (*combo);
+                comboAtt = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (p.apvts, id, *combo);
+                if (id == "fx_chorusModel") combo->onChange = [this] { if (onModelChanged) onModelChanged(); };
+            }
+            else if (dynamic_cast<juce::AudioParameterBool*> (param) != nullptr)
+            {
+                toggle = std::make_unique<PowerButton> (id);
+                toggle->setTooltip (tip);
+                toggle->getProperties().set ("paramId", id);
+                addAndMakeVisible (*toggle);
+                buttonAtt = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (p.apvts, id, *toggle);
+            }
+            else
+            {
+                slider = std::make_unique<juce::Slider> (juce::Slider::RotaryHorizontalVerticalDrag,
+                                                        juce::Slider::TextBoxBelow);
+                slider->setTextBoxStyle (juce::Slider::TextBoxBelow, false, 94, 20);
+                slider->setColour (juce::Slider::textBoxTextColourId, Palette::text);
+                slider->setColour (juce::Slider::textBoxBackgroundColourId, Palette::bg);
+                slider->setColour (juce::Slider::textBoxOutlineColourId, Palette::lineMid);
+                slider->setColour (juce::Slider::textBoxHighlightColourId, Palette::lineMid);
+                slider->setTooltip (tip + " / Drag to adjust, double-click value to type");
+                slider->getProperties().set ("paramId", id);
+                slider->getProperties().set ("big", true);
+                addAndMakeVisible (*slider);
+                sliderAtt = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (p.apvts, id, *slider);
+                if (id.endsWith ("Ext") || id.startsWith ("fx_combTap") || id == "fx_glitchDryLevel" || id == "fx_glitchWetLevel")
+                {
+                    const double follow = param->convertFrom0to1 (param->getDefaultValue());
+                    slider->textFromValueFunction = [param, paramId, follow] (double value) {
+                        bool follows = value <= follow + 0.00001;
+                        if (paramId == "fx_glitchDryLevel" || paramId == "fx_glitchWetLevel"
+                            || (paramId.endsWith ("Ext") && follow == -1.0)) follows = value < 0.0;
+                        if (follows) return juce::String ("FOLLOW");
+                        if (paramId == "fx_spectreWindowExt") return juce::String (512 << juce::jlimit (0, 7, (int) std::lround (value)));
+                        if (paramId == "fx_glitchDryLevel" || paramId == "fx_glitchWetLevel")
+                            return juce::String (value * 100.0, 1) + " %";
+                        return param->getText (param->convertTo0to1 ((float) value), 0);
+                    };
+                    slider->valueFromTextFunction = [param, paramId, follow] (const juce::String& text) {
+                        if (text.trim().equalsIgnoreCase ("FOLLOW")) return follow;
+                        if (paramId == "fx_glitchDryLevel" || paramId == "fx_glitchWetLevel")
+                            return juce::jlimit (0.0, 100.0, text.getDoubleValue()) * 0.01;
+                        if (paramId == "fx_spectreWindowExt") {
+                            const double n = text.getDoubleValue();
+                            return n >= 512 ? (double) juce::jlimit (0, 7, (int) std::lround (std::log2 (n / 512.0)))
+                                            : (double) juce::jlimit (0, 7, (int) std::lround (n));
+                        }
+                        return (double) param->convertFrom0to1 (param->getValueForText (text));
+                    };
+                    slider->updateText();
+                }
+                if (id == "fx_spectreWindow")
+                {
+                    slider->textFromValueFunction = [] (double value) { return juce::String (512 << juce::jlimit (0, 6, (int) std::lround (value))); };
+                    slider->valueFromTextFunction = [] (const juce::String& text) {
+                        const double n = text.getDoubleValue();
+                        return n >= 512 ? (double) juce::jlimit (0, 6, (int) std::lround (std::log2 (n / 512.0)))
+                                        : (double) juce::jlimit (0, 6, (int) std::lround (n));
+                    };
+                    slider->setTooltip (tip + " / 512–32768 samples; use WINDOW EXTENDED for 65536");
+                    slider->updateText();
+                }
+                if (id == "fx_combOdinMix" || id == "fx_combBalance" || id == "fx_combMix"
+                    || id == "fx_glitchMix" || id == "fx_glitchChance" || id == "fx_glitchReverse"
+                    || id == "fx_glitchFeedback" || id == "fx_spectreMix")
+                {
+                    const double scale = id == "fx_glitchFeedback" ? 95.0 : 100.0;
+                    slider->textFromValueFunction = [scale] (double value) { return juce::String (value * scale, 1) + " %"; };
+                    slider->valueFromTextFunction = [scale] (const juce::String& text) { return juce::jlimit (0.0, scale, text.getDoubleValue()) / scale; };
+                    slider->updateText();
+                }
+                if (id == "fx_chorusDepth" || id == "fx_chorusRate" || id == "fx_chorusMix")
+                {
+                    auto* model = p.apvts.getParameter ("fx_chorusModel");
+                    const double scale = id == "fx_chorusRate" ? 63.5 : 127.0;
+                    slider->textFromValueFunction = [param, model, scale] (double value) {
+                        const bool firmware = model != nullptr && model->convertFrom0to1 (model->getValue()) > 0.5f;
+                        return firmware ? juce::String ((int) std::lround (value * scale))
+                                        : param->getText (param->convertTo0to1 ((float) value), 0);
+                    };
+                    slider->valueFromTextFunction = [param, model, scale] (const juce::String& text) {
+                        const bool firmware = model != nullptr && model->convertFrom0to1 (model->getValue()) > 0.5f;
+                        return firmware ? juce::jlimit (0.0, 127.0, text.getDoubleValue()) / scale
+                                        : (double) param->convertFrom0to1 (param->getValueForText (text));
+                    };
+                    slider->setTooltip (tip + " / Firmware model displays and accepts 0–127");
+                    slider->updateText();
+                }
+            }
+        }
+        void resized() override
+        {
+            const float s = juce::jlimit (0.70f, 2.0f, (float) getHeight() / 130.0f);
+            if (slider != nullptr)
+                slider->setBounds (getLocalBounds().withTrimmedTop (juce::roundToInt (25 * s)).reduced (juce::roundToInt (8 * s), 0));
+            if (combo != nullptr)
+                combo->setBounds (getLocalBounds().withTrimmedTop (juce::roundToInt (45 * s))
+                                   .withHeight (juce::roundToInt (32 * s)).reduced (juce::roundToInt (7 * s), 0));
+            if (toggle != nullptr)
+                toggle->setBounds (getLocalBounds().withTrimmedTop (juce::roundToInt (45 * s))
+                                    .withHeight (juce::roundToInt (32 * s)).reduced (juce::roundToInt (22 * s), 0));
+        }
+        void paint (juce::Graphics& g) override
+        {
+            const float s = juce::jlimit (0.70f, 2.0f, (float) getHeight() / 130.0f);
+            g.setColour (Palette::paramLabel);
+            g.setFont (orFont (11.0f * s, true));
+            g.drawFittedText (label, getLocalBounds().removeFromTop (juce::roundToInt (24 * s)).reduced (2, 0),
+                              juce::Justification::centred, 2, 0.88f);
+        }
+        void refreshText() { if (slider != nullptr) slider->updateText(); }
+        std::function<void()> onModelChanged;
+        juce::String id;
+    private:
+        juce::String label;
+        std::unique_ptr<juce::Slider> slider;
+        std::unique_ptr<juce::ComboBox> combo;
+        std::unique_ptr<PowerButton> toggle;
+        std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> sliderAtt;
+        std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> comboAtt;
+        std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> buttonAtt;
+    };
+
+    class Content : public juce::Component
+    {
+    public:
+        Content (OrogenProcessor& proc, int module, const UiSection& section) : index (module)
+        {
+            // Group model-dependent controls explicitly. The parameters remain
+            // editable when inactive so a model can be prepared before switching.
+            if (module == FxChain::Comb)
+                groups = { "COMMON / BOTH MODELS", "ODIN MODEL ONLY", "PARALLEL MODEL ONLY / TAP FOLLOW = SHARED DELAY",
+                           "EXTENDED RANGES / FOLLOW = ORIGINAL CONTROL" };
+            else if (module == FxChain::Spectre)
+                groups = { "COMMON / BOTH MODELS", "EXTENDED MODEL ONLY", "EXTENDED RANGES / FOLLOW = ORIGINAL CONTROL" };
+            else if (module == FxChain::Glitch)
+                groups = { "MIX & TIMING", "STUTTER", "FILTER & SHAPING", "PER-REPEAT VARIATION" };
+            else
+                groups = { "CONTROLS" };
+            controls.resize (groups.size());
+            for (const auto& id : section.ids)
+            {
+                if (id == kFxModules[module].onId) continue; // visible power in the sidebar/header
+                int group = 0;
+                if (module == FxChain::Comb)
+                {
+                    static const juce::StringArray shared { "fx_combModel", "fx_combMix", "fx_combDriveDb",
+                        "fx_combOutputDb", "fx_combDepth", "fx_combRate", "fx_combEnvelope", "fx_combDecayMs" };
+                    static const juce::StringArray odin { "fx_combFreqA", "fx_combFreqB", "fx_combResA", "fx_combResB",
+                        "fx_combBalance", "fx_combRouting", "fx_combNegative", "fx_combNegativeB" };
+                    group = id.endsWith ("Ext") ? 3 : shared.contains (id) ? 0
+                            : (odin.contains (id) || id == "fx_combOdinMix") ? 1 : 2;
+                }
+                else if (module == FxChain::Spectre)
+                {
+                    static const juce::StringArray common { "fx_spectreModel", "fx_spectreMix", "fx_spectreWindow", "fx_spectreProminence" };
+                    group = id.endsWith ("Ext") ? 2 : common.contains (id) ? 0 : 1;
+                }
+                else if (module == FxChain::Glitch)
+                {
+                    static const juce::StringArray mixTiming { "fx_glitchMix", "fx_glitchDryLevel", "fx_glitchWetLevel", "fx_glitchTimingMode", "fx_glitchSync", "fx_glitchDivision", "fx_glitchLengthMs", "fx_glitchLengthExt" };
+                    static const juce::StringArray variation { "fx_glitchDrift", "fx_glitchPitchStep", "fx_glitchPitchRandom", "fx_glitchReroll", "fx_glitchDecay" };
+                    static const juce::StringArray shaping { "fx_glitchFold", "fx_glitchFoldDrive", "fx_glitchTone", "fx_glitchHighpass", "fx_glitchResonance" };
+                    group = mixTiming.contains (id) ? 0 : variation.contains (id) ? 3 : shaping.contains (id) ? 2 : 1;
+                }
+                auto* c = new Control (proc, id, section.title);
+                addAndMakeVisible (c);
+                owned.add (c);
+                controls[(size_t) group].push_back (c);
+            }
+            for (auto* c : owned)
+                if (c->id == "fx_chorusModel") c->onModelChanged = [this] {
+                    for (auto* control : owned) control->refreshText();
+                };
+        }
+        void layoutFor (int width, float scale)
+        {
+            s = scale;
+            const int columns = 6;
+            const int gap = juce::roundToInt (6 * s);
+            const int pad = juce::roundToInt (16 * s);
+            const int cellH = juce::roundToInt (130 * s);
+            const int cellW = juce::jmax (1, (width - 2 * pad - gap * (columns - 1)) / columns);
+            int y = juce::roundToInt (8 * s);
+            headings.clear();
+            for (int gi = 0; gi < (int) groups.size(); ++gi)
+            {
+                const auto& list = controls[(size_t) gi];
+                if (list.empty()) continue;
+                headings.push_back ({ groups[(size_t) gi], y });
+                y += juce::roundToInt (30 * s);
+                for (int i = 0; i < (int) list.size(); ++i)
+                    list[(size_t) i]->setBounds (pad + (i % columns) * (cellW + gap),
+                                                 y + (i / columns) * cellH, cellW, cellH);
+                y += (int) ((list.size() + columns - 1) / columns) * cellH + juce::roundToInt (18 * s);
+            }
+            guideY = y;
+            setSize (width, juce::jmax (y + juce::roundToInt (112 * s), juce::roundToInt (510 * s)));
+        }
+        void paint (juce::Graphics& g) override
+        {
+            g.fillAll (Palette::panel);
+            if (guideY > 0)
+            {
+                const int x = juce::roundToInt (18 * s), y = guideY;
+                const int w = getWidth() - 2 * x, height = juce::roundToInt (88 * s);
+                draw::panel (g, juce::Rectangle<float> ((float) x, (float) y, (float) w, (float) height),
+                             3.0f, Palette::panelAlt, Palette::line);
+                g.setColour (Palette::paramLabel);
+                g.setFont (orFont (11.0f * s, true));
+                g.drawText ("HOW TO USE THE RACK", x + juce::roundToInt (16*s), y + juce::roundToInt (10*s),
+                            w - juce::roundToInt (32*s), juce::roundToInt (18*s), juce::Justification::centredLeft, false);
+                g.setColour (Palette::textDim);
+                g.setFont (orFont (11.0f * s));
+                g.drawFittedText ("1  Select an effect on the left    2  Click OFF to turn it on    3  Drag a knob or type a value",
+                                  juce::Rectangle<int> (x + juce::roundToInt (16*s), y + juce::roundToInt (36*s),
+                                                        w - juce::roundToInt (32*s), juce::roundToInt (37*s)),
+                                  juce::Justification::centredLeft, 2);
+            }
+            for (const auto& h : headings)
+            {
+                g.setColour (Palette::textFaint);
+                g.setFont (orFont (10.0f * s, true));
+                g.drawText (h.first, juce::Rectangle<int> (juce::roundToInt (18 * s), h.second,
+                                                          getWidth() - juce::roundToInt (36 * s), juce::roundToInt (22 * s)),
+                            juce::Justification::centredLeft, false);
+                g.setColour (Palette::line);
+                g.fillRect (juce::roundToInt (18 * s), h.second + juce::roundToInt (25 * s),
+                            getWidth() - juce::roundToInt (36 * s), 1);
+            }
+        }
+        juce::StringArray ids() const
+        {
+            juce::StringArray result;
+            for (auto* c : owned) result.add (c->id);
+            return result;
+        }
+    private:
+        int index;
+        int guideY = 0;
+        float s = 1.0f;
+        juce::StringArray groups;
+        std::vector<std::vector<Control*>> controls;
+        juce::OwnedArray<Control> owned;
+        std::vector<std::pair<juce::String, int>> headings;
+    };
+
+public:
+    explicit FxPage (OrogenProcessor& p) : proc (p), headerPower ("Selected effect power")
+    {
+        setOpaque (true);
+        setLookAndFeel (&rackLookAndFeel);
+        back.setTooltip ("Return to the main synthesizer");
+        allParams.setTooltip ("Open the complete parameter list");
+        addAndMakeVisible (back); addAndMakeVisible (allParams);
+        back.onClick = [this] { if (onClose) onClose(); };
+        allParams.onClick = [this] { if (onParams) onParams(); };
+        addAndMakeVisible (headerPower);
+        addAndMakeVisible (viewport);
+        viewport.setScrollBarsShown (true, false);
+        viewport.getVerticalScrollBar().setColour (juce::ScrollBar::thumbColourId, Palette::textDim);
+        viewport.getVerticalScrollBar().setColour (juce::ScrollBar::backgroundColourId, juce::Colours::transparentBlack);
+        viewport.getVerticalScrollBar().setColour (juce::ScrollBar::trackColourId, juce::Colours::transparentBlack);
+        const auto tabs = buildUiTabs();
+        for (int i = 0; i < FxChain::ModuleCount; ++i)
+        {
+            auto* button = new SelectButton (i, kFxModules[i].name);
+            button->onClick = [this, i] { setSelected (i); };
+            button->setTooltip ("Select " + juce::String (kFxModules[i].name) + " to edit its controls");
+            button->getProperties().set ("fxSelect", i);
+            selectButtons.add (button); addAndMakeVisible (button);
+            auto* power = new PowerButton (juce::String (kFxModules[i].name) + " power");
+            power->getProperties().set ("paramId", kFxModules[i].onId);
+            powerButtons.add (power); addAndMakeVisible (power);
+            powerAtts.push_back (std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
+                proc.apvts, kFxModules[i].onId, *power));
+            const UiSection* section = nullptr;
+            for (const auto& candidate : tabs[1].sections)
+                if (candidate.title == kFxModules[i].section) { section = &candidate; break; }
+            jassert (section != nullptr);
+            if (section != nullptr) contents.add (new Content (proc, i, *section));
+        }
+        setSelected (0);
+    }
+    ~FxPage() override { viewport.setViewedComponent (nullptr, false); setLookAndFeel (nullptr); }
+    std::function<void()> onClose, onParams;
+    void setSelected (int i)
+    {
+        if (contents.size() != FxChain::ModuleCount) return;
+        selected = juce::jlimit (0, FxChain::ModuleCount - 1, i);
+        for (int j = 0; j < selectButtons.size(); ++j) selectButtons[j]->setSelected (j == selected);
+        headerPowerAtt.reset();
+        headerPower.getProperties().set ("paramId", kFxModules[selected].onId);
+        headerPower.setTooltip (juce::String (kFxModules[selected].name) + " on/off / settings are kept");
+        headerPowerAtt = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
+            proc.apvts, kFxModules[selected].onId, headerPower);
+        viewport.setViewedComponent (contents[selected], false);
+        viewport.setViewPosition (0, 0);
+        resized(); repaint();
+    }
+    int selectedModule() const { return selected; }
+    juce::StringArray allIds() const
+    {
+        juce::StringArray ids;
+        for (int i = 0; i < contents.size(); ++i) { ids.add (kFxModules[i].onId); ids.addArray (contents[i]->ids()); }
+        return ids;
+    }
+    void resized() override
+    {
+        const float s = (float) getWidth() / OrogenEditor::kDesignW;
+        const auto r = [s] (float x, float y, float w, float h) {
+            return juce::Rectangle<int> (juce::roundToInt (x*s), juce::roundToInt (y*s),
+                                         juce::roundToInt (w*s), juce::roundToInt (h*s));
+        };
+        back.setBounds (r (18, 18, 142, 32));
+        allParams.setBounds (r (1100, 18, 162, 32));
+        headerPower.setBounds (r (1155, 113, 76, 34));
+        for (int i = 0; i < selectButtons.size(); ++i)
+        {
+            const float y = 145.0f + 43.0f * (float) i;
+            selectButtons[i]->setBounds (r (24, y, 150, 39));
+            powerButtons[i]->setBounds (r (179, y, 64, 39));
+        }
+        viewport.setBounds (r (268, 194, 989, 548));
+        if (selected < contents.size())
+            contents[selected]->layoutFor (juce::jmax (1, viewport.getMaximumVisibleWidth() - juce::roundToInt (14*s)), s);
+    }
+    void paint (juce::Graphics& g) override
+    {
+        const float s = (float) getWidth() / OrogenEditor::kDesignW;
+        juce::Graphics::ScopedSaveState save (g);
+        g.addTransform (juce::AffineTransform::scale (s));
+        g.fillAll (Palette::bg);
+        g.setColour (Palette::panel);
+        g.fillRect (0, 0, 1280, 68);
+        g.setColour (Palette::lineMid); g.fillRect (0, 67, 1280, 1);
+        g.setColour (Palette::text); g.setFont (orFont (19.0f, true));
+        g.drawText ("EFFECTS", 187, 17, 215, 31, juce::Justification::centredLeft, false);
+        g.setColour (Palette::textDim); g.setFont (orFont (11.0f));
+        g.drawText ("FX RACK  /  OROGEN", 334, 18, 260, 30, juce::Justification::centredLeft, false);
+        draw::panel (g, { 16, 85, 235, 667 }, 4.0f, Palette::panel, Palette::line);
+        draw::panel (g, { 268, 85, 989, 667 }, 4.0f, Palette::panel, Palette::line);
+        g.setColour (Palette::text); g.setFont (orFont (12.0f, true));
+        g.drawText ("SIGNAL CHAIN", 26, 99, 200, 18, juce::Justification::centredLeft, false);
+        g.setColour (Palette::textDim); g.setFont (orFont (10.0f));
+        g.drawText ("Select to edit   /   switch to enable", 26, 119, 215, 16, juce::Justification::centredLeft, false);
+        g.setColour (Palette::textFaint); g.setFont (orFont (11.0f, true));
+        g.drawText (juce::String (selected + 1).paddedLeft ('0', 2), 290, 105, 32, 28, juce::Justification::centredLeft, false);
+        g.setColour (Palette::text); g.setFont (orFont (21.0f, true));
+        g.drawText (kFxModules[selected].name, 326, 105, 500, 30, juce::Justification::centredLeft, false);
+        g.setColour (Palette::textDim); g.setFont (orFont (12.0f));
+        g.drawText (kFxModules[selected].description, 326, 140, 720, 20, juce::Justification::centredLeft, false);
+        g.setColour (Palette::line); g.fillRect (286, 177, 951, 1);
+        g.setColour (Palette::textFaint); g.setFont (orFont (10.5f));
+        g.drawText ("FIXED ORDER  /  OUTPUT SAFETY AND ROBIN DRY LATENCY REMAIN ACTIVE",
+                    25, 764, 720, 19, juce::Justification::centredLeft, false);
+        g.drawText ("DRAG KNOBS  /  CLICK VALUE TO TYPE  /  SCROLL FOR MORE",
+                    729, 764, 525, 19, juce::Justification::centredRight, false);
+    }
+    bool keyPressed (const juce::KeyPress& key) override
+    {
+        if (key == juce::KeyPress::escapeKey) { if (onClose) onClose(); return true; }
+        return false;
+    }
+private:
+    OrogenProcessor& proc;
+    RackLookAndFeel rackLookAndFeel;
+    int selected = 0;
+    juce::TextButton back { "<  SYNTH" }, allParams { "ALL PARAMETERS" };
+    PowerButton headerPower;
+    juce::Viewport viewport;
+    juce::OwnedArray<SelectButton> selectButtons;
+    juce::OwnedArray<PowerButton> powerButtons;
+    juce::OwnedArray<Content> contents;
+    std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment>> powerAtts;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> headerPowerAtt;
 };
 
 //============================================================================
@@ -1429,6 +1960,14 @@ OrogenEditor::OrogenEditor (OrogenProcessor& p)
 
     addAndMakeVisible (loadButton);
     addAndMakeVisible (saveButton);
+    addAndMakeVisible (fxRackButton);
+    addAndMakeVisible (paramsButton);
+    fxRackButton.setTooltip ("Open the effects rack");
+    paramsButton.setTooltip ("Open all parameters");
+    fxRackButton.getProperties().set ("nav", true);
+    paramsButton.getProperties().set ("nav", true);
+    fxRackButton.onClick = [this] { toggleFxPage (true); };
+    paramsButton.onClick = [this] { toggleParamsPage (true); };
     loadButton.onClick = [this] { loadPresetFromFile(); };
     saveButton.onClick = [this] { savePresetToFile(); };
 
@@ -1459,6 +1998,7 @@ OrogenEditor::OrogenEditor (OrogenProcessor& p)
     buildBottom();
     buildColumns();
     buildParamsPage();
+    buildFxPage();
 
     selectSlot (0);
     setSection (1);              // по умолчанию открыта мод-матрица (как на макете)
@@ -1469,6 +2009,8 @@ OrogenEditor::OrogenEditor (OrogenProcessor& p)
 OrogenEditor::~OrogenEditor()
 {
     stopTimer();
+    releaseMain();
+    if (vectorPad != nullptr) vectorPad->finishGesture();
     previewWorker.reset();                  // ждём воркер до уничтожения редактора
     setLookAndFeel (nullptr);
 }
@@ -1478,7 +2020,11 @@ void OrogenEditor::buildRail()
 {
     for (int i = 0; i < kNumSlots; ++i)
     {
-        auto* card = new SlotCard (proc, i, [this] (int s) { selectSlot (s); });
+        auto* card = new SlotCard (proc, i, [this] (int s) {
+            // На уже выбранной карточке не перепривязываем все контролы и не
+            // запускаем лишний полный пересчёт превью при каждом нажатии.
+            if (s != selectedSlot) selectSlot (s);
+        });
         addAndMakeVisible (card);
         cards.add (card);
     }
@@ -1665,10 +2211,21 @@ void OrogenEditor::buildParamsPage()
     addChildComponent (*paramsPage);
 }
 
+void OrogenEditor::buildFxPage()
+{
+    fxPage = std::make_unique<FxPage> (proc);
+    fxPage->onClose = [this] { toggleFxPage (false); };
+    fxPage->onParams = [this] { toggleParamsPage (true); };
+    addChildComponent (*fxPage);
+}
+
 // ---------------------------------------------------------------------------
 void OrogenEditor::selectSlot (int slot)
 {
-    selectedSlot = juce::jlimit (0, kNumSlots - 1, slot);
+    const int next = juce::jlimit (0, kNumSlots - 1, slot);
+    // Нельзя продолжить drag старого слота на параметрах нового.
+    if (next != selectedSlot) releaseMain();
+    selectedSlot = next;
 
     // центральные ручки: cutoff/res, shape (p0/p1), level/detune выбранного слота
     static const char* knobIds[3] = { "cutoff", "p0", "level" };
@@ -1728,11 +2285,34 @@ void OrogenEditor::setSection (int index)
 
 void OrogenEditor::toggleParamsPage (bool shouldShow)
 {
+    if (shouldShow && fxOpen) toggleFxPage (false);
+    if (shouldShow && ! paramsOpen)
+    {
+        releaseMain();
+        if (vectorPad != nullptr) vectorPad->finishGesture();
+    }
     paramsOpen = shouldShow;
     if (paramsPage != nullptr)
     {
         paramsPage->setVisible (paramsOpen);
         if (paramsOpen) { paramsPage->setBounds (getLocalBounds()); paramsPage->toFront (false); }
+    }
+    repaint();
+}
+
+void OrogenEditor::toggleFxPage (bool shouldShow)
+{
+    if (shouldShow && paramsOpen) toggleParamsPage (false);
+    if (shouldShow && ! fxOpen)
+    {
+        releaseMain();
+        if (vectorPad != nullptr) vectorPad->finishGesture();
+    }
+    fxOpen = shouldShow;
+    if (fxPage != nullptr)
+    {
+        fxPage->setVisible (fxOpen);
+        if (fxOpen) { fxPage->setBounds (getLocalBounds()); fxPage->toFront (false); }
     }
     repaint();
 }
@@ -1770,6 +2350,10 @@ juce::StringArray OrogenEditor::itemsOf (const juce::String& id) const
     return { "OFF", "ON" };
 }
 
+juce::Component* OrogenEditor::fxOverlay() { return fxPage.get(); }
+juce::StringArray OrogenEditor::fxRackParamIds() const { return fxPage != nullptr ? fxPage->allIds() : juce::StringArray(); }
+int OrogenEditor::fxRackSelectedModule() const { return fxPage != nullptr ? fxPage->selectedModule() : -1; }
+
 juce::Component* OrogenEditor::paramsOverlay()
 {
     return paramsPage.get();
@@ -1784,6 +2368,12 @@ void OrogenEditor::showPage (int index)
 {
     if (index >= 0 && index <= 7) { selectSlot (index); return; }
     if (index >= 8 && index <= 11) { setSection (index - 8); return; }
+    if (index >= 50 && index < 50 + FxChain::ModuleCount)
+    {
+        toggleFxPage (true);
+        if (fxPage != nullptr) fxPage->setSelected (index - 50);
+        return;
+    }
     if (index >= 100 && index <= 104)
     {
         toggleParamsPage (true);
@@ -1893,9 +2483,11 @@ int OrogenEditor::paramsSectionCount() const
 void OrogenEditor::resized()
 {
     masterSlider.setBounds (R (420.0f, 26.0f, 540.0f, 14.0f));
-    programBox.setBounds (R (58.0f, 30.0f, 250.0f, 16.0f));
+    programBox.setBounds (R (58.0f, 30.0f, 208.0f, 16.0f));
     loadButton.setBounds (R (1104.0f, 22.0f, 56.0f, 20.0f));
     saveButton.setBounds (R (1166.0f, 22.0f, 56.0f, 20.0f));
+    fxRackButton.setBounds (R (273.0f, 19.0f, 66.0f, 26.0f));
+    paramsButton.setBounds (R (344.0f, 19.0f, 70.0f, 26.0f));
 
     for (int i = 0; i < cards.size(); ++i)
         cards[i]->setBounds (R (16.0f, 66.0f + 70.0f * (float) i, 216.0f, 62.0f));
@@ -1929,6 +2521,7 @@ void OrogenEditor::resized()
 
     if (vectorPad != nullptr) vectorPad->setBounds (R (1108.0f, 646.0f, 156.0f, 138.0f));
     if (paramsPage != nullptr && paramsOpen) paramsPage->setBounds (getLocalBounds());
+    if (fxPage != nullptr && fxOpen) fxPage->setBounds (getLocalBounds());
 }
 
 // ---------------------------------------------------------------------------
@@ -2161,7 +2754,7 @@ void OrogenEditor::repaintChangedValues()
     }
 
     VisualHash chip;
-    for (const auto& def : kChips) chip.add (pv (def.id));
+    for (const auto& def : kChips) { chip.add (pv (def.id)); chip.add (pv (def.onId)); }
     if (changed (chip.value, chipVisualHash)) repaint (R (248.0f, 570.0f, 736.0f, 70.0f));
 
     VisualHash pad;
@@ -2731,7 +3324,7 @@ void OrogenEditor::paintChips (juce::Graphics& g)
 
         const auto r = chipRect (i);
         const float mix = juce::jlimit (0.0f, 1.0f, pv (kChips[idx].id));
-        const bool on = mix > 0.005f;
+        const bool on = pv (kChips[idx].onId) > 0.5f;
         // включённый чип подсвечивается волной: задержка по индексу
         const float glow = (animOn && on)
             ? 0.72f + 0.28f * (0.5f + 0.5f * std::sin ((animPhaseFor (0.4, 0.12 * i)) * juce::MathConstants<float>::twoPi))
@@ -2744,16 +3337,20 @@ void OrogenEditor::paintChips (juce::Graphics& g)
                        on ? Palette::text : Palette::textFaint);
 
         g.setColour (on ? Palette::textDim.withMultipliedAlpha (glow) : Palette::textFaint);
-        g.setFont (orFont (6.8f));
-        g.drawText (spaced (kChips[idx].name),
-                    juce::Rectangle<int> ((int) r.getX() + 30, (int) r.getY() + 6, 80, 10),
+        g.setFont (orFont (8.0f, true));
+        g.drawText (kChips[idx].name,
+                    juce::Rectangle<int> ((int) r.getX() + 30, (int) r.getY() + 5, 70, 11),
                     juce::Justification::centredLeft, false);
+        g.setColour (on ? Palette::text : Palette::textFaint);
+        g.setFont (orFont (7.0f, true));
+        g.drawText (on ? "ON" : "OFF", juce::Rectangle<int> ((int) r.getRight() - 25, (int) r.getY() + 5, 21, 11),
+                    juce::Justification::centredRight, false);
 
         // индикатор доли эффекта в сигнале
         juce::Rectangle<float> bar (r.getX() + 30.0f, r.getY() + 20.0f, 78.0f, 3.0f);
         g.setColour (Palette::lineMid);
         g.fillRoundedRectangle (bar, 1.5f);
-        g.setColour (Palette::signal.withAlpha (0.9f * glow));
+        g.setColour (on ? Palette::signal.withAlpha (0.9f * glow) : Palette::lineMid);
         g.fillRoundedRectangle (bar.withWidth (juce::jmax (0.0f, bar.getWidth() * mix)), 1.5f);
 
         // пунктирный «кабель» между чипами
@@ -3053,6 +3650,11 @@ juce::String OrogenEditor::chipParamId (int index) const
     if (index < 0 || index >= kChipTotal) return {};
     return kChips[index].id;
 }
+juce::String OrogenEditor::chipPowerId (int index) const
+{
+    if (index < 0 || index >= kChipTotal) return {};
+    return kChips[index].onId;
+}
 
 
 juce::Rectangle<float> OrogenEditor::modLane (int lane) const
@@ -3137,6 +3739,22 @@ OrogenEditor::MainHit OrogenEditor::hitMain (juce::Point<float> p, int& index) c
     return MainHit::none;
 }
 
+void OrogenEditor::beginDragGesture (const juce::String& id)
+{
+    auto* param = proc.apvts.getParameter (id);
+    if (param == nullptr || isDragGestureFor (param)
+        || dragGestureCount >= (int) dragGestureParams.size()) return;
+    dragGestureParams[(size_t) dragGestureCount++] = param;
+    param->beginChangeGesture();
+}
+
+bool OrogenEditor::isDragGestureFor (const juce::AudioProcessorParameter* param) const noexcept
+{
+    for (int i = 0; i < dragGestureCount; ++i)
+        if (dragGestureParams[(size_t) i] == param) return true;
+    return false;
+}
+
 bool OrogenEditor::nudgeParam (const juce::String& id, float deltaNorm)
 {
     if (auto* prm = proc.apvts.getParameter (id))
@@ -3170,20 +3788,12 @@ bool OrogenEditor::clickMain (juce::Point<float> designPos)
 
     if (hit == MainHit::fxChip && index >= 0 && index < kChipTotal)
     {
-        if (auto* prm = proc.apvts.getParameter (kChips[index].id))
+        if (auto* prm = proc.apvts.getParameter (kChips[index].onId))
         {
-            const float now = prm->getValue();
-            if (now > 0.001f)
-            {
-                chipLast[(size_t) index] = now;      // запомнили, чтобы вернуть как было
-                prm->setValueNotifyingHost (0.0f);
-            }
-            else
-            {
-                float target = chipLast[(size_t) index];
-                if (target <= 0.001f) target = kChips[index].onValue;
-                prm->setValueNotifyingHost (juce::jlimit (0.0f, 1.0f, target));
-            }
+            // Clicking bypasses without destroying the saved mix/drive value.
+            prm->beginChangeGesture();
+            prm->setValueNotifyingHost (prm->getValue() > 0.5f ? 0.0f : 1.0f);
+            prm->endChangeGesture();
             repaint();
             return true;
         }
@@ -3203,7 +3813,11 @@ bool OrogenEditor::dragMain (juce::Point<float> designPos)
     {
         case MainHit::fxChip:
             if (dragIndex >= 0 && dragIndex < kChipTotal)
+            {
+                auto* prm = proc.apvts.getParameter (kChips[dragIndex].id);
+                if (! isDragGestureFor (prm)) beginDragGesture (kChips[dragIndex].id);
                 nudgeParam (kChips[dragIndex].id, d.x / kPxPerFullRange);
+            }
             break;
 
         case MainHit::fxChipPage:
@@ -3244,13 +3858,22 @@ bool OrogenEditor::dragMain (juce::Point<float> designPos)
 
 void OrogenEditor::releaseMain()
 {
+    // Сначала сбрасываем состояние, затем уведомляем хост: повторный вызов
+    // release из listener не отправит лишний endChangeGesture.
+    const auto gestures = dragGestureParams;
+    const int count = dragGestureCount;
+    dragGestureParams = { nullptr, nullptr };
+    dragGestureCount = 0;
     dragTarget = MainHit::none;
     dragIndex = -1;
     dragMoved = false;
+    for (int i = 0; i < count; ++i)
+        if (auto* param = gestures[(size_t) i]) param->endChangeGesture();
 }
 
 OrogenEditor::MainHit OrogenEditor::beginMainDrag (juce::Point<float> designPos)
 {
+    releaseMain();                     // баланс даже при повторном mouseDown
     int index = -1;
     const auto hit = hitMain (designPos, index);
 
@@ -3258,6 +3881,27 @@ OrogenEditor::MainHit OrogenEditor::beginMainDrag (juce::Point<float> designPos)
     dragIndex = index;
     dragLast = designPos;
     dragMoved = false;
+    switch (hit)
+    {
+        case MainHit::fxChip:
+            // Open the mix gesture only if the user actually drags; a click
+            // gestures the separate power parameter instead.
+            break;
+        case MainHit::display:
+            beginDragGesture (slotId ("p0")); beginDragGesture (slotId ("p1")); break;
+        case MainHit::modNode:
+            if (index >= 0 && index < 8) beginDragGesture ("mod" + juce::String (index + 1) + "_amt");
+            break;
+        case MainHit::lfoLane:
+            beginDragGesture ("lfo1_rate"); beginDragGesture ("lfo1_amount"); break;
+        case MainHit::envAttack:  beginDragGesture (slotId ("attack")); break;
+        case MainHit::envDecay:   beginDragGesture (slotId ("decay")); break;
+        case MainHit::envSustain:
+            beginDragGesture (slotId ("release")); beginDragGesture (slotId ("sustain")); break;
+        case MainHit::none:
+        case MainHit::fxChipPage:
+        default: break;
+    }
     return hit;
 }
 
@@ -3337,7 +3981,9 @@ bool OrogenEditor::keyPressed (const juce::KeyPress& key)
     if (c >= 'A' && c <= 'H') { selectSlot ((int) (c - 'A')); return true; }
     if (c >= '1' && c <= '4') { setSection ((int) (c - '1')); return true; }
 
+    if (key == juce::KeyPress::escapeKey && fxOpen) { toggleFxPage (false); return true; }
     if (key == juce::KeyPress::escapeKey && paramsOpen) { toggleParamsPage (false); return true; }
+    if (c == 'x' || c == 'X') { toggleFxPage (! fxOpen); return true; }
     if (c == 'p' || c == 'P') { toggleParamsPage (! paramsOpen); return true; }
     return false;
 }

@@ -45,6 +45,9 @@ public:
     void setPeaks (int n)          { s.peaks = n; apply(); }
     void setWidth (int bins)       { s.width = bins; apply(); }
     void setShift (float semis)    { s.shift = semis; apply(); }
+    void setReject (float db)     { s.reject = clamp (db, -120.0f, 0.0f); apply(); }
+    void setAttack (float ms)     { s.attack = clamp (ms, 0.0f, 2000.0f); apply(); }
+    void setRelease (float ms)    { s.release = clamp (ms, 0.0f, 5000.0f); apply(); }
     void setFreeze (bool on)       { s.freeze = on; apply(); }
 
     // Латентность в сэмплах: ровно длина окна, её надо компенсировать

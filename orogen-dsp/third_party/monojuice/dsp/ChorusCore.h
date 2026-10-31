@@ -20,6 +20,9 @@ public:
  // DSP words (sub-step modulation). The translated procedure is untouched.
  void setParametersF(const std::array<float,8>& parameters) noexcept;
  void process16(const std::int32_t* interleavedInput, std::int32_t* interleavedOutput) noexcept;
+ // OROGEN compatibility switch: old projects may retain the 0.9.5 DEL=0
+ // trajectory; MonoJuice V1/V2 use the upstream 0.9.8 boundary guard.
+ void setDelayZeroGuard(bool enabled) noexcept { delayZeroGuard=enabled; }
  static std::int32_t signed24(Word v) noexcept { v&=0xffffffu; return v&0x800000u ? std::int32_t(v)-0x1000000 : std::int32_t(v); }
  // Test access uses the original data addresses, not executable P-memory.
  Word readX(Word address) const noexcept;
@@ -30,8 +33,10 @@ private:
  std::array<Word,0x580> x{};
  std::array<Word,0x580> y{};
  std::array<Word,4096> delay{};
+ bool delayZeroGuard=false; // preserve the pre-0.9.8 OROGEN path by default
  void initialiseProcedure() noexcept;
  void processProcedure() noexcept;
+ void keepDelayReadOutOfCurrentBlock() noexcept;
  static constexpr std::int64_t one=0x1000000ll;
  static std::int64_t q(Word v) noexcept { return std::int64_t(signed24(v))*one; }
  static std::int64_t asr(std::int64_t v,unsigned n) noexcept {

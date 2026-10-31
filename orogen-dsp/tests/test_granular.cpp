@@ -673,8 +673,10 @@ int main()
         }
         const double spanRms = std::sqrt (eSum / wSum);
         const double local = source.envAt (grain[0]);
+        const double end = source.envAt (grain[0] + grain[1]);
         const double body = source.bodyRms;
-        const double reference = clamp ((float) (body / std::max (local, spanRms)), 0.25f, 5.0f)
+        // Независимый эталон включает оба края и полный Hann²-интеграл.
+        const double reference = clamp ((float) (body / std::max ({ local, end, spanRms })), 0.25f, 5.0f)
                                * clamp ((float) (GranularEngine::kBodyTarget / body), 0.05f, 6.0f);
         const double gainRatio = grain[2] / std::max (1.0e-9, reference);
         double peak = 0.0, power = 0.0;
@@ -683,8 +685,8 @@ int main()
             const float v = e.render (p);
             peak = std::max (peak, std::fabs ((double) v)); power += (double) v * v;
         }
-        std::printf ("   старт %.1f мс, локальный RMS %.6f, RMS участка %.6f, усиление %.6f / эталон %.6f\n",
-                     grain[0] * 1000.0 / sr, local, spanRms, grain[2], reference);
+        std::printf ("   старт %.1f мс, RMS краёв %.6f / %.6f, RMS участка %.6f, усиление %.6f / эталон %.6f\n",
+                     grain[0] * 1000.0 / sr, local, end, spanRms, grain[2], reference);
         std::printf ("   пик %.6f, RMS %.6f, отношение усиления к эталону %.3f\n",
                      peak, std::sqrt (power / (sr / 5)), gainRatio);
         suite::check (grain[1] > 0.0f && spanRms > 2.0 * local && std::fabs (gainRatio - 1.0) < 0.08,

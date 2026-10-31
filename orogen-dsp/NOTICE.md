@@ -17,11 +17,15 @@ SPDX-метки и уведомления об авторстве.
 | WDF (схемная сатурация) | `third_party/chowdsp_wdf/` | BSD-3-Clause | © Jatin Chowdhury |
 | Odin 2 comb (перенос) | `third_party/monojuice/dsp/OdinComb.h` | **GPL-3.0-or-later** | © 2020-2021 TheWaveWarden |
 | ParallelComb | `third_party/monojuice/dsp/ParallelCombModel.h`, `third_party/monojuice/third_party/Uhhyou/` | **GPL-3.0-only** | © Takamitsu Endo (Uhhyou) |
-| CombColour, ChorusCore, AudioAdapter, Material, Glitch, Drive-модели | `third_party/monojuice/dsp/` | код автора плагина MonoJuice; части под GPL-3.0 в силу сборки (см. выше) | © MonomachineNova / автор плагина |
+| CombColour, ChorusCore, AudioAdapter, Material, Glitch, Drive-модели | `third_party/monojuice/dsp/` | Учитывать лицензии отдельных файлов; корневой LICENSE репозитория MonoHuice 0.9.15 не найден | автор плагина / указанные в файлах авторы |
 | Spectrum Pixelator (Spectre, EXTENDED и CLASSIC) | `third_party/monojuice/dsp/Spectre.h`, `SpectreClassic.h` | BSD-3-Clause | © 2019 Michael Nuzzo |
 | Airwindows-модели драйва | `third_party/monojuice/dsp/AirwindowsMasterModels.h`, `DriveSourceModels.h` | MIT | © 2016 Chris Johnson |
 | DaisySP (Wavefolder, Decimator) | там же | MIT | © 2020 Electrosmith |
 
 Тексты лицензий — `third_party/monojuice/licenses/` и рядом с соответствующими
-каталогами в `third_party/`. Файлы стороннего кода копируются **без правок**;
-все адаптации живут в `src/instrument/fx_*.h` с указанием источника в шапке.
+каталогами в `third_party/`. В `ChorusCore` и `AudioAdapter.h` есть переключатель совместимости OROGEN;
+`GlitchCore.h` и `ChorusCore` обновлены из репозитория MonoHuice 0.9.15
+(commit `e98c79a8697ba9ade45acc5f15548c5c2c02ab3d`), предоставленного
+пользователем с разрешением использовать код. Корневой LICENSE этого
+репозитория не обнаружен, поэтому его общая лицензия не утверждается;
+перед распространением следует уточнить права у правообладателя.

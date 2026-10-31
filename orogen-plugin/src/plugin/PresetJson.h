@@ -10,6 +10,7 @@
 
 #include "instrument/patcher.h"
 #include "instrument/fx.h"
+#include "Params.h"
 
 namespace orogen
 {
@@ -165,6 +166,13 @@ inline juce::var fxToVar (const FxChain::Settings& s)
 {
     auto* o = new juce::DynamicObject();
     auto put = [o] (const char* k, auto value) { o->setProperty (k, value); };
+    for (int i = 0; i < FxChain::ModuleCount; ++i) put (kFxModules[i].onId, s.enabled[(size_t) i]);
+    int extraCount = 0;
+    const auto* extra = fxExtraParamTable (extraCount);
+    for (int i = 0; i < extraCount; ++i) put (extra[i].id, s.*(extra[i].field));
+    put ("plateDc", s.plateDc); put ("combNegativeB", s.combNegativeB);
+    put ("chorusMode", s.chorusMode); put ("glitchTimingMode", s.glitchTimingMode);
+    put ("glitchSync", s.glitchSync); put ("glitchDivision", s.glitchDivision); put ("glitchHighpass", s.glitchHighpass);
     put ("drive", s.drive);           put ("driveModel", s.driveModel);
     put ("driveTone", s.driveTone);
     put ("chorusMix", s.chorusMix);   put ("chorusDepth", s.chorusDepth);
@@ -231,6 +239,16 @@ inline void fxFromVar (const juce::var& v, FxChain::Settings& s)
     {
         return o->hasProperty (k) ? (bool) o->getProperty (k) : def;
     };
+    // Legacy JSON lacks power fields; Settings defaults to all enabled.
+    for (int j = 0; j < FxChain::ModuleCount; ++j)
+        s.enabled[(size_t) j] = b (kFxModules[j].onId, s.enabled[(size_t) j]);
+    int extraCount = 0;
+    const auto* extra = fxExtraParamTable (extraCount);
+    for (int j = 0; j < extraCount; ++j) s.*(extra[j].field) = f (extra[j].id, s.*(extra[j].field));
+    s.plateDc = b ("plateDc", s.plateDc); s.combNegativeB = i ("combNegativeB", s.combNegativeB);
+    s.chorusMode = i ("chorusMode", s.chorusMode); s.glitchTimingMode = i ("glitchTimingMode", s.glitchTimingMode);
+    s.glitchSync = b ("glitchSync", s.glitchSync); s.glitchDivision = i ("glitchDivision", s.glitchDivision);
+    s.glitchHighpass = b ("glitchHighpass", s.glitchHighpass);
     s.drive = f ("drive", s.drive);           s.driveModel = i ("driveModel", s.driveModel);
     s.driveTone = f ("driveTone", s.driveTone);
     s.chorusMix = f ("chorusMix", s.chorusMix); s.chorusDepth = f ("chorusDepth", s.chorusDepth);

@@ -67,6 +67,7 @@ int main (int argc, char** argv)
     // 200+t*100+s — конкретная секция оверлея (страницы по секциям)
     const int idx = (page >= 200) ? page
                   : (page >= 100) ? juce::jlimit (100, 104, page)
+                  : (page >= 50 && page < 50 + FxChain::ModuleCount) ? page
                                   : juce::jlimit (0, 11, page);
     static_cast<OrogenEditor*> (editor.get())->showPage (idx);
     if (cutoff >= 0.0f)

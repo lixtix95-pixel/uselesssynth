@@ -152,6 +152,97 @@ inline const FxParam* fxParamTable (int& count)
     return table;
 }
 
+// Explicit rack metadata. Indices must match FxChain::Module and DSP order.
+struct FxModuleInfo { const char* name; const char* section; const char* onId; const char* description; };
+inline constexpr FxModuleInfo kFxModules[FxChain::ModuleCount] =
+{
+    { "DRIVE",    "DRIVE",    "fx_driveOn",    "Saturation and distortion" },
+    { "COMB",     "COMB",     "fx_combOn",     "Odin and parallel comb filters" },
+    { "CHORUS",   "CHORUS",   "fx_chorusOn",   "Simple or firmware chorus" },
+    { "DELAY",    "DELAY",    "fx_delayOn",    "Stereo ping-pong delay" },
+    { "REVERB",   "REVERB",   "fx_reverbOn",   "Algorithmic reverb" },
+    { "PLATE",    "PLATE",    "fx_plateOn",    "Dattorro plate reverb" },
+    { "EQ",       "EQ",       "fx_eqOn",       "Low and high shelving EQ" },
+    { "MATERIAL", "MATERIAL", "fx_materialOn", "Modal material resonator" },
+    { "SPECTRE",  "SPECTRE",  "fx_spectreOn",  "Spectral processor" },
+    { "ROBIN",    "ROBIN",    "fx_robinOn",    "Stereo pitch shifter" },
+    { "GLITCH",   "GLITCH",   "fx_glitchOn",   "Stutter, reverse and pitch" },
+    { "DYNAMICS", "DYNAMICS", "fx_compOn",     "Peak compressor" },
+    { "WIDTH",    "OUTPUT",   "fx_widthOn",    "Mid / side stereo width" }
+};
+
+// Extra, previously hidden DSP controls are appended after all 306 legacy IDs.
+// The Settings member pointer is used by APVTS, JSON and the processor in both
+// directions, so a new control cannot silently exist only in the GUI.
+struct FxExtraParam
+{
+    const char* id; const char* name;
+    float min, max, def, step;
+    float FxChain::Settings::*field;
+};
+inline const FxExtraParam* fxExtraParamTable (int& count)
+{
+    using S = FxChain::Settings;
+    static const FxExtraParam table[] = {
+        { "driveMix",       "Drive Mix",          0.0f,     1.0f,  1.0f, 0.001f, &S::driveMix },
+        { "combDecayMs",    "Comb Env Decay ms", 5.0f,  4000.0f,180.0f, 0.1f,   &S::combDecayMs },
+        { "combTapA",       "Comb Tap A ms",      -1.0f,  4000.0f, -1.0f, 0.1f,   &S::combTapA },
+        { "combTapB",       "Comb Tap B ms",      -1.0f,  4000.0f, -1.0f, 0.1f,   &S::combTapB },
+        { "combTapC",       "Comb Tap C ms",      -1.0f,  4000.0f, -1.0f, 0.1f,   &S::combTapC },
+        { "combTapD",       "Comb Tap D ms",      -1.0f,  4000.0f, -1.0f, 0.1f,   &S::combTapD },
+        { "combMultiplier", "Comb Delay Multiply", 0.0f,     1.0f,  1.0f, 0.001f, &S::combMultiplier },
+        { "combParRate",    "Comb Parallel Rate", 0.0f,     4.0f,  0.5f, 0.001f, &S::combParRate },
+        { "combSmoothMs",   "Comb Smooth ms",      0.0f,100000.0f,  0.0f, 0.1f,   &S::combSmoothMs },
+        { "combCross",      "Comb Cross %",        0.0f,   100.0f,  0.0f, 0.1f,   &S::combCross },
+        { "combAm",         "Comb AM %",           0.0f,   100.0f,  0.0f, 0.1f,   &S::combAm },
+        { "combLean",       "Comb Lean %",      -100.0f,   100.0f,  0.0f, 0.1f,   &S::combLean },
+        { "combGateDb",     "Comb Gate dB",     -140.0f,     0.0f,-140.0f,0.1f,   &S::combGateDb },
+        { "combGateMs",     "Comb Gate ms",        0.1f, 10000.0f, 10.0f, 0.1f,   &S::combGateMs },
+        { "combLimiterMs",  "Comb Limiter ms",     0.001f,16000.0f,200.0f,0.001f, &S::combLimiterMs },
+        { "combDryDb",      "Comb Dry dB",       -60.0f,     6.0f,  0.0f, 0.1f,   &S::combDryDb },
+        { "combWetDb",      "Comb Wet dB",       -60.0f,     6.0f,  0.0f, 0.1f,   &S::combWetDb },
+        // Parameters above were introduced with the FX page (indices 319–335).
+        // Append after the two existing choices to retain all first 338 IDs.
+        { "combOdinMix", "Comb ODIN Mix", 0,1,1,.001f,&S::combOdinMix },
+        { "combDryDbExt", "Comb Dry Extended dB", -61,24,-61,.1f,&S::combDryDbExt },
+        { "combWetDbExt", "Comb Wet Extended dB", -61,60,-61,.1f,&S::combWetDbExt },
+        { "combDriveExt", "Comb Drive Extended dB", -1,36,-1,.1f,&S::combDriveExt },
+        { "combOutputExt", "Comb Output Extended dB", -31,12,-31,.1f,&S::combOutputExt },
+        { "combDepthExt", "Comb Depth Extended semitones", -1,24,-1,.1f,&S::combDepthExt },
+        { "combRateExt", "Comb Speed Extended Hz", -1,20,-1,.01f,&S::combRateExt },
+        { "combEnvelopeExt", "Comb Envelope Extended semitones", -37,36,-37,.1f,&S::combEnvelopeExt },
+        { "combFreqAExt", "Comb Frequency A Extended Hz", -1,16000,-1,1,&S::combFreqAExt },
+        { "combFreqBExt", "Comb Frequency B Extended Hz", -1,16000,-1,1,&S::combFreqBExt },
+        { "combFeedbackExt", "Comb Feedback Extended %", -1,100,-1,.1f,&S::combFeedbackExt },
+        { "combHighpassExt", "Comb Highpass Extended Hz", -1,24000,-1,1,&S::combHighpassExt },
+        { "combTuneExt", "Comb Tune Extended semitones", -49,48,-49,.1f,&S::combTuneExt },
+        { "spectreReject", "Spectre Reject Level dB", -120,0,-120,.1f,&S::spectreReject },
+        { "spectreAttack", "Spectre Attack ms", 0,2000,0,1,&S::spectreAttack },
+        { "spectreRelease", "Spectre Release ms", 0,5000,0,1,&S::spectreRelease },
+        { "spectreWindowExt", "Spectre Window Extended index", -1,7,-1,1,&S::spectreWindowExt },
+        { "spectrePeaksExt", "Spectre Peaks Extended", -1,512,-1,1,&S::spectrePeaksExt },
+        { "spectreWidthExt", "Spectre Width Extended", -1,24,-1,1,&S::spectreWidthExt },
+        { "spectreLowExt", "Spectre Low Extended Hz", -1,96000,-1,1,&S::spectreLowExt },
+        { "spectreHighExt", "Spectre High Extended Hz", -1,96000,-1,1,&S::spectreHighExt },
+        { "glitchFoldDrive", "Glitch Dist", 0,20,0,.01f,&S::glitchFoldDrive },
+        { "glitchDryLevel", "Glitch Dry Level", -1,1,-1,.001f,&S::glitchDryLevel },
+        { "glitchWetLevel", "Glitch Wet Level", -1,1,-1,.001f,&S::glitchWetLevel },
+        { "glitchOffset", "Glitch Capture Offset %", 0,100,100,.1f,&S::glitchOffset },
+        { "glitchCrossfade", "Glitch Crossfade %", 0,100,100,.1f,&S::glitchCrossfade },
+        { "glitchResonance", "Glitch Resonance %", 0,95,0,.1f,&S::glitchResonance },
+        { "glitchDrift", "Glitch Size Drift %", -100,100,0,.1f,&S::glitchDrift },
+        { "glitchPitchStep", "Glitch Pitch Step semitones", -12,12,0,.1f,&S::glitchPitchStep },
+        { "glitchPitchRandom", "Glitch Pitch Random semitones", 0,12,0,.1f,&S::glitchPitchRandom },
+        { "glitchReroll", "Glitch Reroll %", 0,100,0,.1f,&S::glitchReroll },
+        { "glitchDecay", "Glitch Repeat Decay %", 0,90,0,.1f,&S::glitchDecay },
+        // 0 = FOLLOW; 1–500 ms matches the original GLITCH control. A
+        // fractional value below 1 ms would be silently clamped by the DSP.
+        { "glitchLengthExt", "Glitch Length Extended ms", 0,500,0,1,&S::glitchLengthExt }
+    };
+    count = (int) (sizeof (table) / sizeof (table[0]));
+    return table;
+}
+
 // Параметры-перечисления (choice / bool / int) — отдельно, у них нет диапазона.
 struct ChoiceParam { const char* id; const char* name; };
 
@@ -328,6 +419,32 @@ inline juce::AudioProcessorValueTreeState::ParameterLayout makeLayout()
         const String pre = slotPrefix (s);
         addFloat (pre + "grainReverse", pre + "Grain Reverse", 0.0f, 1.0f, 0.0f, 0.001f);
     }
+
+    // Only after all 306 previous parameters: preserve the exact old IDs/order.
+    for (const auto& module : kFxModules)
+        layout.add (std::make_unique<AudioParameterBool> (
+            ParameterID { module.onId, 1 }, String (module.name) + " On", false));
+    int extraCount = 0;
+    const auto* extra = fxExtraParamTable (extraCount);
+    constexpr int kOriginalFxExtraCount = 17;
+    for (int i = 0; i < std::min (extraCount, kOriginalFxExtraCount); ++i)
+        addFloat (String ("fx_") + extra[i].id, extra[i].name,
+                  extra[i].min, extra[i].max, extra[i].def, extra[i].step);
+    layout.add (std::make_unique<AudioParameterBool> (
+        ParameterID { "fx_plateDc", 1 }, "Plate DC Block", true));
+    layout.add (std::make_unique<AudioParameterChoice> (
+        ParameterID { "fx_combNegativeB", 1 }, "Comb Negative B",
+        StringArray { "Follow A", "Positive", "Negative" }, 0));
+    for (int i = kOriginalFxExtraCount; i < extraCount; ++i)
+        addFloat (String ("fx_") + extra[i].id, extra[i].name,
+                  extra[i].min, extra[i].max, extra[i].def, extra[i].step);
+    // Host reset/default agrees with the new INIT. Old states without these
+    // IDs are explicitly migrated to Legacy in setStateInformation().
+    layout.add (std::make_unique<AudioParameterChoice> (ParameterID { "fx_chorusMode", 1 }, "Chorus Mix Mode", StringArray { "Legacy", "V1 internal", "V2 external" }, 2));
+    layout.add (std::make_unique<AudioParameterChoice> (ParameterID { "fx_glitchTimingMode", 1 }, "Glitch Timing", StringArray { "Legacy", "Host rate" }, 1));
+    layout.add (std::make_unique<AudioParameterBool> (ParameterID { "fx_glitchSync", 1 }, "Glitch Tempo Sync", false));
+    layout.add (std::make_unique<AudioParameterChoice> (ParameterID { "fx_glitchDivision", 1 }, "Glitch Length Division", StringArray { "2 bars", "1 bar", "1/2", "1/4", "1/8", "1/16", "1/32", "1/64", "1/128" }, 3));
+    layout.add (std::make_unique<AudioParameterBool> (ParameterID { "fx_glitchHighpass", 1 }, "Glitch Highpass", false));
 
     return layout;
 }

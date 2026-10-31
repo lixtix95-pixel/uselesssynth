@@ -20,6 +20,9 @@ OrogenProcessor::OrogenProcessor()
         Preset pr;
         pr.patch = list[i];
         pr.name = juce::String (list[i].name);
+        // INIT is dry. Other factory programs retain their historical sound:
+        // their non-neutral compressor and width remain active.
+        pr.fx.enabled.fill (false);
         pr.fx.compThreshold = -10.0f;
         pr.fx.compRatio = 2.5f;
         pr.fx.compMakeup = 2.0f;
@@ -37,6 +40,28 @@ OrogenProcessor::OrogenProcessor()
                     pr.fx.delayMix = 0.28f; break;
             default: pr.fx.reverbMix = 0.55f; pr.fx.reverbSize = 0.9f;
                      pr.fx.chorusMix = 0.25f; break;
+        }
+        if (i == 0)
+        {
+            // Useful starting values when a user enables a processor. Power,
+            // not an invisible mix=0 convention, controls the initial state.
+            pr.fx.drive = 0.35f; pr.fx.combMix = 0.35f;
+            pr.fx.chorusMix = 0.40f; pr.fx.delayMix = 0.30f;
+            pr.fx.plateMix = 0.35f; pr.fx.materialMix = 0.35f;
+            pr.fx.spectreMix = 0.35f; pr.fx.robinMix = 0.40f;
+            pr.fx.robinSemis = 7.0f; pr.fx.glitchMix = 0.40f;
+            pr.fx.chorusModel = 1;       // firmware chorus on the FX page
+            pr.fx.chorusMode = 2;        // MonoJuice V2 for new INIT
+            pr.fx.glitchTimingMode = 1;  // actual host sample rate
+        }
+        else
+        {
+            pr.fx.enabled[(size_t) FxChain::Drive] = pr.fx.drive > 0.0f;
+            pr.fx.enabled[(size_t) FxChain::ChorusModule] = pr.fx.chorusMix > 0.0f;
+            pr.fx.enabled[(size_t) FxChain::DelayModule] = pr.fx.delayMix > 0.0f;
+            pr.fx.enabled[(size_t) FxChain::ReverbModule] = pr.fx.reverbMix > 0.0f;
+            pr.fx.enabled[(size_t) FxChain::Compressor] = true;
+            pr.fx.enabled[(size_t) FxChain::StereoWidth] = true;
         }
         presets.push_back (pr);
     }
@@ -123,6 +148,18 @@ void OrogenProcessor::cachePointers()
     for (int i = 0; i < fn; ++i)
         fxRefs.push_back (apvts.getRawParameterValue (juce::String ("fx_") + ft[i].id));
 
+    for (int i = 0; i < FxChain::ModuleCount; ++i)
+        fxEnableRefs[(size_t) i] = apvts.getRawParameterValue (kFxModules[i].onId);
+    int extraCount = 0;
+    const auto* extra = fxExtraParamTable (extraCount);
+    fxExtraRefs.clear();
+    for (int i = 0; i < extraCount; ++i)
+        fxExtraRefs.push_back (apvts.getRawParameterValue (juce::String ("fx_") + extra[i].id));
+    fxPlateDcRef = apvts.getParameter ("fx_plateDc");
+    fxCombNegativeBRef = apvts.getParameter ("fx_combNegativeB");
+    const char* monoChoiceIds[] = { "fx_chorusMode", "fx_glitchTimingMode", "fx_glitchSync", "fx_glitchDivision", "fx_glitchHighpass" };
+    for (size_t i = 0; i < fxMonoChoiceRefs.size(); ++i) fxMonoChoiceRefs[i] = apvts.getParameter (monoChoiceIds[i]);
+
     // порядок совпадает с choiceTable()/makeLayout()
     const char* choiceIds[] = { "fx_driveModel", "fx_chorusModel", "fx_materialMode",
                                 "fx_spectreModel", "fx_spectreWindow", "fx_spectrePeaks",
@@ -203,6 +240,11 @@ std::uint64_t OrogenProcessor::hashParams() const noexcept
     for (const auto& l : lfoRefs) for (auto* p : l) if (p) mix (p->load());
     for (auto* f : fxRefs) if (f) mix (f->load());
     for (auto* c : fxChoiceRefs) mix (choiceValue (c));
+    for (auto* p : fxEnableRefs) if (p) mix (p->load());
+    for (auto* p : fxExtraRefs) if (p) mix (p->load());
+    mix (choiceValue (fxPlateDcRef));
+    mix (choiceValue (fxCombNegativeBRef));
+    for (auto* c : fxMonoChoiceRefs) mix (choiceValue (c));
     return h;
 }
 
@@ -243,9 +285,14 @@ void OrogenProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     // операция во всём плагине; хост даёт её на не-аудио-потоке.
     bank.build (sampleRate);
     inst.prepare (sampleRate, 16);
-    inst.setPatch (patch);
-    inst.setFx (fxSettings);
-    inst.setMasterGain (masterGain);
+    // prepareToPlay runs while processing is stopped. Read the current APVTS
+    // rather than an old GUI-side copy (parameters may change while stopped).
+    Patch currentPatch; FxChain::Settings currentFx;
+    collectPatch (currentPatch, currentFx);
+    inst.setPatch (currentPatch);
+    inst.setFx (currentFx);
+    inst.setMasterGain (globRefs[1]->load());
+    lastParamHash = 0;  // re-snapshot on first audio block, including concurrent UI edits
 
     latencySamples.store (inst.fxLatency());
     triggerAsyncUpdate();
@@ -423,6 +470,19 @@ void OrogenProcessor::collectPatch (Patch& p, FxChain::Settings& fx) const noexc
     fx.combOversample = C (11) != 0;
     fx.combMidSide    = C (12) != 0;
     fx.materialFollow = C (13) != 0;
+    for (int i = 0; i < FxChain::ModuleCount; ++i)
+        fx.enabled[(size_t) i] = fxEnableRefs[(size_t) i] != nullptr && fxEnableRefs[(size_t) i]->load() > 0.5f;
+    int extraCount = 0;
+    const auto* extra = fxExtraParamTable (extraCount);
+    for (int i = 0; i < extraCount; ++i)
+        if (fxExtraRefs[(size_t) i] != nullptr) fx.*(extra[i].field) = fxExtraRefs[(size_t) i]->load();
+    fx.plateDc = choiceValue (fxPlateDcRef) > 0.5f;
+    fx.combNegativeB = (int) std::lround (choiceValue (fxCombNegativeBRef));
+    fx.chorusMode = (int) std::lround (choiceValue (fxMonoChoiceRefs[0]));
+    fx.glitchTimingMode = (int) std::lround (choiceValue (fxMonoChoiceRefs[1]));
+    fx.glitchSync = choiceValue (fxMonoChoiceRefs[2]) > 0.5f;
+    fx.glitchDivision = (int) std::lround (choiceValue (fxMonoChoiceRefs[3]));
+    fx.glitchHighpass = choiceValue (fxMonoChoiceRefs[4]) > 0.5f;
 }
 
 void OrogenProcessor::applyToParams (const Patch& p, const FxChain::Settings& fx)
@@ -540,6 +600,18 @@ void OrogenProcessor::applyToParams (const Patch& p, const FxChain::Settings& fx
     put ("combOversample", fx.combOversample ? 1.0f : 0.0f);
     put ("combMidSide", fx.combMidSide ? 1.0f : 0.0f);
     put ("materialFollow", fx.materialFollow ? 1.0f : 0.0f);
+    for (int i = 0; i < FxChain::ModuleCount; ++i)
+        set (kFxModules[i].onId, fx.enabled[(size_t) i] ? 1.0f : 0.0f);
+    int extraCount = 0;
+    const auto* extra = fxExtraParamTable (extraCount);
+    for (int i = 0; i < extraCount; ++i) put (extra[i].id, fx.*(extra[i].field));
+    put ("plateDc", fx.plateDc ? 1.0f : 0.0f);
+    put ("combNegativeB", (float) fx.combNegativeB);
+    put ("chorusMode", (float) fx.chorusMode);
+    put ("glitchTimingMode", (float) fx.glitchTimingMode);
+    put ("glitchSync", fx.glitchSync ? 1.0f : 0.0f);
+    put ("glitchDivision", (float) fx.glitchDivision);
+    put ("glitchHighpass", fx.glitchHighpass ? 1.0f : 0.0f);
 }
 
 void OrogenProcessor::renderRange (juce::AudioBuffer<float>& buf, int start, int num)
@@ -564,24 +636,24 @@ void OrogenProcessor::processBlock (juce::AudioBuffer<float>& buf, juce::MidiBuf
     juce::ScopedNoDenormals noDenormals;
     buf.clear();
 
-    collectPatch (patch, fxSettings);
+    // Snapshot APVTS atomics into audio-thread-local POD, not the GUI's
+    // patch/fxSettings members. Message-thread preset loading must never call
+    // FxChain::set concurrently with render().
+    const auto hashBefore = hashParams();
+    Patch blockPatch; FxChain::Settings blockFx;
+    collectPatch (blockPatch, blockFx);
+    const auto hashAfter = hashParams();
 
     masterGain = globRefs[1]->load();
     inst.setMasterGain (masterGain);
+    inst.applyPatch (blockPatch);
 
-    // applyPatch() = копия POD-структуры + подхват движков, подготовленных
-    // message-потоком. Ни аллокаций, ни обращения к куче — можно каждый блок.
-    inst.applyPatch (patch);
-
-    // настройки эффектов применяем только при изменении: FxChain::set()
-    // переустанавливает линии задержки, и повторный вызов меняет звук
-    const auto hash = hashParams();
-    if (hash != lastParamHash)
+    // If automation changes during collection, apply the snapshot now and
+    // force another snapshot next block instead of losing that last change.
+    if (hashBefore != hashAfter || hashAfter != lastParamHash)
     {
-        lastParamHash = hash;
-        patch.setName (presets.empty() ? "Untitled"
-                                       : presets[(size_t) currentProgram].name.toRawUTF8());
-        inst.setFx (fxSettings);
+        lastParamHash = hashBefore == hashAfter ? hashAfter : 0;
+        inst.setFx (blockFx);
     }
 
     const int lat = inst.fxLatency();
@@ -661,7 +733,7 @@ void OrogenProcessor::loadPreset (int index)
     fxSettings = presets[(size_t) index].fx;
     applyToParams (patch, fxSettings);
     inst.stagePatch (patch);
-    inst.setFx (fxSettings);
+    // FX are applied from the APVTS snapshot by the audio thread.
     stagedTypeHash = slotTypeHash();
     if (auto* ed = getActiveEditor()) ed->repaint();
 }
@@ -691,7 +763,7 @@ bool OrogenProcessor::loadPresetFile (const juce::File& f)
     fxSettings = fx;
     applyToParams (patch, fxSettings);
     inst.stagePatch (patch);            // движки построит message thread
-    inst.setFx (fxSettings);
+    // FX are applied from the APVTS snapshot by the audio thread.
     stagedTypeHash = slotTypeHash();
     return true;
 }
@@ -814,11 +886,44 @@ void OrogenProcessor::setStateInformation (const void* data, int sizeInBytes)
     for (int s = 0; s < kNumSlots; ++s)
         restoreMissingDefault (slotPrefix (s) + "grainReverse");
 
+    // A state with NO rack power IDs predates the switch feature. In that
+    // version the chain (notably Dynamics) was always active; restore all on.
+    // Partial modern states instead take the safe parameter defaults.
+    bool legacyFxState = true;
+    for (const auto& module : kFxModules)
+        if (state.getChildWithProperty ("id", module.onId).isValid()) legacyFxState = false;
+    for (const auto& module : kFxModules)
+    {
+        if (state.getChildWithProperty ("id", module.onId).isValid()) continue;
+        juce::ValueTree entry ("PARAM");
+        entry.setProperty ("id", module.onId, nullptr);
+        entry.setProperty ("value", legacyFxState ? 1.0f : 0.0f, nullptr);
+        state.appendChild (entry, nullptr);
+    }
+    int extraCount = 0;
+    const auto* extra = fxExtraParamTable (extraCount);
+    for (int i = 0; i < extraCount; ++i) restoreMissingDefault (juce::String ("fx_") + extra[i].id);
+    restoreMissingDefault ("fx_plateDc");
+    restoreMissingDefault ("fx_combNegativeB");
+    // Host reset defaults are the new INIT modes. Missing IDs in an older
+    // state must instead select the old OROGEN paths explicitly, even when
+    // loading over an already-edited modern instance.
+    for (const char* id : { "fx_chorusMode", "fx_glitchTimingMode" })
+        if (! state.getChildWithProperty ("id", id).isValid())
+        {
+            juce::ValueTree entry ("PARAM");
+            entry.setProperty ("id", id, nullptr);
+            entry.setProperty ("value", 0.0f, nullptr); // Legacy
+            state.appendChild (entry, nullptr);
+        }
+    for (const char* id : { "fx_glitchSync", "fx_glitchDivision", "fx_glitchHighpass" })
+        restoreMissingDefault (id);
+
     apvts.replaceState (state);
     collectPatch (patch, fxSettings);
     patch.setName (state.getProperty ("patchName", "Untitled").toString().toRawUTF8());
     inst.stagePatch (patch);
-    inst.setFx (fxSettings);
+    // FX are applied from the APVTS snapshot by the audio thread.
     stagedTypeHash = slotTypeHash();
 }
 
