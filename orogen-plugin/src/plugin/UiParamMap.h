@@ -117,10 +117,14 @@ inline std::vector<UiTab> buildUiTabs()
         {
             UiSection sec;
             sec.title = t;
-            for (const auto& id : all)
-                if (detail::fxSectionOf (id) == t) sec.ids.add (id);
+            for (int copy = 0; copy < FxChain::kCopiesPerModule; ++copy)
+                for (const auto& id : all)
+                    if (detail::fxSectionOf (id) == t) sec.ids.add (fxCopyId (id, copy));
             tab.sections.push_back (sec);
         }
+        UiSection order { "RACK ORDER", {} };
+        for (int node = 0; node < FxChain::kNodeCount; ++node) order.ids.add (fxRankId (node));
+        tab.sections.push_back (order);
         tabs.push_back (tab);
     }
 

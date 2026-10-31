@@ -27,8 +27,8 @@ namespace orogen
 namespace
 {
     // Все эффекты, у которых есть ручка доли (mix): 10 штук, по 5 на страницу.
-    // EQ, DYNAMICS и WIDTH доли не имеют — они всегда в цепи и правятся в
-    // колонке FX CHAIN, поэтому чипов у них нет.
+    // EQ, DYNAMICS и WIDTH не имеют доли и отдельных чипов; их можно
+    // выбрать и настроить на странице FX RACK.
     struct ChipDef { const char* name; int glyph; const char* id; const char* onId; };
     const ChipDef kChips[] =
     {
@@ -45,6 +45,14 @@ namespace
     };
     constexpr int kChipTotal = (int) (sizeof (kChips) / sizeof (kChips[0]));
     constexpr int kChipsPerPage = 5;
+
+    int chipModule (int index)
+    {
+        if (index < 0 || index >= kChipTotal) return -1;
+        for (int module = 0; module < FxChain::ModuleCount; ++module)
+            if (std::strcmp (kChips[index].onId, kFxModules[module].onId) == 0) return module;
+        return -1;
+    }
 
     int lfoPreviewCycles (float rate)
     {
@@ -753,7 +761,7 @@ private:
 // Dedicated effects rack: the left column is the real, fixed DSP order. Power
 // and every control are APVTS attachments, including the extended COMB controls.
 //============================================================================
-class OrogenEditor::FxPage : public juce::Component
+class OrogenEditor::FxPage : public juce::Component, private juce::Timer
 {
     class RackLookAndFeel : public OrLookAndFeel
     {
@@ -791,6 +799,7 @@ class OrogenEditor::FxPage : public juce::Component
     public:
         SelectButton (int n, const juce::String& title) : juce::Button (title), number (n) {}
         void setSelected (bool b) { selected = b; repaint(); }
+        void setPosition (int n) { number = n; repaint(); }
         void paintButton (juce::Graphics& g, bool over, bool down) override
         {
             auto box = getLocalBounds().toFloat().reduced (0.5f);
@@ -829,39 +838,40 @@ class OrogenEditor::FxPage : public juce::Component
         {
             auto* param = p.apvts.getParameter (id);
             if (param == nullptr) return;
+            const auto logicalId = fxOriginalId (id);
             label = param->getName (80);
             // Show the actual unit/routing hints rather than cryptic host IDs.
-            if (id == "fx_combTapA") label = "TAP A";
-            if (id == "fx_combTapB") label = "TAP B";
-            if (id == "fx_combTapC") label = "TAP C";
-            if (id == "fx_combTapD") label = "TAP D";
-            if (id == "fx_combNegative") label = "NEGATIVE A";
-            if (id == "fx_combNegativeB") label = "NEGATIVE B";
-            if (id == "fx_chorusDelay") label = "DELAY / DEL";
-            if (id == "fx_chorusDepth") label = "DEPTH / DEP";
-            if (id == "fx_chorusRate") label = "RATE / SPD";
-            if (id == "fx_chorusMix") label = "MIX";
-            if (id == "fx_chorusFeedback") label = "FEEDBACK / FB";
-            if (id == "fx_chorusWidth") label = "WIDTH / WID";
-            if (id == "fx_chorusLowpass") label = "LOWPASS / LP";
-            if (id == "fx_chorusInput") label = "INPUT / INP";
-            if (id == "fx_glitchLengthMs") label = "LENGTH / MS";
-            if (id == "fx_glitchRepeats") label = "REPEATS";
-            if (id == "fx_glitchReverse") label = "REVERSE";
-            if (id == "fx_glitchFeedback") label = "FEEDBACK";
-            if (id == "fx_spectreWindow") label = "WINDOW / SAMPLES";
-            if (id == "fx_spectreWindowExt") label = "WINDOW EXT / SAMPLES";
+            if (logicalId == "fx_combTapA") label = "TAP A";
+            if (logicalId == "fx_combTapB") label = "TAP B";
+            if (logicalId == "fx_combTapC") label = "TAP C";
+            if (logicalId == "fx_combTapD") label = "TAP D";
+            if (logicalId == "fx_combNegative") label = "NEGATIVE A";
+            if (logicalId == "fx_combNegativeB") label = "NEGATIVE B";
+            if (logicalId == "fx_chorusDelay") label = "DELAY / DEL";
+            if (logicalId == "fx_chorusDepth") label = "DEPTH / DEP";
+            if (logicalId == "fx_chorusRate") label = "RATE / SPD";
+            if (logicalId == "fx_chorusMix") label = "MIX";
+            if (logicalId == "fx_chorusFeedback") label = "FEEDBACK / FB";
+            if (logicalId == "fx_chorusWidth") label = "WIDTH / WID";
+            if (logicalId == "fx_chorusLowpass") label = "LOWPASS / LP";
+            if (logicalId == "fx_chorusInput") label = "INPUT / INP";
+            if (logicalId == "fx_glitchLengthMs") label = "LENGTH / MS";
+            if (logicalId == "fx_glitchRepeats") label = "REPEATS";
+            if (logicalId == "fx_glitchReverse") label = "REVERSE";
+            if (logicalId == "fx_glitchFeedback") label = "FEEDBACK";
+            if (logicalId == "fx_spectreWindow") label = "WINDOW / SAMPLES";
+            if (logicalId == "fx_spectreWindowExt") label = "WINDOW EXT / SAMPLES";
             // Drop redundant group names to leave more room for meaningful text.
             if (label.startsWithIgnoreCase (group + " ")) label = label.substring (group.length() + 1);
             label = label.toUpperCase();
             auto tip = param->getName (80) + " / " + id;
-            if (id.startsWith ("fx_combTap")) tip += " / -1 follows the shared delay";
-            if (id == "fx_combNegativeB") tip += " / Follow A preserves the original link";
-            if (id.endsWith ("Ext") || id == "fx_glitchDryLevel" || id == "fx_glitchWetLevel")
+            if (logicalId.startsWith ("fx_combTap")) tip += " / -1 follows the shared delay";
+            if (logicalId == "fx_combNegativeB") tip += " / Follow A preserves the original link";
+            if (logicalId.endsWith ("Ext") || logicalId == "fx_glitchDryLevel" || logicalId == "fx_glitchWetLevel")
                 tip += " / FOLLOW uses the original parameter; type FOLLOW or double-click to reset";
-            if (id == "fx_spectreWindowExt") tip += " / 512 to 65536 samples";
-            if (id == "fx_chorusMode") tip += " / Legacy preserves old OROGEN; V1 internal mix; V2 external mix";
-            if (id == "fx_glitchTimingMode") tip += " / Host rate is correct; Legacy preserves old OROGEN timing";
+            if (logicalId == "fx_spectreWindowExt") tip += " / 512 to 65536 samples";
+            if (logicalId == "fx_chorusMode") tip += " / Legacy preserves old OROGEN; V1 internal mix; V2 external mix";
+            if (logicalId == "fx_glitchTimingMode") tip += " / Host rate is correct; Legacy preserves old OROGEN timing";
             getProperties().set ("paramId", id);
             if (auto* choice = dynamic_cast<juce::AudioParameterChoice*> (param))
             {
@@ -872,7 +882,7 @@ class OrogenEditor::FxPage : public juce::Component
                 combo->getProperties().set ("paramId", id);
                 addAndMakeVisible (*combo);
                 comboAtt = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (p.apvts, id, *combo);
-                if (id == "fx_chorusModel") combo->onChange = [this] { if (onModelChanged) onModelChanged(); };
+                if (logicalId == "fx_chorusModel") combo->onChange = [this] { if (onModelChanged) onModelChanged(); };
             }
             else if (dynamic_cast<juce::AudioParameterBool*> (param) != nullptr)
             {
@@ -896,24 +906,24 @@ class OrogenEditor::FxPage : public juce::Component
                 slider->getProperties().set ("big", true);
                 addAndMakeVisible (*slider);
                 sliderAtt = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (p.apvts, id, *slider);
-                if (id.endsWith ("Ext") || id.startsWith ("fx_combTap") || id == "fx_glitchDryLevel" || id == "fx_glitchWetLevel")
+                if (logicalId.endsWith ("Ext") || logicalId.startsWith ("fx_combTap") || logicalId == "fx_glitchDryLevel" || logicalId == "fx_glitchWetLevel")
                 {
                     const double follow = param->convertFrom0to1 (param->getDefaultValue());
-                    slider->textFromValueFunction = [param, paramId, follow] (double value) {
+                    slider->textFromValueFunction = [param, logicalId, follow] (double value) {
                         bool follows = value <= follow + 0.00001;
-                        if (paramId == "fx_glitchDryLevel" || paramId == "fx_glitchWetLevel"
-                            || (paramId.endsWith ("Ext") && follow == -1.0)) follows = value < 0.0;
+                        if (logicalId == "fx_glitchDryLevel" || logicalId == "fx_glitchWetLevel"
+                            || (logicalId.endsWith ("Ext") && follow == -1.0)) follows = value < 0.0;
                         if (follows) return juce::String ("FOLLOW");
-                        if (paramId == "fx_spectreWindowExt") return juce::String (512 << juce::jlimit (0, 7, (int) std::lround (value)));
-                        if (paramId == "fx_glitchDryLevel" || paramId == "fx_glitchWetLevel")
+                        if (logicalId == "fx_spectreWindowExt") return juce::String (512 << juce::jlimit (0, 7, (int) std::lround (value)));
+                        if (logicalId == "fx_glitchDryLevel" || logicalId == "fx_glitchWetLevel")
                             return juce::String (value * 100.0, 1) + " %";
                         return param->getText (param->convertTo0to1 ((float) value), 0);
                     };
-                    slider->valueFromTextFunction = [param, paramId, follow] (const juce::String& text) {
+                    slider->valueFromTextFunction = [param, logicalId, follow] (const juce::String& text) {
                         if (text.trim().equalsIgnoreCase ("FOLLOW")) return follow;
-                        if (paramId == "fx_glitchDryLevel" || paramId == "fx_glitchWetLevel")
+                        if (logicalId == "fx_glitchDryLevel" || logicalId == "fx_glitchWetLevel")
                             return juce::jlimit (0.0, 100.0, text.getDoubleValue()) * 0.01;
-                        if (paramId == "fx_spectreWindowExt") {
+                        if (logicalId == "fx_spectreWindowExt") {
                             const double n = text.getDoubleValue();
                             return n >= 512 ? (double) juce::jlimit (0, 7, (int) std::lround (std::log2 (n / 512.0)))
                                             : (double) juce::jlimit (0, 7, (int) std::lround (n));
@@ -922,7 +932,7 @@ class OrogenEditor::FxPage : public juce::Component
                     };
                     slider->updateText();
                 }
-                if (id == "fx_spectreWindow")
+                if (logicalId == "fx_spectreWindow")
                 {
                     slider->textFromValueFunction = [] (double value) { return juce::String (512 << juce::jlimit (0, 6, (int) std::lround (value))); };
                     slider->valueFromTextFunction = [] (const juce::String& text) {
@@ -933,19 +943,19 @@ class OrogenEditor::FxPage : public juce::Component
                     slider->setTooltip (tip + " / 512–32768 samples; use WINDOW EXTENDED for 65536");
                     slider->updateText();
                 }
-                if (id == "fx_combOdinMix" || id == "fx_combBalance" || id == "fx_combMix"
-                    || id == "fx_glitchMix" || id == "fx_glitchChance" || id == "fx_glitchReverse"
-                    || id == "fx_glitchFeedback" || id == "fx_spectreMix")
+                if (logicalId == "fx_combOdinMix" || logicalId == "fx_combBalance" || logicalId == "fx_combMix"
+                    || logicalId == "fx_glitchMix" || logicalId == "fx_glitchChance" || logicalId == "fx_glitchReverse"
+                    || logicalId == "fx_glitchFeedback" || logicalId == "fx_spectreMix")
                 {
-                    const double scale = id == "fx_glitchFeedback" ? 95.0 : 100.0;
+                    const double scale = logicalId == "fx_glitchFeedback" ? 95.0 : 100.0;
                     slider->textFromValueFunction = [scale] (double value) { return juce::String (value * scale, 1) + " %"; };
                     slider->valueFromTextFunction = [scale] (const juce::String& text) { return juce::jlimit (0.0, scale, text.getDoubleValue()) / scale; };
                     slider->updateText();
                 }
-                if (id == "fx_chorusDepth" || id == "fx_chorusRate" || id == "fx_chorusMix")
+                if (logicalId == "fx_chorusDepth" || logicalId == "fx_chorusRate" || logicalId == "fx_chorusMix")
                 {
-                    auto* model = p.apvts.getParameter ("fx_chorusModel");
-                    const double scale = id == "fx_chorusRate" ? 63.5 : 127.0;
+                    auto* model = p.apvts.getParameter (fxCopyId ("fx_chorusModel", fxIdCopy (id)));
+                    const double scale = logicalId == "fx_chorusRate" ? 63.5 : 127.0;
                     slider->textFromValueFunction = [param, model, scale] (double value) {
                         const bool firmware = model != nullptr && model->convertFrom0to1 (model->getValue()) > 0.5f;
                         return firmware ? juce::String ((int) std::lround (value * scale))
@@ -997,7 +1007,7 @@ class OrogenEditor::FxPage : public juce::Component
     class Content : public juce::Component
     {
     public:
-        Content (OrogenProcessor& proc, int module, const UiSection& section) : index (module)
+        Content (OrogenProcessor& proc, int module, int copy, const UiSection& section)
         {
             // Group model-dependent controls explicitly. The parameters remain
             // editable when inactive so a model can be prepared before switching.
@@ -1013,7 +1023,9 @@ class OrogenEditor::FxPage : public juce::Component
             controls.resize (groups.size());
             for (const auto& id : section.ids)
             {
-                if (id == kFxModules[module].onId) continue; // visible power in the sidebar/header
+                if (fxIdCopy (id) != copy) continue;
+                const auto baseId = fxOriginalId (id);
+                if (baseId == kFxModules[module].onId) continue; // visible power in the sidebar/header
                 int group = 0;
                 if (module == FxChain::Comb)
                 {
@@ -1021,20 +1033,20 @@ class OrogenEditor::FxPage : public juce::Component
                         "fx_combOutputDb", "fx_combDepth", "fx_combRate", "fx_combEnvelope", "fx_combDecayMs" };
                     static const juce::StringArray odin { "fx_combFreqA", "fx_combFreqB", "fx_combResA", "fx_combResB",
                         "fx_combBalance", "fx_combRouting", "fx_combNegative", "fx_combNegativeB" };
-                    group = id.endsWith ("Ext") ? 3 : shared.contains (id) ? 0
-                            : (odin.contains (id) || id == "fx_combOdinMix") ? 1 : 2;
+                    group = baseId.endsWith ("Ext") ? 3 : shared.contains (baseId) ? 0
+                            : (odin.contains (baseId) || baseId == "fx_combOdinMix") ? 1 : 2;
                 }
                 else if (module == FxChain::Spectre)
                 {
                     static const juce::StringArray common { "fx_spectreModel", "fx_spectreMix", "fx_spectreWindow", "fx_spectreProminence" };
-                    group = id.endsWith ("Ext") ? 2 : common.contains (id) ? 0 : 1;
+                    group = baseId.endsWith ("Ext") ? 2 : common.contains (baseId) ? 0 : 1;
                 }
                 else if (module == FxChain::Glitch)
                 {
                     static const juce::StringArray mixTiming { "fx_glitchMix", "fx_glitchDryLevel", "fx_glitchWetLevel", "fx_glitchTimingMode", "fx_glitchSync", "fx_glitchDivision", "fx_glitchLengthMs", "fx_glitchLengthExt" };
                     static const juce::StringArray variation { "fx_glitchDrift", "fx_glitchPitchStep", "fx_glitchPitchRandom", "fx_glitchReroll", "fx_glitchDecay" };
                     static const juce::StringArray shaping { "fx_glitchFold", "fx_glitchFoldDrive", "fx_glitchTone", "fx_glitchHighpass", "fx_glitchResonance" };
-                    group = mixTiming.contains (id) ? 0 : variation.contains (id) ? 3 : shaping.contains (id) ? 2 : 1;
+                    group = mixTiming.contains (baseId) ? 0 : variation.contains (baseId) ? 3 : shaping.contains (baseId) ? 2 : 1;
                 }
                 auto* c = new Control (proc, id, section.title);
                 addAndMakeVisible (c);
@@ -1042,7 +1054,7 @@ class OrogenEditor::FxPage : public juce::Component
                 controls[(size_t) group].push_back (c);
             }
             for (auto* c : owned)
-                if (c->id == "fx_chorusModel") c->onModelChanged = [this] {
+                if (fxOriginalId (c->id) == "fx_chorusModel") c->onModelChanged = [this] {
                     for (auto* control : owned) control->refreshText();
                 };
         }
@@ -1085,7 +1097,7 @@ class OrogenEditor::FxPage : public juce::Component
                             w - juce::roundToInt (32*s), juce::roundToInt (18*s), juce::Justification::centredLeft, false);
                 g.setColour (Palette::textDim);
                 g.setFont (orFont (11.0f * s));
-                g.drawFittedText ("1  Select an effect on the left    2  Click OFF to turn it on    3  Drag a knob or type a value",
+                g.drawFittedText ("1  Choose an effect and click ADD    2  Select it to edit    3  Use UP / DOWN to change the signal order",
                                   juce::Rectangle<int> (x + juce::roundToInt (16*s), y + juce::roundToInt (36*s),
                                                         w - juce::roundToInt (32*s), juce::roundToInt (37*s)),
                                   juce::Justification::centredLeft, 2);
@@ -1109,7 +1121,6 @@ class OrogenEditor::FxPage : public juce::Component
             return result;
         }
     private:
-        int index;
         int guideY = 0;
         float s = 1.0f;
         juce::StringArray groups;
@@ -1119,12 +1130,12 @@ class OrogenEditor::FxPage : public juce::Component
     };
 
 public:
-    explicit FxPage (OrogenProcessor& p) : proc (p), headerPower ("Selected effect power")
+    explicit FxPage (OrogenProcessor& p) : proc (p), tabs (buildUiTabs()), headerPower ("Selected effect power")
     {
         setOpaque (true);
         setLookAndFeel (&rackLookAndFeel);
         back.setTooltip ("Return to the main synthesizer");
-        allParams.setTooltip ("Open the complete parameter list");
+        allParams.setTooltip ("Open all parameters, including every effect copy");
         addAndMakeVisible (back); addAndMakeVisible (allParams);
         back.onClick = [this] { if (onClose) onClose(); };
         allParams.onClick = [this] { if (onParams) onParams(); };
@@ -1134,48 +1145,111 @@ public:
         viewport.getVerticalScrollBar().setColour (juce::ScrollBar::thumbColourId, Palette::textDim);
         viewport.getVerticalScrollBar().setColour (juce::ScrollBar::backgroundColourId, juce::Colours::transparentBlack);
         viewport.getVerticalScrollBar().setColour (juce::ScrollBar::trackColourId, juce::Colours::transparentBlack);
-        const auto tabs = buildUiTabs();
-        for (int i = 0; i < FxChain::ModuleCount; ++i)
+        addAndMakeVisible (addChoice); addAndMakeVisible (addButton);
+        addAndMakeVisible (upButton); addAndMakeVisible (downButton); addAndMakeVisible (removeButton);
+        addChoice.setTooltip ("Choose a type, then click ADD. Up to four independent copies of each type.");
+        for (int module = 0; module < FxChain::ModuleCount; ++module) addChoice.addItem (kFxModules[module].name, module + 1);
+        addChoice.setSelectedId (1, juce::dontSendNotification);
+        addButton.setTooltip ("Add an enabled effect at the end of the signal chain");
+        upButton.setTooltip ("Move the selected effect earlier in the audio path");
+        downButton.setTooltip ("Move the selected effect later in the audio path");
+        removeButton.setTooltip ("Remove the selected effect from the audio path");
+        addButton.getProperties().set ("fxAction", "add");
+        upButton.getProperties().set ("fxAction", "up");
+        downButton.getProperties().set ("fxAction", "down");
+        removeButton.getProperties().set ("fxAction", "remove");
+        addChoice.getProperties().set ("fxAction", "type");
+        addButton.onClick = [this] {
+            const int node = proc.addRackEffect (addChoice.getSelectedId() - 1);
+            if (node < 0) { status = "LIMIT: 16 TOTAL / 4 PER TYPE"; repaint(); return; }
+            status = "ADDED AT END OF CHAIN"; refreshOrder(); setSelected (node);
+        };
+        upButton.onClick = [this] { if (proc.moveRackNode (selected, -1)) { status = "MOVED EARLIER"; refreshOrder(); } };
+        downButton.onClick = [this] { if (proc.moveRackNode (selected, 1)) { status = "MOVED LATER"; refreshOrder(); } };
+        removeButton.onClick = [this] {
+            const auto before = proc.rackOrder();
+            const auto it = std::find (before.begin(), before.end(), selected);
+            const int pos = it == before.end() ? 0 : (int) std::distance (before.begin(), it);
+            if (proc.removeRackNode (selected)) {
+                status = "REMOVED FROM CHAIN"; refreshOrder();
+                if (! order.empty()) setSelected (order[(size_t) juce::jmin (pos, (int) order.size() - 1)]);
+            }
+        };
+        for (int node = 0; node < FxChain::kNodeCount; ++node)
         {
-            auto* button = new SelectButton (i, kFxModules[i].name);
-            button->onClick = [this, i] { setSelected (i); };
-            button->setTooltip ("Select " + juce::String (kFxModules[i].name) + " to edit its controls");
-            button->getProperties().set ("fxSelect", i);
-            selectButtons.add (button); addAndMakeVisible (button);
-            auto* power = new PowerButton (juce::String (kFxModules[i].name) + " power");
-            power->getProperties().set ("paramId", kFxModules[i].onId);
-            powerButtons.add (power); addAndMakeVisible (power);
+            const int module = node % FxChain::ModuleCount, copy = node / FxChain::ModuleCount;
+            const auto title = juce::String (kFxModules[module].name) + " #" + juce::String (copy + 1);
+            auto* button = new SelectButton (node, title);
+            button->onClick = [this, node] { setSelected (node); };
+            button->setTooltip ("Select " + title + " to edit its independent controls");
+            button->getProperties().set ("fxSelect", node);
+            selectButtons.add (button); addChildComponent (button);
+            auto* power = new PowerButton (title + " power");
+            const auto powerId = fxCopyId (kFxModules[module].onId, copy);
+            power->getProperties().set ("paramId", powerId);
+            powerButtons.add (power); addChildComponent (power);
             powerAtts.push_back (std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
-                proc.apvts, kFxModules[i].onId, *power));
+                proc.apvts, powerId, *power));
+        }
+        refreshOrder();
+        if (! order.empty()) setSelected (order.front());
+        startTimerHz (15);
+    }
+    ~FxPage() override { stopTimer(); viewport.setViewedComponent (nullptr, false); setLookAndFeel (nullptr); }
+    std::function<void()> onClose, onParams;
+
+    void refreshOrder()
+    {
+        order = proc.rackOrder();
+        for (int node = 0; node < FxChain::kNodeCount; ++node)
+        {
+            const auto it = std::find (order.begin(), order.end(), node);
+            const bool visible = it != order.end();
+            selectButtons[node]->setVisible (visible);
+            powerButtons[node]->setVisible (visible);
+            if (visible) selectButtons[node]->setPosition ((int) std::distance (order.begin(), it));
+        }
+        if (std::find (order.begin(), order.end(), selected) == order.end())
+        {
+            if (! order.empty()) setSelected (order.front());
+            else { selected = -1; headerPowerAtt.reset(); headerPower.setVisible (false); viewport.setViewedComponent (nullptr, false); }
+        }
+        resized(); repaint();
+    }
+    void timerCallback() override
+    {
+        if (isShowing() && proc.rackOrder() != order) refreshOrder();
+    }
+    void setSelected (int node)
+    {
+        if (node < 0 || node >= FxChain::kNodeCount) return;
+        selected = node;
+        const int module = node % FxChain::ModuleCount, copy = node / FxChain::ModuleCount;
+        for (int j = 0; j < selectButtons.size(); ++j) selectButtons[j]->setSelected (j == selected);
+        if (contents[(size_t) node] == nullptr)
+        {
             const UiSection* section = nullptr;
             for (const auto& candidate : tabs[1].sections)
-                if (candidate.title == kFxModules[i].section) { section = &candidate; break; }
-            jassert (section != nullptr);
-            if (section != nullptr) contents.add (new Content (proc, i, *section));
+                if (candidate.title == kFxModules[module].section) { section = &candidate; break; }
+            if (section == nullptr) return;
+            contents[(size_t) node] = std::make_unique<Content> (proc, module, copy, *section);
         }
-        setSelected (0);
-    }
-    ~FxPage() override { viewport.setViewedComponent (nullptr, false); setLookAndFeel (nullptr); }
-    std::function<void()> onClose, onParams;
-    void setSelected (int i)
-    {
-        if (contents.size() != FxChain::ModuleCount) return;
-        selected = juce::jlimit (0, FxChain::ModuleCount - 1, i);
-        for (int j = 0; j < selectButtons.size(); ++j) selectButtons[j]->setSelected (j == selected);
         headerPowerAtt.reset();
-        headerPower.getProperties().set ("paramId", kFxModules[selected].onId);
-        headerPower.setTooltip (juce::String (kFxModules[selected].name) + " on/off / settings are kept");
-        headerPowerAtt = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
-            proc.apvts, kFxModules[selected].onId, headerPower);
-        viewport.setViewedComponent (contents[selected], false);
+        const auto powerId = fxCopyId (kFxModules[module].onId, copy);
+        headerPower.getProperties().set ("paramId", powerId);
+        headerPower.setTooltip (juce::String (kFxModules[module].name) + " #" + juce::String (copy + 1) + " on/off");
+        headerPower.setVisible (true);
+        headerPowerAtt = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (proc.apvts, powerId, headerPower);
+        viewport.setViewedComponent (contents[(size_t) node].get(), false);
         viewport.setViewPosition (0, 0);
         resized(); repaint();
     }
-    int selectedModule() const { return selected; }
+    int selectedModule() const { return selected < 0 ? -1 : selected % FxChain::ModuleCount; }
     juce::StringArray allIds() const
     {
         juce::StringArray ids;
-        for (int i = 0; i < contents.size(); ++i) { ids.add (kFxModules[i].onId); ids.addArray (contents[i]->ids()); }
+        for (const auto& section : tabs[1].sections)
+            if (section.title != "RACK ORDER") ids.addArray (section.ids);
         return ids;
     }
     void resized() override
@@ -1188,15 +1262,19 @@ public:
         back.setBounds (r (18, 18, 142, 32));
         allParams.setBounds (r (1100, 18, 162, 32));
         headerPower.setBounds (r (1155, 113, 76, 34));
-        for (int i = 0; i < selectButtons.size(); ++i)
+        addChoice.setBounds (r (24, 126, 147, 28)); addButton.setBounds (r (177, 126, 66, 28));
+        upButton.setBounds (r (24, 677, 68, 29)); downButton.setBounds (r (98, 677, 68, 29));
+        removeButton.setBounds (r (172, 677, 71, 29));
+        for (int i = 0; i < (int) order.size(); ++i)
         {
-            const float y = 145.0f + 43.0f * (float) i;
-            selectButtons[i]->setBounds (r (24, y, 150, 39));
-            powerButtons[i]->setBounds (r (179, y, 64, 39));
+            const int node = order[(size_t) i];
+            const float y = 164.0f + 31.0f * (float) i;
+            selectButtons[node]->setBounds (r (24, y, 160, 28));
+            powerButtons[node]->setBounds (r (189, y, 54, 28));
         }
         viewport.setBounds (r (268, 194, 989, 548));
-        if (selected < contents.size())
-            contents[selected]->layoutFor (juce::jmax (1, viewport.getMaximumVisibleWidth() - juce::roundToInt (14*s)), s);
+        if (selected >= 0 && contents[(size_t) selected] != nullptr)
+            contents[(size_t) selected]->layoutFor (juce::jmax (1, viewport.getMaximumVisibleWidth() - juce::roundToInt (14*s)), s);
     }
     void paint (juce::Graphics& g) override
     {
@@ -1204,8 +1282,7 @@ public:
         juce::Graphics::ScopedSaveState save (g);
         g.addTransform (juce::AffineTransform::scale (s));
         g.fillAll (Palette::bg);
-        g.setColour (Palette::panel);
-        g.fillRect (0, 0, 1280, 68);
+        g.setColour (Palette::panel); g.fillRect (0, 0, 1280, 68);
         g.setColour (Palette::lineMid); g.fillRect (0, 67, 1280, 1);
         g.setColour (Palette::text); g.setFont (orFont (19.0f, true));
         g.drawText ("EFFECTS", 187, 17, 215, 31, juce::Justification::centredLeft, false);
@@ -1214,20 +1291,32 @@ public:
         draw::panel (g, { 16, 85, 235, 667 }, 4.0f, Palette::panel, Palette::line);
         draw::panel (g, { 268, 85, 989, 667 }, 4.0f, Palette::panel, Palette::line);
         g.setColour (Palette::text); g.setFont (orFont (12.0f, true));
-        g.drawText ("SIGNAL CHAIN", 26, 99, 200, 18, juce::Justification::centredLeft, false);
+        g.drawText ("SIGNAL CHAIN", 26, 99, 130, 18, juce::Justification::centredLeft, false);
         g.setColour (Palette::textDim); g.setFont (orFont (10.0f));
-        g.drawText ("Select to edit   /   switch to enable", 26, 119, 215, 16, juce::Justification::centredLeft, false);
-        g.setColour (Palette::textFaint); g.setFont (orFont (11.0f, true));
-        g.drawText (juce::String (selected + 1).paddedLeft ('0', 2), 290, 105, 32, 28, juce::Justification::centredLeft, false);
-        g.setColour (Palette::text); g.setFont (orFont (21.0f, true));
-        g.drawText (kFxModules[selected].name, 326, 105, 500, 30, juce::Justification::centredLeft, false);
-        g.setColour (Palette::textDim); g.setFont (orFont (12.0f));
-        g.drawText (kFxModules[selected].description, 326, 140, 720, 20, juce::Justification::centredLeft, false);
+        g.drawText (juce::String ((int) order.size()) + " / 16", 181, 99, 60, 18, juce::Justification::centredRight, false);
+        g.drawFittedText (status, 25, 716, 216, 26, juce::Justification::centredLeft, 2);
+        if (selected >= 0)
+        {
+            const int module = selected % FxChain::ModuleCount, copy = selected / FxChain::ModuleCount;
+            const auto it = std::find (order.begin(), order.end(), selected);
+            const int position = it == order.end() ? 0 : (int) std::distance (order.begin(), it) + 1;
+            g.setColour (Palette::textFaint); g.setFont (orFont (11.0f, true));
+            g.drawText (juce::String (position).paddedLeft ('0', 2), 290, 105, 32, 28, juce::Justification::centredLeft, false);
+            g.setColour (Palette::text); g.setFont (orFont (21.0f, true));
+            g.drawText (juce::String (kFxModules[module].name) + " #" + juce::String (copy + 1), 326, 105, 500, 30, juce::Justification::centredLeft, false);
+            g.setColour (Palette::textDim); g.setFont (orFont (12.0f));
+            g.drawText (kFxModules[module].description, 326, 140, 720, 20, juce::Justification::centredLeft, false);
+        }
+        else
+        {
+            g.setColour (Palette::text); g.setFont (orFont (18.0f, true));
+            g.drawText ("CHOOSE AN EFFECT AND CLICK ADD", 300, 110, 650, 30, juce::Justification::centredLeft, false);
+        }
         g.setColour (Palette::line); g.fillRect (286, 177, 951, 1);
         g.setColour (Palette::textFaint); g.setFont (orFont (10.5f));
-        g.drawText ("FIXED ORDER  /  OUTPUT SAFETY AND ROBIN DRY LATENCY REMAIN ACTIVE",
+        g.drawText ("TOP TO BOTTOM = AUDIO ORDER  /  OUTPUT SAFETY + ROBIN DRY LATENCY ACTIVE",
                     25, 764, 720, 19, juce::Justification::centredLeft, false);
-        g.drawText ("DRAG KNOBS  /  CLICK VALUE TO TYPE  /  SCROLL FOR MORE",
+        g.drawText ("ADD  /  SELECT  /  MOVE UP OR DOWN  /  REMOVE",
                     729, 764, 525, 19, juce::Justification::centredRight, false);
     }
     bool keyPressed (const juce::KeyPress& key) override
@@ -1238,13 +1327,18 @@ public:
 private:
     OrogenProcessor& proc;
     RackLookAndFeel rackLookAndFeel;
-    int selected = 0;
+    int selected = -1;
+    juce::String status { "UP TO 16 EFFECTS / 4 OF EACH TYPE" };
+    std::vector<UiTab> tabs;
+    std::vector<int> order;
     juce::TextButton back { "<  SYNTH" }, allParams { "ALL PARAMETERS" };
+    juce::ComboBox addChoice;
+    juce::TextButton addButton { "+ ADD" }, upButton { "UP" }, downButton { "DOWN" }, removeButton { "REMOVE" };
     PowerButton headerPower;
     juce::Viewport viewport;
     juce::OwnedArray<SelectButton> selectButtons;
     juce::OwnedArray<PowerButton> powerButtons;
-    juce::OwnedArray<Content> contents;
+    std::array<std::unique_ptr<Content>, FxChain::kNodeCount> contents {};
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment>> powerAtts;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> headerPowerAtt;
 };
@@ -1728,7 +1822,7 @@ private:
         for (int i = 0; i < c->sectionCount(); ++i)
         {
             auto* b = new TabButton (c->sectionName (i), [this, i] { setSection (i); });
-            *sectionOwned.add (b);
+            sectionOwned.add (b);
             addAndMakeVisible (b);
             sectionButtons.add (b);
         }
@@ -2112,9 +2206,10 @@ void OrogenEditor::buildBottom()
     // кнопки секций патч-колонки (иконки в левом нижнем углу)
     static const char* titles[4] = { "FX CHAIN", "MOD MATRIX", "ARP", "LFO" };
     juce::ignoreUnused (titles);
-    for (int i = 0; i < 4; ++i)
+    for (int i = 1; i < 4; ++i)
     {
         auto* b = new IconButton (i, [this, i] { setSection (i); });
+        b->getProperties().set ("sectionKind", i);
         addAndMakeVisible (b);
         sectionButtons.add (b);
     }
@@ -2279,7 +2374,7 @@ void OrogenEditor::setSection (int index)
     for (int i = 0; i < columns.size(); ++i)
         columns[i]->setVisible (i == section);
     for (int i = 0; i < sectionButtons.size(); ++i)
-        sectionButtons[i]->setActive (i == section);
+        sectionButtons[i]->setActive (i + 1 == section);
     repaint();
 }
 
@@ -2312,7 +2407,7 @@ void OrogenEditor::toggleFxPage (bool shouldShow)
     if (fxPage != nullptr)
     {
         fxPage->setVisible (fxOpen);
-        if (fxOpen) { fxPage->setBounds (getLocalBounds()); fxPage->toFront (false); }
+        if (fxOpen) { fxPage->refreshOrder(); fxPage->setBounds (getLocalBounds()); fxPage->toFront (false); }
     }
     repaint();
 }
@@ -2372,6 +2467,13 @@ void OrogenEditor::showPage (int index)
     {
         toggleFxPage (true);
         if (fxPage != nullptr) fxPage->setSelected (index - 50);
+        return;
+    }
+    // Test/documentation hook for any stable rack node, including copies.
+    if (index >= 1000 && index < 1000 + FxChain::kNodeCount)
+    {
+        toggleFxPage (true);
+        if (fxPage != nullptr) fxPage->setSelected (index - 1000);
         return;
     }
     if (index >= 100 && index <= 104)
@@ -2754,7 +2856,12 @@ void OrogenEditor::repaintChangedValues()
     }
 
     VisualHash chip;
-    for (const auto& def : kChips) { chip.add (pv (def.id)); chip.add (pv (def.onId)); }
+    for (int i = 0; i < kChipTotal; ++i)
+    {
+        chip.add (pv (kChips[i].id)); chip.add (pv (kChips[i].onId));
+        const int module = chipModule (i);
+        if (module >= 0) chip.add (pv (fxRankId (module)));
+    }
     if (changed (chip.value, chipVisualHash)) repaint (R (248.0f, 570.0f, 736.0f, 70.0f));
 
     VisualHash pad;
@@ -3324,7 +3431,9 @@ void OrogenEditor::paintChips (juce::Graphics& g)
 
         const auto r = chipRect (i);
         const float mix = juce::jlimit (0.0f, 1.0f, pv (kChips[idx].id));
-        const bool on = pv (kChips[idx].onId) > 0.5f;
+        const int module = chipModule (idx);
+        const bool present = module >= 0 && pv (fxRankId (module)) > 0.0f;
+        const bool on = present && pv (kChips[idx].onId) > 0.5f;
         // включённый чип подсвечивается волной: задержка по индексу
         const float glow = (animOn && on)
             ? 0.72f + 0.28f * (0.5f + 0.5f * std::sin ((animPhaseFor (0.4, 0.12 * i)) * juce::MathConstants<float>::twoPi))
@@ -3338,12 +3447,12 @@ void OrogenEditor::paintChips (juce::Graphics& g)
 
         g.setColour (on ? Palette::textDim.withMultipliedAlpha (glow) : Palette::textFaint);
         g.setFont (orFont (8.0f, true));
-        g.drawText (kChips[idx].name,
+        g.drawText (juce::String (kChips[idx].name) + " #1",
                     juce::Rectangle<int> ((int) r.getX() + 30, (int) r.getY() + 5, 70, 11),
                     juce::Justification::centredLeft, false);
         g.setColour (on ? Palette::text : Palette::textFaint);
         g.setFont (orFont (7.0f, true));
-        g.drawText (on ? "ON" : "OFF", juce::Rectangle<int> ((int) r.getRight() - 25, (int) r.getY() + 5, 21, 11),
+        g.drawText (! present ? "ADD" : on ? "ON" : "OFF", juce::Rectangle<int> ((int) r.getRight() - 25, (int) r.getY() + 5, 21, 11),
                     juce::Justification::centredRight, false);
 
         // индикатор доли эффекта в сигнале
@@ -3790,6 +3899,14 @@ bool OrogenEditor::clickMain (juce::Point<float> designPos)
     {
         if (auto* prm = proc.apvts.getParameter (kChips[index].onId))
         {
+            const int module = chipModule (index);
+            if (module >= 0 && pv (fxRankId (module)) <= 0.0f)
+            {
+                // A removed original is not silently shown as enabled. Clicking
+                // ADD reinstates #1, or opens the rack if all 16 slots are full.
+                if (proc.addRackEffect (module) < 0) toggleFxPage (true);
+                repaint(); return true;
+            }
             // Clicking bypasses without destroying the saved mix/drive value.
             prm->beginChangeGesture();
             prm->setValueNotifyingHost (prm->getValue() > 0.5f ? 0.0f : 1.0f);

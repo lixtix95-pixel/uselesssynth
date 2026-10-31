@@ -9,7 +9,7 @@ MONOJUICE_OBJ := build/monojuice_chorus.o build/monojuice_adapter.o
 TEST_BINS := build/test_wavetable build/test_fm build/test_harmonic build/test_sample \
              build/test_granular build/test_granular_reverse build/test_granular_envelope build/test_granular_streams build/test_granular_randomness build/test_vocal_vibrato build/test_granular_vocal \
              build/test_modal build/test_resynth build/test_organics \
-             build/test_instrument build/test_engine_handoff build/test_meters build/test_fx build/test_fx_bypass build/test_fx_extra build/test_fx_monohuice build/test_chop
+             build/test_instrument build/test_engine_handoff build/test_meters build/test_fx build/test_fx_bypass build/test_fx_extra build/test_fx_monohuice build/test_fx_dynamic build/test_fx_rack_handoff build/test_chop
 DEMO_BINS := build/render_demo build/render_demo_sample build/render_demo_granular build/render_demo_modal \
              build/render_demo_resynth build/render_demo_organics build/render_demo_synth build/render_demo_instrument \
              build/render_demo_fx build/render_demo_comb build/render_demo_chop
@@ -198,6 +198,18 @@ build/test_fx_extra: tests/test_fx_extra.cpp src/instrument/*.h src/core/*.h $(M
 build/test_fx_monohuice: tests/test_fx_monohuice.cpp src/instrument/*.h src/core/*.h third_party/monojuice/dsp/*.h $(MONOJUICE_OBJ)
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(INC) tests/test_fx_monohuice.cpp $(MONOJUICE_OBJ) -o $@
+
+build/test_fx_dynamic: tests/test_fx_dynamic.cpp src/instrument/*.h src/core/*.h third_party/monojuice/dsp/*.h $(MONOJUICE_OBJ)
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) $(INC) tests/test_fx_dynamic.cpp $(MONOJUICE_OBJ) -o $@
+
+build/test_fx_rack_handoff: tests/test_fx_rack_handoff.cpp src/instrument/*.h src/core/*.h third_party/monojuice/dsp/*.h $(MONOJUICE_OBJ)
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) $(INC) -pthread tests/test_fx_rack_handoff.cpp $(MONOJUICE_OBJ) -o $@
+
+build/test_fx_dynamic_asan: tests/test_fx_dynamic.cpp src/instrument/*.h src/core/*.h third_party/monojuice/dsp/*.h third_party/monojuice/dsp/ChorusCore.cpp third_party/monojuice/dsp/AudioAdapter.cpp
+	@mkdir -p build
+	$(CXX) -O1 -g1 -std=c++17 -fsanitize=address,undefined -fno-omit-frame-pointer $(INC) tests/test_fx_dynamic.cpp third_party/monojuice/dsp/ChorusCore.cpp third_party/monojuice/dsp/AudioAdapter.cpp -o $@
 
 build/test_fx_monohuice_asan: tests/test_fx_monohuice.cpp src/instrument/*.h src/core/*.h third_party/monojuice/dsp/*.h third_party/monojuice/dsp/ChorusCore.cpp third_party/monojuice/dsp/AudioAdapter.cpp
 	@mkdir -p build

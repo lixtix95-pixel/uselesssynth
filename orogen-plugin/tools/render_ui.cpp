@@ -3,11 +3,12 @@
 //
 //   render_ui <out.png> [view] [width] [height] [phase] [program]
 //             [cutoff] [filter] [morph] [mode] [scene] [elapsed-ms]
-// scene: fx-before | fx-change | fx-hover | hover | lfo-wrap | granular |
+// scene: fx-before | fx-change | fx-hover | fx-copies | hover | lfo-wrap | granular | modal |
 //        anim-frames | transition-frames | lfo-wrap-frames (необязательно).
 // Для *-frames <out> — каталог из 40 PNG; GIF собирается отдельно.
 //
 // view: 0…7 = слоты A–H, 8…11 = секции патч-колонки (FX/MATRIX/ARP/LFO),
+//       1000…1051 = конкретная строка FX RACK с копиями,
 //       100…104 = оверлей параметров, вкладки SLOT/FX/MOD/ARP-LFO/GLOBAL
 #include "../src/plugin/PluginProcessor.h"
 #include "../src/plugin/PluginEditor.h"
@@ -56,6 +57,15 @@ int main (int argc, char** argv)
     proc.setPlayConfigDetails (0, 2, 48000.0, 512);
     proc.prepareToPlay (48000.0, 512);
     proc.setCurrentProgram (program);                   // 1 = Terra Pad
+    if (scene == "fx-copies")
+    {
+        const int drive = proc.addRackEffect (FxChain::Drive);
+        const int chorus = proc.addRackEffect (FxChain::ChorusModule);
+        if (drive >= 0) proc.moveRackNode (drive, -11);
+        if (chorus >= 0) proc.moveRackNode (chorus, -10);
+        if (auto* mix = proc.apvts.getParameter ("fx2_chorusMix"))
+            mix->setValueNotifyingHost (mix->convertTo0to1 (.64f));
+    }
 
     std::unique_ptr<juce::AudioProcessorEditor> editor (proc.createEditor());
     if (editor == nullptr) { std::printf ("нет редактора\n"); return 1; }
@@ -85,14 +95,14 @@ int main (int argc, char** argv)
             prm->setValueNotifyingHost (prm->convertTo0to1 ((float) patchMode));
 
     auto* ore = static_cast<OrogenEditor*> (editor.get());
-    if (scene == "granular")
+    if (scene == "granular" || scene == "modal")
     {
         const auto set = [&proc] (const char* id, float value) {
             if (auto* p = proc.apvts.getParameter (id))
                 p->setValueNotifyingHost (p->convertTo0to1 (value));
         };
         set ("sA_on", 1.0f);
-        set ("sA_type", 4.0f);
+        set ("sA_type", scene == "granular" ? 4.0f : 5.0f);
         set ("sA_table", 0.0f);
         set ("sA_grainReverse", 0.5f);
     }
@@ -116,7 +126,7 @@ int main (int argc, char** argv)
         ore->setAnimationsEnabled (true);
         if (scene == "transition-frames")
         {
-            ore->showPage (8);
+            ore->showPage (9);
             mm->runDispatchLoopUntil (220);
         }
         if (scene == "lfo-wrap-frames")
@@ -136,7 +146,7 @@ int main (int argc, char** argv)
             if (scene == "anim-frames") ore->setAnimationPhase (0.05 * (double) i);
             else
             {
-                if (scene == "transition-frames" && i == 4) ore->nextColumnPage (0);
+                if (scene == "transition-frames" && i == 4) ore->nextColumnPage (1);
                 if (scene == "transition-frames" && i == 14) ore->hoverKnob (0, true);
                 if (scene == "transition-frames" && i == 29) ore->hoverKnob (0, false);
                 mm->runDispatchLoopUntil (50);
@@ -161,7 +171,7 @@ int main (int argc, char** argv)
     // что и в реальном окне, и фиксируем заданный момент перехода.
     if (scene.isNotEmpty())
     {
-        if (scene.startsWith ("fx-")) ore->showPage (8);
+        if (scene.startsWith ("fx-") && scene != "fx-copies") ore->showPage (8);
         if (scene == "lfo-wrap")
         {
             // Реальный таймер редактора: масштаб 4→1, затем playhead

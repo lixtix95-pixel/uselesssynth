@@ -1,7 +1,8 @@
 // Цепочка эффектов инструмента:
 //   Drive (19 моделей) → COMB (ODIN2 / ParallelComb) → Chorus → Ping-pong Delay →
 //   Reverb → Plate → EQ → Material → Spectre → Glitch → Compressor → Limiter.
-// Всё аллоцируется в prepare(), в горячем цикле — ни аллокаций, ни делений.
+// Основной тракт готовится в prepare(), копии — в ensureCopy() вне audio;
+// в аудиоколбэке нет выделений/удалений и ожидания потоков.
 //
 // Drive, Material, Spectre и Glitch перенесены из плагина MonoJuice 0.9.5
 // (см. FX-MONOJUICE.md): Drive — 12 моделей автора плагина + Airwindows
@@ -31,6 +32,9 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <atomic>
+#include <mutex>
+#include <memory>
 
 namespace orogen {
 
@@ -535,8 +539,96 @@ public:
         float width = 1.0f;
     };
 
+    // Stable node identity: module + copy * ModuleCount. Copy zero keeps
+    // every historical parameter ID and DSP state. Additional copies are
+    // staged off the audio thread and published once, then retained until the
+    // instrument is destroyed. The rack itself is deliberately bounded.
+    static constexpr int kCopiesPerModule = 4;
+    static constexpr int kNodeCount = ModuleCount * kCopiesPerModule;
+    static constexpr int kRackLimit = 16;
+    using RackRanks = std::array<int, kNodeCount>;
+    using CopySettings = std::array<Settings, kCopiesPerModule>;
+
+    static RackRanks defaultRanks() noexcept
+    {
+        RackRanks ranks {};
+        for (int i = 0; i < ModuleCount; ++i) ranks[(size_t) i] = i + 1;
+        return ranks;
+    }
+
+    FxChain() noexcept
+    {
+        for (auto& copy : copies) copy.store (nullptr, std::memory_order_relaxed);
+        for (int i = 0; i < ModuleCount; ++i) active.nodes[(size_t) i] = { i, this };
+        desired = active;
+    }
+
+    ~FxChain()
+    {
+        // The owner must have stopped audio before destroying the instrument.
+        for (auto& copy : copies) delete copy.load (std::memory_order_relaxed);
+    }
+
+    // Message/control thread only. No active DSP object is modified here.
+    void ensureCopy (int node, const Settings& initial)
+    {
+        if (node < ModuleCount || node >= kNodeCount) return;
+        const int slot = node - ModuleCount;
+        if (copies[(size_t) slot].load (std::memory_order_acquire) != nullptr) return;
+        std::lock_guard<std::mutex> lock (copyMutex);
+        if (copies[(size_t) slot].load (std::memory_order_relaxed) != nullptr) return;
+        auto instance = std::make_unique<FxChain>();
+        instance->prepareSingle (sampleRate, (Module) (node % ModuleCount));
+        instance->set (initial);
+        copies[(size_t) slot].store (instance.release(), std::memory_order_release);
+        copyGeneration.fetch_add (1, std::memory_order_release);
+    }
+
+    unsigned getCopyGeneration() const noexcept { return copyGeneration.load (std::memory_order_acquire); }
+
+    // Audio thread only. Pointer snapshots and fixed-size insertion sort mean
+    // no allocation, deletion, locks or waiting in the callback. A change in
+    // order or ready copies is faded out before the new graph is installed.
+    void setRack (const RackRanks& ranks, const CopySettings& settings) noexcept
+    {
+        struct Ranked { int rank, code; FxChain* instance; };
+        std::array<Ranked, kRackLimit> ordered {};
+        int count = 0;
+        for (int node = 0; node < kNodeCount; ++node)
+        {
+            const int rank = ranks[(size_t) node];
+            if (rank <= 0) continue;
+            FxChain* instance = node < ModuleCount ? this
+                : copies[(size_t) (node - ModuleCount)].load (std::memory_order_acquire);
+            if (instance != nullptr && instance != this)
+                instance->set (settings[(size_t) (node / ModuleCount)]);
+            const Ranked candidate { rank, node, instance };
+            int at = 0;
+            while (at < count && (ordered[(size_t) at].rank < rank
+                   || (ordered[(size_t) at].rank == rank && ordered[(size_t) at].code < node))) ++at;
+            if (at >= kRackLimit) continue;
+            const int newCount = std::min (count + 1, kRackLimit);
+            for (int j = newCount - 1; j > at; --j) ordered[(size_t) j] = ordered[(size_t) (j - 1)];
+            ordered[(size_t) at] = candidate;
+            count = newCount;
+        }
+        Layout next {};
+        next.count = count;
+        next.canonical = count == ModuleCount;
+        for (int i = 0; i < count; ++i)
+        {
+            next.nodes[(size_t) i] = { ordered[(size_t) i].code, ordered[(size_t) i].instance };
+            next.canonical = next.canonical && ordered[(size_t) i].code == i;
+        }
+        if (sameLayout (next, desired)) return;
+        desired = next;
+        if (! processed) { active = desired; switching = 0; transitionGain = 1.0f; }
+        else if (! sameLayout (active, desired)) switching = 1; // fade out, then install
+    }
+
     void prepare (double sr)
     {
+        std::lock_guard<std::mutex> lock (copyMutex);
         sampleRate = sr;
         shaper.prepare (sr); chorus.prepare (sr); delay.prepare (sr);
         reverb.prepare (sr); eq.prepare (sr); dyn.prepare (sr);
@@ -549,6 +641,11 @@ public:
         dcX1L = dcY1L = dcX1R = dcY1R = 0.0f;
         processed = false;
         for (auto& gain : moduleGain) { gain.reset (sr, 6.0); gain.snap (1.0f); }
+        transitionStep = 1.0f / (float) std::max (1.0, sr * 0.006);
+        transitionGain = 1.0f; switching = 0;
+        for (int slot = 0; slot < (int) copies.size(); ++slot)
+            if (auto* instance = copies[(size_t) slot].load (std::memory_order_acquire))
+                instance->prepareSingle (sr, (Module) ((slot + ModuleCount) % ModuleCount));
     }
 
     void set (const Settings& s)
@@ -682,7 +779,13 @@ public:
         width = clamp (s.width, 0.0f, 1.5f);
     }
 
-    void setTempo (double bpm) { glitch.setTempo (bpm); }
+    void setTempo (double bpm)
+    {
+        glitch.setTempo (bpm);
+        for (int copy = 1; copy < kCopiesPerModule; ++copy)
+            if (auto* c = copies[(size_t) ((copy - 1) * ModuleCount + Glitch)].load (std::memory_order_acquire))
+                c->glitch.setTempo (bpm);
+    }
 
     // Суммарная транспортная задержка цепочки, в сэмплах.
     //
@@ -692,6 +795,20 @@ public:
     // но относительно входа инструмента цепочка всё равно сдвинута.
     int latency() const
     {
+        if (! active.canonical)
+        {
+            int lat = 0;
+            bool baseRobinPresent = false;
+            for (int i = 0; i < active.count; ++i)
+            {
+                const auto& node = active.nodes[(size_t) i];
+                const auto module = (Module) (node.code % ModuleCount);
+                if (node.code == Robin) baseRobinPresent = true;
+                if (node.instance != nullptr) lat += node.instance->stageLatency (module);
+            }
+            if (! baseRobinPresent) lat += robin.latency();
+            return lat;
+        }
         int lat = 0;
         if (s_spectreOn) lat += s_spectreClassic ? spectreClassic.latency() : spectre.latency();
         if (s_chorusFw)  lat += chorusFw.latency();
@@ -701,6 +818,26 @@ public:
 
     // innerOnly: для стендов, которым нужен только «хвост» цепочки без COMB
     inline void process (float& l, float& r, bool innerOnly = false) noexcept
+    {
+        if (active.canonical) processOriginal (l, r, innerOnly);
+        else                  processFlexible (l, r, innerOnly);
+        if (switching != 0)
+        {
+            if (switching == 1)
+            {
+                transitionGain = std::max (0.0f, transitionGain - transitionStep);
+                if (transitionGain <= 0.0f) { active = desired; switching = 2; }
+            }
+            else
+            {
+                transitionGain = std::min (1.0f, transitionGain + transitionStep);
+                if (transitionGain >= 1.0f) switching = 0;
+            }
+            l *= transitionGain; r *= transitionGain;
+        }
+    }
+
+    inline void processOriginal (float& l, float& r, bool innerOnly = false) noexcept
     {
         // Мастер-блокер DC: shaper и компрессор асимметричны, и без него
         // на выходе накапливалось до 2.6·10⁻³ постоянной составляющей
@@ -753,6 +890,119 @@ public:
     }
 
 private:
+    struct Node { int code = 0; FxChain* instance = nullptr; };
+    struct Layout
+    {
+        std::array<Node, kRackLimit> nodes {};
+        int count = ModuleCount;
+        bool canonical = true;
+    };
+    static bool sameLayout (const Layout& a, const Layout& b) noexcept
+    {
+        if (a.count != b.count || a.canonical != b.canonical) return false;
+        for (int i = 0; i < a.count; ++i)
+            if (a.nodes[(size_t) i].code != b.nodes[(size_t) i].code
+                || a.nodes[(size_t) i].instance != b.nodes[(size_t) i].instance) return false;
+        return true;
+    }
+
+    void prepareSingle (double sr, Module module)
+    {
+        sampleRate = sr;
+        switch (module)
+        {
+            case Drive: drive.prepare (sr); break;
+            case Comb: comb.prepare (sr); break;
+            case ChorusModule: chorus.prepare (sr); chorusFw.prepare (sr); break;
+            case DelayModule: delay.prepare (sr); break;
+            case ReverbModule: reverb.prepare (sr); break;
+            case Plate: plate.prepare (sr); break;
+            case Equalizer: eq.prepare (sr); break;
+            case Material: material.prepare (sr); break;
+            case Spectre: spectre.prepare (sr); spectreClassic.prepare (sr); break;
+            case Robin: robin.prepare (sr); break;
+            case Glitch: glitch.prepare (sr); break;
+            case Compressor: dyn.prepare (sr); break;
+            case StereoWidth: break;
+            default: break;
+        }
+        processed = false;
+        for (auto& gain : moduleGain) { gain.reset (sr, 6.0); gain.snap (1.0f); }
+    }
+
+    int stageLatency (Module module) const noexcept
+    {
+        if (module == Robin) return robin.latency();
+        if (module == Spectre && s_spectreOn) return s_spectreClassic ? spectreClassic.latency() : spectre.latency();
+        if (module == ChorusModule && s_chorusFw) return chorusFw.latency();
+        return 0;
+    }
+
+    inline void processStage (Module which, float& l, float& r, bool innerOnly) noexcept
+    {
+        processed = true;
+        if (which == Robin)
+        {
+            robin.setMix (robinBaseMix * moduleGain[(size_t) Robin].next());
+            robin.process (l, r);
+            return;
+        }
+        if (which == StereoWidth)
+        {
+            const float gain = moduleGain[(size_t) StereoWidth].next();
+            const float w = gain >= 1.0f ? width : gain <= 0.0f ? 1.0f : 1.0f + (width - 1.0f) * gain;
+            const float mid = (l + r) * 0.5f, side = (l - r) * 0.5f * w;
+            l = mid + side; r = mid - side;
+            return;
+        }
+        const float gain = moduleGain[(size_t) which].next();
+        if (gain <= 0.0f && which != DelayModule) return;
+        const float dryL = l, dryR = r;
+        switch (which)
+        {
+            case Drive: if (s_driveOn) drive.process (l, r); break;
+            case Comb: if (s_combOn && ! innerOnly) comb.process (l, r); break;
+            case ChorusModule: if (s_chorusFw) chorusFw.process (l, r); else chorus.process (l, r); break;
+            case DelayModule: delay.process (l, r); break;
+            case ReverbModule: reverb.process (l, r); break;
+            case Plate: plate.process (l, r); break;
+            case Equalizer: eq.process (l, r); break;
+            case Material: material.process (l, r); break;
+            case Spectre: if (s_spectreOn) { if (s_spectreClassic) spectreClassic.process (l, r); else spectre.process (l, r); } break;
+            case Glitch: glitch.process (l, r); break;
+            case Compressor: dyn.process (l, r); break;
+            default: break;
+        }
+        if (gain <= 0.0f) { l = dryL; r = dryR; }
+        else if (gain < 1.0f) { l = dryL + (l - dryL) * gain; r = dryR + (r - dryR) * gain; }
+    }
+
+    inline void processFlexible (float& l, float& r, bool innerOnly) noexcept
+    {
+        const float dl = l - dcX1L + dcCoef * dcY1L; dcX1L = l; dcY1L = dl; l = dl;
+        const float dr = r - dcX1R + dcCoef * dcY1R; dcX1R = r; dcY1R = dr; r = dr;
+        processed = true;
+        bool baseRobinPresent = false;
+        for (int i = 0; i < active.count; ++i)
+        {
+            const auto& node = active.nodes[(size_t) i];
+            if (node.code == Robin) baseRobinPresent = true;
+            if (node.instance != nullptr)
+                node.instance->processStage ((Module) (node.code % ModuleCount), l, r, innerOnly);
+        }
+        // Preserve the historic fixed 1024-sample dry latency even if the
+        // original ROBIN node was removed. Extra ROBIN nodes each add 1024.
+        if (! baseRobinPresent) { robin.setMix (0.0f); robin.process (l, r); }
+        Dynamics::limit (l, r, 0.98f);
+    }
+
+    std::array<std::atomic<FxChain*>, (kCopiesPerModule - 1) * ModuleCount> copies {};
+    std::atomic<unsigned> copyGeneration { 0 };
+    std::mutex copyMutex;
+    Layout active {}, desired {};
+    int switching = 0; // 0 stable, 1 fade out, 2 fade in
+    float transitionGain = 1.0f, transitionStep = 1.0f / 288.0f;
+
     Shaper shaper;
     Chorus chorus;
     PingPongDelay delay;

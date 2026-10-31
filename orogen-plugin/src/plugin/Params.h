@@ -3,7 +3,8 @@
 // Правило: единственный источник истины для пресетов — Patch + FxChain::Settings
 // (JSON). APVTS нужен хосту для автоматизации и UI, поэтому каждое поле структур
 // имеет параметр с предсказуемым id: sA_level, sB_cutoff, fx_reverbMix, gl_master.
-// Пресет читается в структуры, затем структуры пишутся в APVTS (см. applyToParams).
+// Историческая первая копия читается в структуры; независимые копии и их
+// позиции дополнительно хранятся в APVTS, DAW state и JSON-пресетах.
 #pragma once
 
 #include <juce_audio_processors/juce_audio_processors.h>
@@ -273,11 +274,43 @@ inline const ChoiceParam* choiceTable (int& count)
     return table;
 }
 
+// Copy zero deliberately uses the original VST3 IDs. Other copies have their
+// own stable IDs and independently automatable parameter objects.
+inline juce::String fxCopyId (const juce::String& original, int copy)
+{
+    if (copy <= 0 || ! original.startsWith ("fx_")) return original;
+    return "fx" + juce::String (copy + 1) + "_" + original.substring (3);
+}
+inline int fxIdCopy (const juce::String& id)
+{
+    for (int c = 1; c < FxChain::kCopiesPerModule; ++c)
+        if (id.startsWith ("fx" + juce::String (c + 1) + "_")) return c;
+    return 0;
+}
+inline juce::String fxOriginalId (const juce::String& id)
+{
+    const int copy = fxIdCopy (id);
+    return copy == 0 ? id : "fx_" + id.fromFirstOccurrenceOf ("_", false, false);
+}
+inline juce::String fxRankId (int node) { return "rack_order_" + juce::String (node); }
+
+struct RecordingParameterLayout
+{
+    juce::AudioProcessorValueTreeState::ParameterLayout result;
+    std::vector<juce::RangedAudioParameter*> originalFx;
+    template <typename T> void add (std::unique_ptr<T> parameter)
+    {
+        if (auto* p = dynamic_cast<juce::RangedAudioParameter*> (parameter.get()))
+            if (p->paramID.startsWith ("fx_")) originalFx.push_back (p);
+        result.add (std::move (parameter));
+    }
+};
+
 // Единственное место, где перечисляются id параметров.
 inline juce::AudioProcessorValueTreeState::ParameterLayout makeLayout()
 {
     using namespace juce;
-    AudioProcessorValueTreeState::ParameterLayout layout;
+    RecordingParameterLayout layout;
 
     auto addFloat = [&layout] (const String& id, const String& name,
                                float mn, float mx, float def, float step)
@@ -446,7 +479,40 @@ inline juce::AudioProcessorValueTreeState::ParameterLayout makeLayout()
     layout.add (std::make_unique<AudioParameterChoice> (ParameterID { "fx_glitchDivision", 1 }, "Glitch Length Division", StringArray { "2 bars", "1 bar", "1/2", "1/4", "1/8", "1/16", "1/32", "1/64", "1/128" }, 3));
     layout.add (std::make_unique<AudioParameterBool> (ParameterID { "fx_glitchHighpass", 1 }, "Glitch Highpass", false));
 
-    return layout;
+    // Append, never interleave, so the original 376 IDs and ordering survive.
+    // Clone their actual ranges, discrete choices and defaults from the source
+    // objects rather than maintaining a second divergent parameter table.
+    const auto originalFx = layout.originalFx;
+    for (int copy = 1; copy < FxChain::kCopiesPerModule; ++copy)
+        for (auto* source : originalFx)
+        {
+            const auto id = fxCopyId (source->paramID, copy);
+            const auto name = source->getName (100) + " #" + String (copy + 1);
+            const auto value = source->convertFrom0to1 (source->getDefaultValue());
+            if (auto* choice = dynamic_cast<AudioParameterChoice*> (source))
+                layout.add (std::make_unique<AudioParameterChoice> (ParameterID { id, 1 }, name,
+                                                                      choice->getAllValueStrings(), (int) std::lround (value)));
+            else if (dynamic_cast<AudioParameterBool*> (source) != nullptr)
+                layout.add (std::make_unique<AudioParameterBool> (ParameterID { id, 1 }, name, value > 0.5f));
+            else if (dynamic_cast<AudioParameterInt*> (source) != nullptr)
+            {
+                const auto range = source->getNormalisableRange();
+                layout.add (std::make_unique<AudioParameterInt> (ParameterID { id, 1 }, name,
+                                                                  (int) range.start, (int) range.end, (int) std::lround (value)));
+            }
+            else
+                layout.add (std::make_unique<AudioParameterFloat> (ParameterID { id, 1 }, name,
+                                                                    source->getNormalisableRange(), value));
+        }
+    for (int node = 0; node < FxChain::kNodeCount; ++node)
+    {
+        const int copy = node / FxChain::ModuleCount, module = node % FxChain::ModuleCount;
+        layout.add (std::make_unique<AudioParameterInt> (
+            ParameterID { fxRankId (node), 1 },
+            String (kFxModules[module].name) + " #" + String (copy + 1) + " Rack Position",
+            0, FxChain::kRackLimit, copy == 0 ? module + 1 : 0));
+    }
+    return std::move (layout.result);
 }
 
 } // namespace orogen

@@ -23,6 +23,7 @@
 #include <array>
 #include <atomic>
 #include <vector>
+#include <thread>
 
 namespace orogen
 {
@@ -33,7 +34,7 @@ class OrogenProcessor : public juce::AudioProcessor,
 {
 public:
     OrogenProcessor();
-    ~OrogenProcessor() override = default;
+    ~OrogenProcessor() override;
 
     // --- AudioProcessor ---
     void prepareToPlay (double sampleRate, int samplesPerBlock) override;
@@ -68,6 +69,12 @@ public:
     void collectPatch (Patch& p, FxChain::Settings& fx) const noexcept;
     // Записать структуры в параметры (message thread, после загрузки пресета).
     void applyToParams (const Patch& p, const FxChain::Settings& fx);
+    void collectFxCopy (int copy, FxChain::Settings& fx) const noexcept;
+    FxChain::RackRanks rackRanks() const noexcept;
+    std::vector<int> rackOrder() const;
+    int addRackEffect (int module);
+    bool removeRackNode (int node);
+    bool moveRackNode (int node, int delta);
 
     juce::StringArray presetNames() const;
     void loadPreset (int index);
@@ -119,7 +126,7 @@ private:
     Patch patch = patchInit();
     FxChain::Settings fxSettings;
 
-    struct Preset { juce::String name; Patch patch; FxChain::Settings fx; };
+    struct Preset { juce::String name; Patch patch; FxChain::Settings fx; juce::var rack; };
     std::vector<Preset> presets;
     int currentProgram = 0;
 
@@ -128,16 +135,26 @@ private:
     // gain master glide width mode modWheel morph — ровно 7, порядок = индексы в collectPatch()
     std::array<std::atomic<float>*, 7> globRefs { };
     std::array<std::array<std::atomic<float>*, 4>, 2> lfoRefs { };
-    std::vector<std::atomic<float>*> fxRefs;                    // по порядку fxParamTable
-    // Для AudioParameterChoice/Bool/Int getRawParameterValue() возвращает
-    // nullptr (это API только для параметров, созданных самим APVTS), поэтому
-    // перечисления читаются через RangedAudioParameter::convertFrom0to1.
-    std::array<juce::RangedAudioParameter*, 14> fxChoiceRefs { };
-    std::array<std::atomic<float>*, FxChain::ModuleCount> fxEnableRefs {};
-    std::vector<std::atomic<float>*> fxExtraRefs;
-    juce::RangedAudioParameter* fxPlateDcRef = nullptr;
-    juce::RangedAudioParameter* fxCombNegativeBRef = nullptr;
-    std::array<juce::RangedAudioParameter*, 5> fxMonoChoiceRefs {};
+    struct FxRefs
+    {
+        std::vector<std::atomic<float>*> fxRefs;
+        std::array<juce::RangedAudioParameter*, 14> choices {};
+        std::array<std::atomic<float>*, FxChain::ModuleCount> enable {};
+        std::vector<std::atomic<float>*> extra;
+        juce::RangedAudioParameter* plateDc = nullptr;
+        juce::RangedAudioParameter* combNegativeB = nullptr;
+        std::array<juce::RangedAudioParameter*, 5> monoChoices {};
+    };
+    std::array<FxRefs, FxChain::kCopiesPerModule> fxGroups;
+    std::array<std::atomic<float>*, FxChain::kNodeCount> rackRankRefs {};
+    std::atomic<bool> fxPrepared { false };
+    std::atomic<bool> fxWorkerStop { false };
+    std::thread fxWorker;
+    unsigned lastFxCopyGeneration = 0;
+    void stageRequestedFxCopies();
+    juce::var captureRack() const;
+    void restoreRack (const juce::var& value);
+    void setRackOrder (const std::vector<int>& order);
 
     // арпеджиатор: 5 перечислений (on, mode, div, octaves, latch) + 2 float
     std::array<juce::RangedAudioParameter*, 5> arpRefs { };

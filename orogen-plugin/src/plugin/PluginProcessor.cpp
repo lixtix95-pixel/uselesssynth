@@ -1,8 +1,10 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "UiParamMap.h"
 
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 
 namespace orogen
 {
@@ -77,6 +79,24 @@ OrogenProcessor::OrogenProcessor()
     applyToParams (patch, fxSettings);
     inst.setPatch (patch);
     inst.setFx (fxSettings);
+    // Independent of the GUI/message loop: offline hosts and closed editors can
+    // still materialise automated/new rack nodes. The callback only reads the
+    // published pointer; this worker performs all allocations and preparation.
+    fxWorker = std::thread ([this] {
+        while (! fxWorkerStop.load (std::memory_order_acquire))
+        {
+            if (fxPrepared.load (std::memory_order_acquire)) stageRequestedFxCopies();
+            std::this_thread::sleep_for (std::chrono::milliseconds (20));
+        }
+    });
+}
+
+OrogenProcessor::~OrogenProcessor()
+{
+    stopTimer();
+    cancelPendingUpdate();
+    fxWorkerStop.store (true, std::memory_order_release);
+    if (fxWorker.joinable()) fxWorker.join();
 }
 
 // Порядок обязан совпадать с fxParamTable() в Params.h — это проверяется
@@ -144,32 +164,30 @@ void OrogenProcessor::cachePointers()
     int fn = 0;
     const FxParam* ft = fxParamTable (fn);
     jassert (fn == (int) kFxCount);
-    fxRefs.clear();
-    for (int i = 0; i < fn; ++i)
-        fxRefs.push_back (apvts.getRawParameterValue (juce::String ("fx_") + ft[i].id));
-
-    for (int i = 0; i < FxChain::ModuleCount; ++i)
-        fxEnableRefs[(size_t) i] = apvts.getRawParameterValue (kFxModules[i].onId);
     int extraCount = 0;
     const auto* extra = fxExtraParamTable (extraCount);
-    fxExtraRefs.clear();
-    for (int i = 0; i < extraCount; ++i)
-        fxExtraRefs.push_back (apvts.getRawParameterValue (juce::String ("fx_") + extra[i].id));
-    fxPlateDcRef = apvts.getParameter ("fx_plateDc");
-    fxCombNegativeBRef = apvts.getParameter ("fx_combNegativeB");
-    const char* monoChoiceIds[] = { "fx_chorusMode", "fx_glitchTimingMode", "fx_glitchSync", "fx_glitchDivision", "fx_glitchHighpass" };
-    for (size_t i = 0; i < fxMonoChoiceRefs.size(); ++i) fxMonoChoiceRefs[i] = apvts.getParameter (monoChoiceIds[i]);
-
-    // порядок совпадает с choiceTable()/makeLayout()
     const char* choiceIds[] = { "fx_driveModel", "fx_chorusModel", "fx_materialMode",
-                                "fx_spectreModel", "fx_spectreWindow", "fx_spectrePeaks",
-                                "fx_spectreWidth", "fx_spectreFreeze", "fx_combModel",
-                                "fx_combRouting", "fx_combNegative", "fx_combOversample",
-                                "fx_combMidSide", "fx_materialFollow" };
-    jassert ((int) fxChoiceRefs.size() == (int) (sizeof (choiceIds) / sizeof (choiceIds[0])));
-    for (size_t i = 0; i < fxChoiceRefs.size(); ++i)
-        fxChoiceRefs[i] = dynamic_cast<juce::RangedAudioParameter*> (
-                              apvts.getParameter (choiceIds[i]));
+        "fx_spectreModel", "fx_spectreWindow", "fx_spectrePeaks", "fx_spectreWidth", "fx_spectreFreeze",
+        "fx_combModel", "fx_combRouting", "fx_combNegative", "fx_combOversample", "fx_combMidSide", "fx_materialFollow" };
+    const char* monoIds[] = { "fx_chorusMode", "fx_glitchTimingMode", "fx_glitchSync", "fx_glitchDivision", "fx_glitchHighpass" };
+    for (int copy = 0; copy < FxChain::kCopiesPerModule; ++copy)
+    {
+        auto& group = fxGroups[(size_t) copy];
+        for (int i = 0; i < fn; ++i)
+            group.fxRefs.push_back (apvts.getRawParameterValue (fxCopyId (juce::String ("fx_") + ft[i].id, copy)));
+        for (int i = 0; i < FxChain::ModuleCount; ++i)
+            group.enable[(size_t) i] = apvts.getRawParameterValue (fxCopyId (kFxModules[i].onId, copy));
+        for (int i = 0; i < extraCount; ++i)
+            group.extra.push_back (apvts.getRawParameterValue (fxCopyId (juce::String ("fx_") + extra[i].id, copy)));
+        group.plateDc = apvts.getParameter (fxCopyId ("fx_plateDc", copy));
+        group.combNegativeB = apvts.getParameter (fxCopyId ("fx_combNegativeB", copy));
+        for (size_t i = 0; i < group.monoChoices.size(); ++i)
+            group.monoChoices[i] = apvts.getParameter (fxCopyId (monoIds[i], copy));
+        for (size_t i = 0; i < group.choices.size(); ++i)
+            group.choices[i] = apvts.getParameter (fxCopyId (choiceIds[i], copy));
+    }
+    for (int node = 0; node < FxChain::kNodeCount; ++node)
+        rackRankRefs[(size_t) node] = apvts.getRawParameterValue (fxRankId (node));
 
     for (int r = 0; r < kModRoutes; ++r)
     {
@@ -210,10 +228,12 @@ void OrogenProcessor::cachePointers()
     }
     for (size_t i = 0; i < globRefs.size(); ++i)
         if (globRefs[i] == nullptr) std::fprintf (stderr, "OROGEN: глобальный параметр %d не найден\n", (int) i);
-    for (size_t i = 0; i < fxRefs.size(); ++i)
-        if (fxRefs[i] == nullptr) std::fprintf (stderr, "OROGEN: параметр эффекта %d не найден\n", (int) i);
-    for (size_t i = 0; i < fxChoiceRefs.size(); ++i)
-        if (fxChoiceRefs[i] == nullptr) std::fprintf (stderr, "OROGEN: перечисление %d не найдено\n", (int) i);
+    for (const auto& group : fxGroups)
+    {
+        for (auto* ref : group.fxRefs) if (ref == nullptr) std::fprintf (stderr, "OROGEN: missing FX parameter\n");
+        for (auto* ref : group.choices) if (ref == nullptr) std::fprintf (stderr, "OROGEN: missing FX choice\n");
+    }
+    for (auto* ref : rackRankRefs) if (ref == nullptr) std::fprintf (stderr, "OROGEN: missing rack rank\n");
     for (size_t i = 0; i < arpRefs.size(); ++i)
         if (arpRefs[i] == nullptr) std::fprintf (stderr, "OROGEN: параметр арпеджиатора %d не найден\n", (int) i);
 
@@ -238,13 +258,17 @@ std::uint64_t OrogenProcessor::hashParams() const noexcept
     }
     for (auto* g : globRefs) if (g) mix (g->load());
     for (const auto& l : lfoRefs) for (auto* p : l) if (p) mix (p->load());
-    for (auto* f : fxRefs) if (f) mix (f->load());
-    for (auto* c : fxChoiceRefs) mix (choiceValue (c));
-    for (auto* p : fxEnableRefs) if (p) mix (p->load());
-    for (auto* p : fxExtraRefs) if (p) mix (p->load());
-    mix (choiceValue (fxPlateDcRef));
-    mix (choiceValue (fxCombNegativeBRef));
-    for (auto* c : fxMonoChoiceRefs) mix (choiceValue (c));
+    for (const auto& group : fxGroups)
+    {
+        for (auto* f : group.fxRefs) if (f) mix (f->load());
+        for (auto* c : group.choices) mix (choiceValue (c));
+        for (auto* p : group.enable) if (p) mix (p->load());
+        for (auto* p : group.extra) if (p) mix (p->load());
+        mix (choiceValue (group.plateDc));
+        mix (choiceValue (group.combNegativeB));
+        for (auto* c : group.monoChoices) mix (choiceValue (c));
+    }
+    for (auto* rank : rackRankRefs) if (rank) mix (rank->load());
     return h;
 }
 
@@ -279,6 +303,7 @@ void OrogenProcessor::timerCallback()
 void OrogenProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
     juce::ignoreUnused (samplesPerBlock);
+    fxPrepared.store (false, std::memory_order_release);
     currentSampleRate = sampleRate;
 
     // Сборка контента (таблицы, MIP-уровни записей, ресинтез) — самая дорогая
@@ -291,6 +316,13 @@ void OrogenProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     collectPatch (currentPatch, currentFx);
     inst.setPatch (currentPatch);
     inst.setFx (currentFx);
+    stageRequestedFxCopies();
+    FxChain::CopySettings copySettings {};
+    copySettings[0] = currentFx;
+    for (int c = 1; c < FxChain::kCopiesPerModule; ++c) collectFxCopy (c, copySettings[(size_t) c]);
+    inst.setFxRack (rackRanks(), copySettings);
+    lastFxCopyGeneration = inst.fxCopyGeneration();
+    fxPrepared.store (true, std::memory_order_release);
     inst.setMasterGain (globRefs[1]->load());
     lastParamHash = 0;  // re-snapshot on first audio block, including concurrent UI edits
 
@@ -375,9 +407,22 @@ void OrogenProcessor::collectPatch (Patch& p, FxChain::Settings& fx) const noexc
         sp.tail    = r.f[(size_t) kTail]->load();
     }
 
+    collectFxCopy (0, fx);
+}
+
+void OrogenProcessor::collectFxCopy (int copy, FxChain::Settings& fx) const noexcept
+{
     // --- эффекты: порядок fxRefs = fxParamTable() (см. enum FxIdx выше) ---
+    const auto& group = fxGroups[(size_t) juce::jlimit (0, FxChain::kCopiesPerModule - 1, copy)];
+    const auto& fxRefs = group.fxRefs;
+    const auto& fxChoiceRefs = group.choices;
+    const auto& fxEnableRefs = group.enable;
+    const auto& fxExtraRefs = group.extra;
+    auto* fxPlateDcRef = group.plateDc;
+    auto* fxCombNegativeBRef = group.combNegativeB;
+    const auto& fxMonoChoiceRefs = group.monoChoices;
     jassert ((int) fxRefs.size() == kFxCount);
-    auto X = [this] (FxIdx i) { return fxRefs[(size_t) i]->load(); };
+    auto X = [&fxRefs] (FxIdx i) { return fxRefs[(size_t) i]->load(); };
 
     fx.drive             = X (FxDrive);
     fx.driveTone         = X (FxDriveTone);
@@ -455,7 +500,7 @@ void OrogenProcessor::collectPatch (Patch& p, FxChain::Settings& fx) const noexc
     fx.combHighpass      = X (FxCombHighpass);
     fx.combTune          = X (FxCombTune);
 
-    auto C = [this] (int i) { return (int) std::lround (choiceValue (fxChoiceRefs[(size_t) i])); };
+    auto C = [&fxChoiceRefs] (int i) { return (int) std::lround (choiceValue (fxChoiceRefs[(size_t) i])); };
     fx.driveModel     = C (0);
     fx.chorusModel    = C (1);
     fx.materialMode   = C (2);
@@ -650,10 +695,16 @@ void OrogenProcessor::processBlock (juce::AudioBuffer<float>& buf, juce::MidiBuf
 
     // If automation changes during collection, apply the snapshot now and
     // force another snapshot next block instead of losing that last change.
-    if (hashBefore != hashAfter || hashAfter != lastParamHash)
+    const unsigned generation = inst.fxCopyGeneration();
+    if (hashBefore != hashAfter || hashAfter != lastParamHash || generation != lastFxCopyGeneration)
     {
         lastParamHash = hashBefore == hashAfter ? hashAfter : 0;
+        lastFxCopyGeneration = generation;
         inst.setFx (blockFx);
+        FxChain::CopySettings copySettings {};
+        copySettings[0] = blockFx;
+        for (int c = 1; c < FxChain::kCopiesPerModule; ++c) collectFxCopy (c, copySettings[(size_t) c]);
+        inst.setFxRack (rackRanks(), copySettings);
     }
 
     const int lat = inst.fxLatency();
@@ -714,6 +765,161 @@ void OrogenProcessor::handleAsyncUpdate()
     setLatencySamples (latencySamples.load());
 }
 
+FxChain::RackRanks OrogenProcessor::rackRanks() const noexcept
+{
+    FxChain::RackRanks ranks {};
+    for (int i = 0; i < FxChain::kNodeCount; ++i)
+        if (auto* value = rackRankRefs[(size_t) i]) ranks[(size_t) i] = (int) std::lround (value->load());
+    return ranks;
+}
+
+std::vector<int> OrogenProcessor::rackOrder() const
+{
+    const auto ranks = rackRanks();
+    std::vector<int> result;
+    for (int node = 0; node < FxChain::kNodeCount; ++node)
+        if (ranks[(size_t) node] > 0) result.push_back (node);
+    std::sort (result.begin(), result.end(), [&ranks] (int a, int b) {
+        return ranks[(size_t) a] != ranks[(size_t) b] ? ranks[(size_t) a] < ranks[(size_t) b] : a < b;
+    });
+    if ((int) result.size() > FxChain::kRackLimit) result.resize (FxChain::kRackLimit);
+    return result;
+}
+
+void OrogenProcessor::setRackOrder (const std::vector<int>& order)
+{
+    std::array<int, FxChain::kNodeCount> ranks {};
+    for (size_t i = 0; i < order.size() && i < (size_t) FxChain::kRackLimit; ++i)
+        if (order[i] >= 0 && order[i] < FxChain::kNodeCount) ranks[(size_t) order[i]] = (int) i + 1;
+    for (int i = 0; i < FxChain::kNodeCount; ++i)
+        if (auto* p = apvts.getParameter (fxRankId (i)))
+        {
+            const float target = p->convertTo0to1 ((float) ranks[(size_t) i]);
+            if ((int) std::lround (p->convertFrom0to1 (p->getValue())) != ranks[(size_t) i])
+            { p->beginChangeGesture(); p->setValueNotifyingHost (target); p->endChangeGesture(); }
+        }
+}
+
+int OrogenProcessor::addRackEffect (int module)
+{
+    if (module < 0 || module >= FxChain::ModuleCount) return -1;
+    auto order = rackOrder();
+    if ((int) order.size() >= FxChain::kRackLimit) return -1;
+    const auto ranks = rackRanks();
+    int node = -1;
+    for (int copy = 0; copy < FxChain::kCopiesPerModule; ++copy)
+    {
+        const int candidate = copy * FxChain::ModuleCount + module;
+        if (ranks[(size_t) candidate] == 0) { node = candidate; break; }
+    }
+    if (node < 0) return -1;
+    const int copy = node / FxChain::ModuleCount;
+    if (copy > 0)
+    {
+        // New copy starts with the first instance's settings but remains a
+        // completely independent set of host parameters from this point on.
+        for (auto* p : getParameters())
+            if (auto* original = dynamic_cast<juce::AudioProcessorParameterWithID*> (p))
+            {
+                const auto id = original->paramID;
+                if (! id.startsWith ("fx_") || detail::fxSectionOf (id) != kFxModules[module].section) continue;
+                if (auto* target = apvts.getParameter (fxCopyId (id, copy)))
+                {
+                    target->beginChangeGesture(); target->setValueNotifyingHost (p->getValue()); target->endChangeGesture();
+                }
+            }
+    }
+    const auto onId = fxCopyId (kFxModules[module].onId, copy);
+    if (auto* power = apvts.getParameter (onId))
+    {
+        power->beginChangeGesture(); power->setValueNotifyingHost (1.0f); power->endChangeGesture();
+    }
+    order.push_back (node); setRackOrder (order);
+    return node;
+}
+
+bool OrogenProcessor::removeRackNode (int node)
+{
+    auto order = rackOrder();
+    const auto it = std::find (order.begin(), order.end(), node);
+    if (it == order.end()) return false;
+    const int module = node % FxChain::ModuleCount, copy = node / FxChain::ModuleCount;
+    if (auto* power = apvts.getParameter (fxCopyId (kFxModules[module].onId, copy)))
+    {
+        power->beginChangeGesture(); power->setValueNotifyingHost (0.0f); power->endChangeGesture();
+    }
+    order.erase (it); setRackOrder (order); return true;
+}
+
+bool OrogenProcessor::moveRackNode (int node, int delta)
+{
+    auto order = rackOrder();
+    const auto it = std::find (order.begin(), order.end(), node);
+    if (it == order.end()) return false;
+    const int from = (int) std::distance (order.begin(), it);
+    const int to = juce::jlimit (0, (int) order.size() - 1, from + delta);
+    if (from == to) return false;
+    order.erase (order.begin() + from); order.insert (order.begin() + to, node);
+    setRackOrder (order); return true;
+}
+
+void OrogenProcessor::stageRequestedFxCopies()
+{
+    // Only materialise the first 16 sorted entries even if a host automates
+    // more rank parameters to nonzero values at once.
+    const auto ranks = rackRanks();
+    std::array<int, FxChain::kRackLimit> ordered {};
+    int count = 0;
+    for (int node = 0; node < FxChain::kNodeCount; ++node)
+    {
+        if (ranks[(size_t) node] <= 0) continue;
+        int at = 0;
+        while (at < count && (ranks[(size_t) ordered[(size_t) at]] < ranks[(size_t) node]
+               || (ranks[(size_t) ordered[(size_t) at]] == ranks[(size_t) node] && ordered[(size_t) at] < node))) ++at;
+        if (at >= FxChain::kRackLimit) continue;
+        const int nextCount = std::min (count + 1, FxChain::kRackLimit);
+        for (int j = nextCount - 1; j > at; --j) ordered[(size_t) j] = ordered[(size_t) (j - 1)];
+        ordered[(size_t) at] = node; count = nextCount;
+    }
+    FxChain::CopySettings settings {};
+    std::array<bool, FxChain::kCopiesPerModule> collected {};
+    for (int i = 0; i < count; ++i)
+    {
+        const int node = ordered[(size_t) i], copy = node / FxChain::ModuleCount;
+        if (copy == 0) continue;
+        if (! collected[(size_t) copy]) { collectFxCopy (copy, settings[(size_t) copy]); collected[(size_t) copy] = true; }
+        inst.ensureFxCopy (node, settings[(size_t) copy]);
+    }
+}
+
+juce::var OrogenProcessor::captureRack() const
+{
+    auto* object = new juce::DynamicObject();
+    object->setProperty ("version", 1);
+    auto* values = new juce::DynamicObject();
+    for (auto* parameter : getParameters())
+        if (auto* p = dynamic_cast<juce::AudioProcessorParameterWithID*> (parameter))
+            if (p->paramID.startsWith ("rack_order_") || fxIdCopy (p->paramID) > 0)
+                if (auto* ranged = dynamic_cast<juce::RangedAudioParameter*> (p))
+                    values->setProperty (p->paramID, ranged->convertFrom0to1 (ranged->getValue()));
+    object->setProperty ("parameters", juce::var (values));
+    return juce::var (object);
+}
+
+void OrogenProcessor::restoreRack (const juce::var& rack)
+{
+    auto* object = rack.getDynamicObject();
+    auto* values = object != nullptr ? object->getProperty ("parameters").getDynamicObject() : nullptr;
+    for (auto* parameter : getParameters())
+        if (auto* p = dynamic_cast<juce::RangedAudioParameter*> (parameter))
+            if (p->paramID.startsWith ("rack_order_") || fxIdCopy (p->paramID) > 0)
+            {
+                const float value = values != nullptr && values->hasProperty (p->paramID)
+                    ? p->convertTo0to1 ((float) values->getProperty (p->paramID)) : p->getDefaultValue();
+                p->setValueNotifyingHost (juce::jlimit (0.0f, 1.0f, value));
+            }
+}
+
 // ---------- программы и состояние ------------------------------------------
 
 juce::StringArray OrogenProcessor::presetNames() const
@@ -732,6 +938,7 @@ void OrogenProcessor::loadPreset (int index)
     patch = presets[(size_t) index].patch;
     fxSettings = presets[(size_t) index].fx;
     applyToParams (patch, fxSettings);
+    restoreRack (presets[(size_t) index].rack);
     inst.stagePatch (patch);
     // FX are applied from the APVTS snapshot by the audio thread.
     stagedTypeHash = slotTypeHash();
@@ -762,6 +969,7 @@ bool OrogenProcessor::loadPresetFile (const juce::File& f)
     patch = p;
     fxSettings = fx;
     applyToParams (patch, fxSettings);
+    restoreRack (parsed.getProperty ("rack", {}));
     inst.stagePatch (patch);            // движки построит message thread
     // FX are applied from the APVTS snapshot by the audio thread.
     stagedTypeHash = slotTypeHash();
@@ -774,7 +982,9 @@ bool OrogenProcessor::savePresetFile (const juce::File& f, const juce::String& n
     FxChain::Settings fx;
     collectPatch (p, fx);
     p.setName (name.toRawUTF8());
-    const auto json = juce::JSON::toString (presetToVar (name, p, fx), false);
+    auto preset = presetToVar (name, p, fx);
+    if (auto* obj = preset.getDynamicObject()) obj->setProperty ("rack", captureRack());
+    const auto json = juce::JSON::toString (preset, false);
     return f.replaceWithText (json);
 }
 
@@ -786,7 +996,11 @@ juce::var OrogenProcessor::bankToVar() const
     o->setProperty ("version", 1);
     juce::Array<juce::var> list;
     for (const auto& pr : presets)
-        list.add (presetToVar (pr.name, pr.patch, pr.fx));
+    {
+        auto preset = presetToVar (pr.name, pr.patch, pr.fx);
+        if (auto* obj = preset.getDynamicObject()) obj->setProperty ("rack", pr.rack);
+        list.add (preset);
+    }
     o->setProperty ("programs", list);
     return juce::var (o);
 }
@@ -818,7 +1032,7 @@ bool OrogenProcessor::loadBankFile (const juce::File& f)
             juce::String name;
             if (! presetFromVar (item, p, fx, name)) return false;
             if (name.isEmpty()) name = "Program " + juce::String ((int) loaded.size() + 1);
-            loaded.push_back ({ name, p, fx });
+            loaded.push_back ({ name, p, fx, item.getProperty ("rack", {}) });
         }
 
         presets = std::move (loaded);
@@ -833,7 +1047,7 @@ bool OrogenProcessor::loadBankFile (const juce::File& f)
     juce::String name;
     if (! presetFromVar (parsed, p, fx, name)) return false;
     presets.clear();
-    presets.push_back ({ name.isEmpty() ? juce::String ("Program 1") : name, p, fx });
+    presets.push_back ({ name.isEmpty() ? juce::String ("Program 1") : name, p, fx, parsed.getProperty ("rack", {}) });
     currentProgram = 0;
     loadPreset (0);
     return true;
@@ -845,7 +1059,7 @@ int OrogenProcessor::addProgram (const juce::String& name)
     FxChain::Settings fx;
     collectPatch (p, fx);
     presets.push_back ({ name.isEmpty() ? juce::String ("Program ") + juce::String ((int) presets.size() + 1)
-                                         : name, p, fx });
+                                         : name, p, fx, captureRack() });
     return (int) presets.size() - 1;
 }
 
@@ -919,6 +1133,12 @@ void OrogenProcessor::setStateInformation (const void* data, int sizeInBytes)
     for (const char* id : { "fx_glitchSync", "fx_glitchDivision", "fx_glitchHighpass" })
         restoreMissingDefault (id);
 
+    for (auto* parameter : getParameters())
+        if (auto* withId = dynamic_cast<juce::AudioProcessorParameterWithID*> (parameter))
+        {
+            const auto& id = withId->paramID;
+            if (id.startsWith ("rack_order_") || fxIdCopy (id) > 0) restoreMissingDefault (id);
+        }
     apvts.replaceState (state);
     collectPatch (patch, fxSettings);
     patch.setName (state.getProperty ("patchName", "Untitled").toString().toRawUTF8());

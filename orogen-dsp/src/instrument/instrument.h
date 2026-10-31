@@ -129,6 +129,13 @@ public:
     const Patch& getPatch() const { return patch; }
 
     void setFx (const FxChain::Settings& s) { fxSettings = s; fx.set (s); }
+    // ensureFxCopy is control-thread-only. setFxRack is audio-thread-only.
+    void ensureFxCopy (int node, const FxChain::Settings& initial) { fx.ensureCopy (node, initial); }
+    unsigned fxCopyGeneration() const noexcept { return fx.getCopyGeneration(); }
+    void setFxRack (const FxChain::RackRanks& ranks, const FxChain::CopySettings& copies) noexcept
+    {
+        fx.setRack (ranks, copies);
+    }
 
     // Транспортная задержка цепочки эффектов в сэмплах. Обёртка VST3 обязана
     // отдать её хосту через setLatencySamples().

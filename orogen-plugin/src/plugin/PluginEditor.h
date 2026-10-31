@@ -195,7 +195,7 @@ private:
     juce::OwnedArray<Bound> centreKnobs, centreBars;    // 3 + 3, зависят от слота
     juce::OwnedArray<Bound> bottomKnobs, bottomBars;    // 5 + 5, глобальные
     juce::OwnedArray<PatchColumn> columns;              // 4 секции
-    juce::OwnedArray<IconButton> sectionButtons;        // 4 кнопки слева внизу
+    juce::OwnedArray<IconButton> sectionButtons;        // 3 кнопки слева внизу (FX открывается отдельной кнопкой FX RACK)
     juce::OwnedArray<juce::ToggleButton> switchButtons; // 4 переключателя
     juce::OwnedArray<juce::AudioProcessorValueTreeState::ButtonAttachment> switchAtts;
     std::unique_ptr<VectorPad> vectorPad;

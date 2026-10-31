@@ -11,6 +11,7 @@
 #include <csignal>
 #if ! defined (_WIN32)
 #include <execinfo.h>
+#include <dlfcn.h>
 #endif
 #include <cstdlib>
 
@@ -1008,7 +1009,7 @@ static void testGuiRegressions()
     editor->setSize (960, 600);     // минимальный поддерживаемый размер окна
     editor->showPage (101);        // FX / ALL
     int sectionBtns = 0, boundsErrors = 0, lastRight = 0;
-    juce::Button* robinButton = nullptr;
+    juce::Button* robinButton = nullptr; juce::Button* rankButton = nullptr;
     for (auto* child : overlay->getChildren())
         if (auto* button = dynamic_cast<juce::Button*> (child))
             if (button->isVisible() && button->getY() == 46)
@@ -1017,12 +1018,17 @@ static void testGuiRegressions()
                 if (button->getX() < lastRight || button->getRight() > overlay->getWidth() - 140) ++boundsErrors;
                 lastRight = button->getRight();
                 if (button->getButtonText() == "ROBIN") robinButton = button;
+                if (button->getButtonText() == "RACK ORDER") rankButton = button;
             }
     if (robinButton != nullptr) robinButton->triggerClick();
     juce::MessageManager::getInstance()->runDispatchLoopUntil (80);
     const auto narrowIds = visibleBoundIds (*overlay);
-    check (sectionBtns == 14 && boundsErrors == 0 && narrowIds.contains ("fx_robinMix"),
-           "в узком окне все 13 FX-секций помещаются и последняя открывается мышью",
+    if (rankButton != nullptr) rankButton->triggerClick();
+    juce::MessageManager::getInstance()->runDispatchLoopUntil (80);
+    const auto rankIds = visibleBoundIds (*overlay);
+    check (sectionBtns == 15 && boundsErrors == 0 && narrowIds.contains ("fx_robinMix")
+           && rankIds.contains ("rack_order_0") && rankIds.contains ("rack_order_51"),
+           "в узком окне все 13 FX-секций и RACK ORDER помещаются и открываются мышью",
            juce::String (sectionBtns) + " кнопок, " + juce::String (boundsErrors) + " ошибок геометрии");
     editor->setSize (1280, 800);
 
@@ -2186,6 +2192,110 @@ static void testNativeVectorGesture()
    #endif
 }
 
+// Ordered multi-instance rack: stable host IDs, persistence, migration, and limits.
+static void testDynamicFxRack()
+{
+    std::printf ("\n--- Dynamic FX: duplicates, ordering, state, JSON ---\n");
+    OrogenProcessor p;
+    auto expected = p.rackOrder();
+    bool defaultOrder = expected.size() == (size_t) FxChain::ModuleCount;
+    for (int i = 0; i < FxChain::ModuleCount && defaultOrder; ++i) defaultOrder = expected[(size_t) i] == i;
+    check (defaultOrder, "старые 13 стадий доступны в прежнем порядке");
+
+    setP (p, "fx_drive", 0.24f); setP (p, "fx_driveTone", -0.30f);
+    const int n2 = p.addRackEffect (FxChain::Drive);
+    const int n3 = p.addRackEffect (FxChain::Drive);
+    const int n4 = p.addRackEffect (FxChain::Drive);
+    check (n2 == FxChain::ModuleCount + FxChain::Drive && n3 == 2 * FxChain::ModuleCount + FxChain::Drive
+           && n4 == 3 * FxChain::ModuleCount + FxChain::Drive && p.rackOrder().size() == 16,
+           "добавляются три отдельные копии Drive; общий лимит 16");
+    check (std::fabs (p.apvts.getRawParameterValue ("fx2_drive")->load() - .24f) < .002f,
+           "новая копия начинается с настроек первого экземпляра");
+    setP (p, "fx_drive", 0.11f); setP (p, "fx2_drive", 0.33f);
+    setP (p, "fx3_drive", 0.58f); setP (p, "fx4_drive", 0.87f);
+    FxChain::Settings copies[4];
+    for (int i = 0; i < 4; ++i) p.collectFxCopy (i, copies[i]);
+    check (std::fabs (copies[0].drive - .11f) < .002f && std::fabs (copies[1].drive - .33f) < .002f
+           && std::fabs (copies[2].drive - .58f) < .002f && std::fabs (copies[3].drive - .87f) < .002f,
+           "автоматизация четырёх копий независима");
+    check (p.moveRackNode (n4, -5), "экземпляр можно сдвинуть раньше по цепи");
+    expected = p.rackOrder();
+    check (expected[(size_t) 10] == n4, "новый порядок прочитан из реальных параметров хоста");
+    check (p.removeRackNode (FxChain::Comb) && p.addRackEffect (FxChain::Drive) == -1,
+           "лимит четырёх одинаковых эффектов соблюдается даже при свободном месте");
+    expected = p.rackOrder();
+
+    juce::MemoryBlock state; p.getStateInformation (state);
+    OrogenProcessor restored;
+    restored.setStateInformation (state.getData(), (int) state.getSize());
+    bool same = restored.rackOrder() == expected;
+    for (int i = 0; i < 4; ++i)
+    {
+        FxChain::Settings snapshot; restored.collectFxCopy (i, snapshot);
+        same = same && std::fabs (snapshot.drive - copies[i].drive) < .002f;
+    }
+    check (same, "DAW state восстанавливает порядок и настройки всех четырёх копий");
+
+    const auto file = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                          .getNonexistentChildFile ("orogen-rack-preset", ".json");
+    const bool saved = p.savePresetFile (file, "Rack copies");
+    OrogenProcessor fromJson;
+    const bool loaded = fromJson.loadPresetFile (file);
+    same = loaded && fromJson.rackOrder() == expected;
+    for (int i = 0; i < 4; ++i)
+    {
+        FxChain::Settings snapshot; fromJson.collectFxCopy (i, snapshot);
+        same = same && std::fabs (snapshot.drive - copies[i].drive) < .002f;
+    }
+    check (saved && same, "JSON-пресет сохраняет порядок и независимые копии");
+    file.deleteFile();
+
+    const auto bankFile = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                              .getNonexistentChildFile ("orogen-rack-bank", ".json");
+    const int program = p.addProgram ("Rack copies");
+    const bool bankSaved = p.saveBankFile (bankFile);
+    OrogenProcessor fromBank;
+    const bool bankLoaded = fromBank.loadBankFile (bankFile);
+    fromBank.loadPreset (program);
+    FxChain::Settings bankCopy; fromBank.collectFxCopy (3, bankCopy);
+    check (bankSaved && bankLoaded && fromBank.rackOrder() == expected && std::fabs (bankCopy.drive - .87f) < .002f,
+           "банк JSON сохраняет цепочку для добавленной программы");
+    bankFile.deleteFile();
+
+    // Simulate a 376-parameter state from immediately before this change,
+    // loaded over a modified new instance: missing new fields must reset.
+    auto oldState = p.apvts.copyState();
+    for (int i = oldState.getNumChildren(); --i >= 0; )
+    {
+        auto child = oldState.getChild (i);
+        const auto id = child.getProperty ("id").toString();
+        if (id.startsWith ("rack_order_") || fxIdCopy (id) > 0) oldState.removeChild (i, nullptr);
+    }
+    juce::MemoryBlock oldBlob;
+    if (auto xml = oldState.createXml()) juce::AudioProcessor::copyXmlToBinary (*xml, oldBlob);
+    restored.setStateInformation (oldBlob.getData(), (int) oldBlob.getSize());
+    const auto migrated = restored.rackOrder();
+    bool canonical = migrated.size() == (size_t) FxChain::ModuleCount;
+    for (int i = 0; i < FxChain::ModuleCount && canonical; ++i) canonical = migrated[(size_t) i] == i;
+    auto* oldClone = restored.apvts.getParameter ("fx2_drive");
+    check (canonical && oldClone != nullptr && oldClone->getValue() == oldClone->getDefaultValue(),
+           "старая сессия, загруженная поверх новой: исходный порядок и дефолты копий");
+
+    OrogenProcessor mainProcessor;
+    mainProcessor.removeRackNode (FxChain::Drive);
+    OrogenEditor mainEditor (mainProcessor); mainEditor.setSize (1280, 800);
+    int sectionMask = 0;
+    for (auto* child : mainEditor.getChildren())
+        if (child->getProperties().contains ("sectionKind"))
+            sectionMask |= 1 << (int) child->getProperties()["sectionKind"];
+    check (sectionMask == ((1 << 1) | (1 << 2) | (1 << 3)),
+           "нижняя кнопка FX CHAIN удалена, три остальные сохранены");
+    const bool clicked = mainEditor.clickMain ({ 275.0f, 615.0f });
+    check (clicked && mainProcessor.rackRanks()[(size_t) FxChain::Drive] > 0
+           && mainProcessor.apvts.getRawParameterValue ("fx_driveOn")->load() > 0.5f,
+           "чип ADD на главном экране возвращает удалённый экземпляр #1");
+}
+
 // FX rack: state migration, complete control map, and native GUI events.
 static void testFxRackStateAndMap()
 {
@@ -2288,7 +2398,8 @@ static void testFxRackStateAndMap()
     const auto all = editor.fxRackParamIds();
     juce::StringArray expected;
     const auto tabs = buildUiTabs();
-    for (const auto& section : tabs[1].sections) expected.addArray (section.ids);
+    for (const auto& section : tabs[1].sections)
+        if (section.title != "RACK ORDER") expected.addArray (section.ids);
     int missing = 0, duplicates = 0, wrongPage = 0;
     for (const auto& id : expected)
     {
@@ -2297,7 +2408,12 @@ static void testFxRackStateAndMap()
     }
     for (int i = 0; i < FxChain::ModuleCount; ++i)
     {
-        editor.showPage (50 + i);
+        std::vector<int> copies;
+        for (int copy = 1; copy < FxChain::kCopiesPerModule; ++copy)
+            copies.push_back (p.addRackEffect (i));
+        for (int copy = 0; copy < FxChain::kCopiesPerModule; ++copy)
+        {
+        editor.showPage (1000 + copy * FxChain::ModuleCount + i);
         auto* overlay = editor.fxOverlay();
         juce::StringArray actual;
         std::function<void (juce::Component&)> walk = [&] (juce::Component& c) {
@@ -2316,7 +2432,9 @@ static void testFxRackStateAndMap()
         if (overlay != nullptr) walk (*overlay);
         for (const auto& section : tabs[1].sections)
             if (section.title == kFxModules[i].section)
-                for (const auto& id : section.ids) if (! actual.contains (id)) ++wrongPage;
+                for (const auto& id : section.ids) if (fxIdCopy (id) == copy && ! actual.contains (id)) ++wrongPage;
+        }
+        for (int node : copies) if (node >= 0) p.removeRackNode (node);
     }
     check (missing == 0 && duplicates == 0 && all.size() == expected.size() && wrongPage == 0,
            "каждый FX-параметр имеет реальный контрол на странице своего эффекта",
@@ -2365,6 +2483,66 @@ static void testFxRackStateAndMap()
            && std::fabs (length->getValueFromText ("1") - 1.0) < 1e-6
            && std::fabs (length->getValueFromText ("500") - 500.0) < 1e-6,
            "GLITCH LENGTH EXT: FOLLOW или действительные 1–500 мс с шагом 1 мс");
+}
+
+// Run with the optional Linux/glibc LD_PRELOAD probe. It intercepts malloc,
+// calloc, realloc and aligned allocation in this calling thread, including C++
+// new; it intentionally does not count preparation on the FX worker.
+static void testAudioCallbackAllocations()
+{
+   #if JUCE_LINUX
+    using Start = void (*)(); using Stop = std::uint64_t (*)();
+    const auto start = reinterpret_cast<Start> (dlsym (RTLD_DEFAULT, "orogen_allocation_probe_start"));
+    const auto stop = reinterpret_cast<Stop> (dlsym (RTLD_DEFAULT, "orogen_allocation_probe_stop"));
+    if (start == nullptr || stop == nullptr) { check (false, "подключён LD_PRELOAD allocation probe"); return; }
+    // Sanity check the instrument itself: calls through libc malloc and C++
+    // operator new must both be observed before a zero-allocation result means anything.
+    using Alloc = void* (*) (std::size_t);
+    const auto cMalloc = reinterpret_cast<Alloc> (dlsym (RTLD_DEFAULT, "malloc"));
+    Alloc volatile cppNew = static_cast<Alloc> (&::operator new);
+    start(); void* a = cMalloc != nullptr ? cMalloc (41) : nullptr; void* b = cppNew (73);
+    const auto sanity = stop();
+    std::free (a); ::operator delete (b);
+    check (a != nullptr && b != nullptr && sanity >= 2,
+           "allocation probe видит libc malloc и C++ new", juce::String ((juce::int64) sanity));
+    OrogenProcessor p;
+    p.setPlayConfigDetails (0, 2, 48000.0, 128); p.prepareToPlay (48000.0, 128);
+    for (const auto& item : { std::pair<const char*, float> { "fx_drive", .7f },
+         { "fx_driveMix", .9f }, { "fx_combMix", .4f }, { "fx_chorusMix", .4f },
+         { "fx_delayMix", .4f }, { "fx_reverbMix", .4f }, { "fx_plateMix", .4f },
+         { "fx_eqLow", 8.0f }, { "fx_materialMix", .4f }, { "fx_spectreMix", .4f },
+         { "fx_robinMix", .4f }, { "fx_glitchMix", .4f } })
+        if (p.apvts.getParameter (item.first) != nullptr) setP (p, item.first, item.second);
+    juce::AudioBuffer<float> audio (2, 128); juce::MidiBuffer first, empty;
+    first.addEvent (juce::MidiMessage::noteOn (1, 60, .8f), 0);
+    p.processBlock (audio, first);
+    std::uint64_t total = 0; int ready = 0, nonfinite = 0;
+    unsigned previousGeneration = p.engine().fxCopyGeneration();
+    for (int module = 0; module < FxChain::ModuleCount; ++module)
+    {
+        const int node = p.addRackEffect (module);
+        for (int wait = 0; wait < 400 && p.engine().fxCopyGeneration() == previousGeneration; ++wait)
+            juce::Thread::sleep (5);
+        const unsigned generation = p.engine().fxCopyGeneration();
+        if (node != FxChain::ModuleCount + module || generation <= previousGeneration) break;
+        previousGeneration = generation; ++ready;
+        // Process the changed graph and its fade while counting only this thread.
+        start();
+        for (int block = 0; block < 16; ++block) p.processBlock (audio, empty);
+        const auto count = stop(); total += count;
+        for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < 128; ++i)
+            if (! std::isfinite (audio.getSample (ch, i))) ++nonfinite;
+        if (count != 0) std::printf ("   allocations in %s #2 processBlock: %llu\n",
+                                     kFxModules[module].name, (unsigned long long) count);
+        p.removeRackNode (node);
+    }
+    p.releaseResources();
+    check (ready == FxChain::ModuleCount && total == 0 && nonfinite == 0,
+           "реальный AudioProcessor processBlock: подготовлены копии всех типов, аллокаций и NaN/Inf нет",
+           juce::String (ready) + "/13, alloc=" + juce::String ((juce::int64) total) + ", nonfinite=" + juce::String (nonfinite));
+   #else
+    check (false, "этот allocation probe рассчитан на Linux/glibc");
+   #endif
 }
 
 // The DAW parameter path must reach the audio callback, not merely the DSP
@@ -2437,22 +2615,27 @@ static void testNativeFxRack (bool scrollOnly = false)
     const auto openDisplay = reinterpret_cast<void* (*) (const char*)> (x11.getFunction ("XOpenDisplay"));
     const auto closeDisplay = reinterpret_cast<int (*) (void*)> (x11.getFunction ("XCloseDisplay"));
     const auto flushDisplay = reinterpret_cast<int (*) (void*)> (x11.getFunction ("XFlush"));
+    const auto syncDisplay = reinterpret_cast<int (*) (void*, int)> (x11.getFunction ("XSync"));
     const auto move = reinterpret_cast<int (*) (void*, int, int, int, unsigned long)> (xtest.getFunction ("XTestFakeMotionEvent"));
     const auto button = reinterpret_cast<int (*) (void*, unsigned int, int, unsigned long)> (xtest.getFunction ("XTestFakeButtonEvent"));
     const auto keyEvent = reinterpret_cast<int (*) (void*, unsigned int, int, unsigned long)> (xtest.getFunction ("XTestFakeKeyEvent"));
     const auto keyCode = reinterpret_cast<unsigned char (*) (void*, unsigned long)> (x11.getFunction ("XKeysymToKeycode"));
-    if (!openDisplay || !closeDisplay || !flushDisplay || !move || !button || !keyEvent || !keyCode) { check (false, "XTEST symbols"); return; }
+    if (!openDisplay || !closeDisplay || !flushDisplay || !syncDisplay || !move || !button || !keyEvent || !keyCode) { check (false, "XTEST symbols"); return; }
     void* display = openDisplay (nullptr);
     if (!display) { check (false, "XTEST display"); return; }
+    // XSync waits until synthetic events have reached the X server; a
+    // follow-up one-pixel motion wakes JUCE's other X connection after release.
+    const auto flush = [&] { flushDisplay (display); syncDisplay (display, 0); };
     {
         OrogenProcessor p; p.setCurrentProgram (0);
         OrogenEditor editor (p); editor.setSize (1280, 800); editor.setAnimationsEnabled (false);
         editor.addToDesktop (0); editor.setTopLeftPosition (0, 0); editor.setVisible (true);
         auto* mm = juce::MessageManager::getInstance(); mm->runDispatchLoopUntil (350);
         const auto click = [&] (juce::Point<int> pt) {
-            move (display, -1, pt.x, pt.y, 0); flushDisplay (display); mm->runDispatchLoopUntil (20);
-            button (display, 1, 1, 0); flushDisplay (display); mm->runDispatchLoopUntil (25);
-            button (display, 1, 0, 0); flushDisplay (display); mm->runDispatchLoopUntil (55);
+            move (display, -1, pt.x, pt.y, 0); flush(); mm->runDispatchLoopUntil (20);
+            button (display, 1, 1, 0); flush(); mm->runDispatchLoopUntil (45);
+            button (display, 1, 0, 0); flush();
+            move (display, -1, pt.x + 1, pt.y, 0); flush(); mm->runDispatchLoopUntil (90);
         };
         std::function<juce::Button* (juce::Component&, const juce::String&)> findButton;
         findButton = [&] (juce::Component& c, const juce::String& text) -> juce::Button* {
@@ -2478,19 +2661,35 @@ static void testNativeFxRack (bool scrollOnly = false)
                 std::array<float, FxChain::ModuleCount> states {};
                 for (int j = 0; j < FxChain::ModuleCount; ++j) states[(size_t) j] = p.apvts.getRawParameterValue (kFxModules[j].onId)->load();
                 const float saved = p.apvts.getRawParameterValue ("fx_chorusMix")->load();
-                const auto select = editor.localPointToGlobal (juce::Point<int> (juce::roundToInt (94*scale), juce::roundToInt ((164.0f + 43.0f*i)*scale)));
+                const auto select = editor.localPointToGlobal (juce::Point<int> (juce::roundToInt (94*scale), juce::roundToInt ((178.0f + 31.0f*i)*scale)));
                 click (select);
                 if (editor.fxRackSelectedModule() == i) ++selected;
                 GestureTrace trace (p, kFxModules[i].onId);
-                const auto power = editor.localPointToGlobal (juce::Point<int> (juce::roundToInt (211*scale), juce::roundToInt ((164.0f + 43.0f*i)*scale)));
+                const auto power = editor.localPointToGlobal (juce::Point<int> (juce::roundToInt (211*scale), juce::roundToInt ((178.0f + 31.0f*i)*scale)));
                 click (power);
+                // Let the native X11 press/release actually reach JUCE even
+                // when a large editor repaint takes longer than one timer tick.
+                for (int wait = 0; wait < 50 && (p.apvts.getRawParameterValue (kFxModules[i].onId)->load() <= 0.5f
+                                                  || ! trace.balanced()); ++wait)
+                    mm->runDispatchLoopUntil (10);
                 const bool on = p.apvts.getRawParameterValue (kFxModules[i].onId)->load() > 0.5f;
                 const bool hasGesture = trace.balanced(); trace.clear();
-                bool others = true;
+                bool others = true; int otherIndex = -1;
                 for (int j = 0; j < FxChain::ModuleCount; ++j) if (j != i)
-                    if (std::fabs (p.apvts.getRawParameterValue (kFxModules[j].onId)->load() - states[(size_t) j]) > 0.001f) others = false;
+                    if (std::fabs (p.apvts.getRawParameterValue (kFxModules[j].onId)->load() - states[(size_t) j]) > 0.001f)
+                    { others = false; otherIndex = j; }
+                // Two deliberate clicks rather than an artificial double-click:
+                // allow JUCE's 100 ms flashButtonState timer to finish first.
+                mm->runDispatchLoopUntil (150);
                 click (power);
+                for (int wait = 0; wait < 50 && (p.apvts.getRawParameterValue (kFxModules[i].onId)->load() >= 0.5f
+                                                  || ! trace.balanced()); ++wait)
+                    mm->runDispatchLoopUntil (10);
                 const bool off = p.apvts.getRawParameterValue (kFxModules[i].onId)->load() < 0.5f;
+                if (! on || ! off || ! others || ! hasGesture || ! trace.balanced())
+                    std::printf ("   XTEST detail: width=%d module=%d selected=%d other=%d on/off=%d/%d gestures=%d/%d power=(%d,%d)\n",
+                                 width, i, editor.fxRackSelectedModule(), otherIndex, (int) on, (int) off,
+                                 (int) hasGesture, (int) trace.balanced(), power.x, power.y);
                 if (on && off) ++toggles;
                 if (others) ++isolated;
                 if (std::fabs (saved - p.apvts.getRawParameterValue ("fx_chorusMix")->load()) < 1.0e-6f) ++retained;
@@ -2515,6 +2714,62 @@ static void testNativeFxRack (bool scrollOnly = false)
             }
             return nullptr;
         };
+        // Real X11 clicks: add a second DRIVE, edit its own automation,
+        // move it up, then remove only that instance.
+        if (! scrollOnly)
+        {
+            std::function<juce::Button* (juce::Component&, const juce::String&)> findAction;
+            findAction = [&] (juce::Component& c, const juce::String& action) -> juce::Button* {
+                for (auto* child : c.getChildren()) {
+                    if (auto* b = dynamic_cast<juce::Button*> (child))
+                        if (b->getProperties().getWithDefault ("fxAction", {}).toString() == action) return b;
+                    if (auto* found = findAction (*child, action)) return found;
+                }
+                return nullptr;
+            };
+            editor.showPage (50); mm->runDispatchLoopUntil (100);
+            setP (p, "fx_drive", .20f);
+            auto* add = findAction (*editor.fxOverlay(), "add");
+            if (add) click (add->getScreenBounds().getCentre());
+            mm->runDispatchLoopUntil (100);
+            const int clone = FxChain::ModuleCount + FxChain::Drive;
+            const auto added = p.rackOrder();
+            const bool addOk = ! added.empty() && added.back() == clone
+                && p.apvts.getRawParameterValue ("fx2_driveOn")->load() > .5f;
+            auto* duplicateSlider = findSlider (*editor.fxOverlay(), "fx2_drive");
+            GestureTrace duplicateGesture (p, "fx2_drive");
+            const float baseBefore = p.apvts.getRawParameterValue ("fx_drive")->load();
+            const float duplicateBefore = p.apvts.getRawParameterValue ("fx2_drive")->load();
+            if (duplicateSlider != nullptr)
+            {
+                auto point = duplicateSlider->getScreenBounds().getCentre(); point.y -= 15;
+                move (display, -1, point.x, point.y, 0); flush(); mm->runDispatchLoopUntil (25);
+                button (display, 1, 1, 0); flush(); mm->runDispatchLoopUntil (30);
+                move (display, -1, point.x, point.y - 45, 0); flush(); mm->runDispatchLoopUntil (60);
+                button (display, 1, 0, 0); flush();
+                move (display, -1, point.x + 1, point.y - 45, 0); flush(); mm->runDispatchLoopUntil (120);
+            }
+            const bool independent = duplicateSlider != nullptr && duplicateGesture.balanced()
+                && std::fabs (p.apvts.getRawParameterValue ("fx2_drive")->load() - duplicateBefore) > .01f
+                && std::fabs (p.apvts.getRawParameterValue ("fx_drive")->load() - baseBefore) < .001f;
+            auto* up = findAction (*editor.fxOverlay(), "up");
+            if (up) click (up->getScreenBounds().getCentre());
+            const auto moved = p.rackOrder();
+            const bool moveOk = moved.size() == 14 && moved[12] == clone;
+            auto* down = findAction (*editor.fxOverlay(), "down");
+            if (down) click (down->getScreenBounds().getCentre());
+            const auto movedDown = p.rackOrder();
+            const bool downOk = movedDown.size() == 14 && movedDown[13] == clone;
+            auto* remove = findAction (*editor.fxOverlay(), "remove");
+            if (remove) click (remove->getScreenBounds().getCentre());
+            const auto removed = p.rackOrder();
+            const bool removeOk = removed.size() == 13 && std::find (removed.begin(), removed.end(), clone) == removed.end();
+            check (addOk && independent && moveOk && downOk && removeOk,
+                   "XTEST: ADD, независимая ручка с host gesture, UP, DOWN, REMOVE",
+                   juce::String ((int) addOk) + "/" + juce::String ((int) independent) + "/"
+                   + juce::String ((int) moveOk) + "/" + juce::String ((int) downOk) + "/" + juce::String ((int) removeOk));
+            editor.showPage (52); mm->runDispatchLoopUntil (150);
+        }
         auto* slider = findSlider (*editor.fxOverlay(), "fx_chorusDelay");
         setP (p, "fx_chorusDelay", 60.0f); mm->runDispatchLoopUntil (80);
         GestureTrace knob (p, "fx_chorusDelay");
@@ -2522,11 +2777,13 @@ static void testNativeFxRack (bool scrollOnly = false)
         if (slider != nullptr)
         {
             auto pt = slider->getScreenBounds().getCentre(); pt.y -= 15;
-            move (display, -1, pt.x, pt.y, 0); flushDisplay (display); mm->runDispatchLoopUntil (25);
-            button (display, 1, 1, 0); flushDisplay (display); mm->runDispatchLoopUntil (30);
-            move (display, -1, pt.x, pt.y - 45, 0); flushDisplay (display); mm->runDispatchLoopUntil (60);
-            button (display, 1, 0, 0); flushDisplay (display); mm->runDispatchLoopUntil (100);
+            move (display, -1, pt.x, pt.y, 0); flush(); mm->runDispatchLoopUntil (25);
+            button (display, 1, 1, 0); flush(); mm->runDispatchLoopUntil (30);
+            move (display, -1, pt.x, pt.y - 45, 0); flush(); mm->runDispatchLoopUntil (60);
+            button (display, 1, 0, 0); flush();
+            move (display, -1, pt.x + 1, pt.y - 45, 0); flush(); mm->runDispatchLoopUntil (120);
         }
+        for (int wait = 0; wait < 50 && ! knob.balanced(); ++wait) mm->runDispatchLoopUntil (10);
         const float after = p.apvts.getRawParameterValue ("fx_chorusDelay")->load();
         check (slider != nullptr && std::fabs (before - after) > 1.0f && knob.balanced(),
                "XTEST drag изменяет настоящий параметр Chorus DEL и сообщает жест хосту",
@@ -2546,7 +2803,7 @@ static void testNativeFxRack (bool scrollOnly = false)
             send (0xffe3, true); send ('a', true); send ('a', false); send (0xffe3, false); // Ctrl+A
             send ('3', true); send ('3', false); send ('7', true); send ('7', false);
             send (0xff0d, true); send (0xff0d, false); // Return
-            flushDisplay (display); mm->runDispatchLoopUntil (200);
+            flush(); mm->runDispatchLoopUntil (200);
         }
         const float typed = p.apvts.getRawParameterValue ("fx_chorusDelay")->load();
         check (valueLabel != nullptr && std::fabs (typed - 37.0f) < 0.1f,
@@ -2566,7 +2823,7 @@ static void testNativeFxRack (bool scrollOnly = false)
             auto send = [&] (unsigned long sym, bool down) { keyEvent (display, keyCode (display, sym), down ? 1 : 0, 0); };
             send (0xffe3, true); send ('a', true); send ('a', false); send (0xffe3, false);
             send ('7', true); send ('7', false); send ('5', true); send ('5', false);
-            send (0xff0d, true); send (0xff0d, false); flushDisplay (display); mm->runDispatchLoopUntil (200);
+            send (0xff0d, true); send (0xff0d, false); flush(); mm->runDispatchLoopUntil (200);
         }
         const float dryTyped = p.apvts.getRawParameterValue ("fx_glitchDryLevel")->load();
         check (dryLabel != nullptr && std::fabs (dryTyped - .75f) < .002f && dryGesture.balanced(),
@@ -2596,11 +2853,11 @@ static void testNativeFxRack (bool scrollOnly = false)
             const auto scrollPos = viewport->getVerticalScrollBar().getScreenBounds().getCentre();
             std::printf ("   viewport screen %d,%d %dx%d, scrollbar centre %d,%d\n",
                          bounds.getX(), bounds.getY(), bounds.getWidth(), bounds.getHeight(), scrollPos.x, scrollPos.y);
-            move (display, -1, scrollPos.x, scrollPos.y, 0); flushDisplay (display); mm->runDispatchLoopUntil (80);
+            move (display, -1, scrollPos.x, scrollPos.y, 0); flush(); mm->runDispatchLoopUntil (80);
             for (int i = 0; i < 30; ++i)
             {
                 button (display, 5, 1, 0); button (display, 5, 0, 0);
-                flushDisplay (display); mm->runDispatchLoopUntil (15);
+                flush(); mm->runDispatchLoopUntil (15);
             }
             mm->runDispatchLoopUntil (150);
         }
@@ -2612,10 +2869,10 @@ static void testNativeFxRack (bool scrollOnly = false)
         if (lastVisible)
         {
             auto pt = wetDb->getScreenBounds().getCentre(); pt.y -= 15;
-            move (display, -1, pt.x, pt.y, 0); flushDisplay (display); mm->runDispatchLoopUntil (20);
-            button (display, 1, 1, 0); flushDisplay (display); mm->runDispatchLoopUntil (30);
-            move (display, -1, pt.x, pt.y - 40, 0); flushDisplay (display); mm->runDispatchLoopUntil (60);
-            button (display, 1, 0, 0); flushDisplay (display); mm->runDispatchLoopUntil (100);
+            move (display, -1, pt.x, pt.y, 0); flush(); mm->runDispatchLoopUntil (20);
+            button (display, 1, 1, 0); flush(); mm->runDispatchLoopUntil (30);
+            move (display, -1, pt.x, pt.y - 40, 0); flush(); mm->runDispatchLoopUntil (60);
+            button (display, 1, 0, 0); flush(); mm->runDispatchLoopUntil (100);
         }
         const float wetValue = p.apvts.getRawParameterValue ("fx_combWetDb")->load();
         check (scrolled && lastVisible && std::fabs (wetValue) > 0.1f && combWet.balanced(),
@@ -2640,6 +2897,13 @@ int main (int argc, char** argv)
     auto* mm = juce::MessageManager::getInstance();
     std::printf ("OROGEN test_plugin: старт\n");
     juce::ignoreUnused (mm);
+    if (argc > 1 && juce::String (argv[1]) == "--audio-alloc-only")
+    {
+        testAudioCallbackAllocations();
+        juce::DeletedAtShutdown::deleteAll();
+        juce::MessageManager::deleteInstance();
+        return failures == 0 ? 0 : 1;
+    }
     if (argc > 1 && juce::String (argv[1]) == "--fx-scroll-only")
     {
         testNativeFxRack (true);
@@ -2649,6 +2913,7 @@ int main (int argc, char** argv)
     }
     if (argc > 1 && juce::String (argv[1]) == "--fx-rack-only")
     {
+        testDynamicFxRack();
         testFxRackStateAndMap();
         testMonoFxProcessorAudio();
         testNativeFxRack();
@@ -2744,7 +3009,10 @@ int main (int argc, char** argv)
         const int count = p.getParameters().size();
         std::printf ("   параметров: %d, программ: %d\n", count, p.getNumPrograms());
         int extraFxCount = 0; fxExtraParamTable (extraFxCount);
-        const int expectedCount = 306 + FxChain::ModuleCount + extraFxCount + 2 + 5;
+        const int legacyCount = 306 + FxChain::ModuleCount + extraFxCount + 2 + 5;
+        int fxCount = 0; fxParamTable (fxCount);
+        const int perCopy = fxCount + FxChain::ModuleCount + extraFxCount + 21;
+        const int expectedCount = legacyCount + (FxChain::kCopiesPerModule - 1) * perCopy + FxChain::kNodeCount;
         check (count == expectedCount, "все параметры объявлены", num (count, 0));
 
         // Снимок последовательности ID rev21 до добавления Plate. Хэшируем
@@ -3611,7 +3879,7 @@ int main (int argc, char** argv)
                 }
             }
             std::printf ("   страниц секций: %d (секций в API-карте: %d)\n", pages, sectionsTotal);
-            check (pages == 33, "страниц ровно столько, сколько секций в карте",
+            check (pages == 34 && pages == sectionsTotal, "страниц ровно столько, сколько секций в карте, включая RACK ORDER",
                    num ((double) pages, 0));
             check (seen == apvtsIds.size(), "на все параметры есть контрол в постраничном оверлее",
                    juce::String (seen) + " / " + juce::String (apvtsIds.size()));

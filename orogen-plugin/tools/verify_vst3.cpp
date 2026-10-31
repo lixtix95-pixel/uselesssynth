@@ -17,7 +17,7 @@
 
 using namespace juce;
 
-static constexpr int kNumApvtsParams = 376;   // см. Params.h / test_plugin
+static constexpr int kNumApvtsParams = 890;   // см. Params.h / test_plugin
 
 static int failures = 0;
 static void check (bool ok, const String& what, const String& detail = {})
@@ -115,10 +115,10 @@ static void testHostedGuiGestures (AudioPluginFormat& format, const PluginDescri
             };
             click ({ 306, 32 }); // FX RACK
             HostGestureTrace chorus (findParam ("CHORUS On"));
-            click ({ 211, 251 }); // Chorus OFF -> ON
+            click ({ 211, 240 }); // Chorus OFF -> ON
             check (chorus.balanced() && chorus.p->getValue() > 0.5f,
                    "VST3 FX rack: Chorus ON передаёт begin/value/end хосту", chorus.info());
-            click ({ 95, 251 });  // select Chorus settings
+            click ({ 95, 240 });  // select Chorus settings
             auto* delay = findParam ("Chorus Delay");
             if (delay != nullptr) delay->setValueNotifyingHost (0.5f);
             const float before = delay != nullptr ? delay->getValue() : -1.0f;
@@ -207,6 +207,11 @@ int main (int argc, char** argv)
     check (midiCC == 16 * 130, "MIDI CC обёртки на месте", String (midiCC));
     check (names.size() == (size_t) params.size(), "имена параметров не совпадают ни у кого",
            String ((int) names.size()));
+    std::set<String> hostIds;
+    for (int i = 0; i < params.size(); ++i)
+        if (const auto* parameter = inst->getHostedParameter (i)) hostIds.insert (parameter->getParameterID());
+    check (hostIds.size() == (size_t) params.size(), "все VST3 ParamID уникальны, включая копии FX",
+           String ((int) hostIds.size()) + "/" + String (params.size()));
 
     // по одному представителю каждой группы: имена как в Params.h
     for (const char* probe : { "sA_Level", "sA_Cutoff", "sA_Filter", "sA_Engine",
@@ -228,6 +233,116 @@ int main (int argc, char** argv)
     }
     MemoryBlock initialState;
     inst->getStateInformation (initialState);
+    // Verify that host automation for an extra copy has its own parameter ID,
+    // and that its rank + value survive an actual VST3 state roundtrip.
+    AudioProcessorParameter *driveFirst = nullptr, *driveSecond = nullptr, *driveRank = nullptr, *driveSecondOn = nullptr;
+    for (auto* parameter : params)
+    {
+        const auto name = parameter->getName (64);
+        if (name == "Drive") driveFirst = parameter;
+        if (name == "Drive #2") driveSecond = parameter;
+        if (name == "DRIVE #2 Rack Position") driveRank = parameter;
+        if (name == "DRIVE On #2") driveSecondOn = parameter;
+    }
+    if (driveFirst) driveFirst->setValueNotifyingHost (.18f);
+    if (driveSecond) driveSecond->setValueNotifyingHost (.79f);
+    if (driveRank) driveRank->setValueNotifyingHost (14.0f / 16.0f);
+    if (driveSecondOn) driveSecondOn->setValueNotifyingHost (1.0f);
+    MemoryBlock duplicatedState; inst->getStateInformation (duplicatedState);
+    if (driveSecond) driveSecond->setValueNotifyingHost (.05f);
+    if (driveRank) driveRank->setValueNotifyingHost (0.0f);
+    if (driveSecondOn) driveSecondOn->setValueNotifyingHost (0.0f);
+    inst->setStateInformation (duplicatedState.getData(), (int) duplicatedState.getSize());
+    check (driveFirst && driveSecond && driveRank && driveSecondOn
+           && std::fabs (driveFirst->getValue() - .18f) < .002f
+           && std::fabs (driveSecond->getValue() - .79f) < .002f
+           && std::fabs (driveRank->getValue() - 14.0f/16.0f) < .002f && driveSecondOn->getValue() > .5f,
+           "VST3: независимая автоматизация копии и позиция восстанавливаются из host state");
+    inst->setStateInformation (initialState.getData(), (int) initialState.getSize());
+
+    // Two genuine VST3 instances with identical MIDI/state, differing only in
+    // the order of EQ and DRIVE. This tests the hosted audio path, not labels.
+    {
+        String errorA, errorB;
+        auto a = format->createInstanceFromDescription (d, 48000.0, 128, errorA);
+        auto b = format->createInstanceFromDescription (d, 48000.0, 128, errorB);
+        auto setNamed = [] (AudioPluginInstance& plugin, const String& name, float value) {
+            for (auto* parameter : plugin.getParameters()) if (parameter->getName (64) == name)
+            { parameter->setValueNotifyingHost (value); return true; }
+            return false;
+        };
+        bool configured = a != nullptr && b != nullptr;
+        const char* modules[] = { "DRIVE", "COMB", "CHORUS", "DELAY", "REVERB", "PLATE", "EQ", "MATERIAL", "SPECTRE", "ROBIN", "GLITCH", "DYNAMICS", "WIDTH" };
+        if (configured)
+        {
+            for (auto* plugin : { a.get(), b.get() })
+            {
+                for (const auto* module : modules)
+                    configured = setNamed (*plugin, String (module) + " #1 Rack Position", 0.0f) && configured;
+                configured = setNamed (*plugin, "DRIVE On", 1.0f) && configured;
+                configured = setNamed (*plugin, "EQ On", 1.0f) && configured;
+                configured = setNamed (*plugin, "Drive", .8f) && configured;
+                configured = setNamed (*plugin, "Drive Mix", .9f) && configured;
+                configured = setNamed (*plugin, "EQ Low", .9f) && configured;
+                configured = setNamed (*plugin, "EQ High", .1f) && configured;
+            }
+            configured = setNamed (*a, "DRIVE #1 Rack Position", 1.0f / 16.0f) && configured;
+            configured = setNamed (*a, "EQ #1 Rack Position", 2.0f / 16.0f) && configured;
+            configured = setNamed (*b, "EQ #1 Rack Position", 1.0f / 16.0f) && configured;
+            configured = setNamed (*b, "DRIVE #1 Rack Position", 2.0f / 16.0f) && configured;
+            a->prepareToPlay (48000.0, 128); b->prepareToPlay (48000.0, 128);
+            AudioBuffer<float> xa (2, 128), xb (2, 128); MidiBuffer ma, mb, emptyA, emptyB;
+            ma.addEvent (MidiMessage::noteOn (1, 60, 0.8f), 0);
+            mb.addEvent (MidiMessage::noteOn (1, 60, 0.8f), 0);
+            double diff = 0.0, energy = 0.0; int invalid = 0;
+            for (int block = 0; block < 240; ++block)
+            {
+                xa.clear(); xb.clear(); a->processBlock (xa, block == 0 ? ma : emptyA); b->processBlock (xb, block == 0 ? mb : emptyB);
+                for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < 128; ++i)
+                {
+                    const double x = xa.getSample (ch, i), y = xb.getSample (ch, i);
+                    if (! std::isfinite (x) || ! std::isfinite (y)) ++invalid;
+                    diff += (x-y)*(x-y); energy += x*x;
+                }
+            }
+            const double rms = std::sqrt (diff / (240.0 * 128.0 * 2.0));
+            const double reference = std::sqrt (energy / (240.0 * 128.0 * 2.0));
+            check (configured && invalid == 0 && reference > .001 && rms > .001,
+                   "VST3: перестановка EQ и DRIVE меняет реальный звук при одинаковом MIDI",
+                   "delta RMS=" + String (rms, 9) + ", ref=" + String (reference, 6));
+            a->releaseResources(); b->releaseResources();
+        }
+        else check (false, "два VST3-инстанса для сравнения порядка", errorA + " / " + errorB);
+    }
+
+    // The host must receive changes in algorithmic latency, including an
+    // OFF duplicate ROBIN and the return to the fixed 1024-sample dry path.
+    {
+        String latencyError;
+        auto plugin = format->createInstanceFromDescription (d, 48000.0, 128, latencyError);
+        AudioProcessorParameter* robinRank = nullptr;
+        if (plugin != nullptr)
+            for (auto* parameter : plugin->getParameters())
+                if (parameter->getName (64) == "ROBIN #2 Rack Position") robinRank = parameter;
+        if (robinRank != nullptr) robinRank->setValueNotifyingHost (14.0f / 16.0f);
+        int added = -1, removed = -1;
+        if (plugin != nullptr && robinRank != nullptr)
+        {
+            plugin->prepareToPlay (48000.0, 128);
+            AudioBuffer<float> audio (2, 128); MidiBuffer midi;
+            auto blocks = [&] {
+                for (int i = 0; i < 24; ++i) { audio.clear(); plugin->processBlock (audio, midi); }
+                MessageManager::getInstance()->runDispatchLoopUntil (100);
+            };
+            blocks(); added = plugin->getLatencySamples();
+            robinRank->setValueNotifyingHost (0.0f); blocks(); removed = plugin->getLatencySamples();
+            plugin->releaseResources();
+        }
+        check (added == 2048 && removed == 1024,
+               "VST3 сообщает хосту latency копии ROBIN и после её удаления",
+               String (added) + " -> " + String (removed));
+    }
+
     int rackOff = 0;
     for (auto* parameter : rackParams) if (parameter != nullptr && parameter->getValue() < 0.5f) ++rackOff;
     check (rackOff == 13 && rackMix != nullptr && rackCross != nullptr,
@@ -348,9 +463,52 @@ int main (int argc, char** argv)
         check (old != nullptr, "предыдущий VST3 загружается для проверки старой сессии", oldError);
         if (old != nullptr)
         {
+            // Compare real hosted VST3 ParamIDs/ranges for every old user
+            // parameter, not just their labels or XML state properties.
+            int oldUserParams = 0, stableIds = 0;
+            const auto oldParams = old->getParameters();
+            for (int oi = 0; oi < oldParams.size(); ++oi)
+            {
+                auto* op = oldParams[oi]; const auto name = op->getName (64);
+                if (name.containsIgnoreCase ("MIDI CC") || name == "Program" || name == "Bypass") continue;
+                ++oldUserParams;
+                const auto* oldHosted = old->getHostedParameter (oi);
+                for (int ni = 0; ni < params.size(); ++ni)
+                    if (params[ni]->getName (64) == name)
+                    {
+                        const auto* newHosted = inst->getHostedParameter (ni);
+                        if (oldHosted && newHosted && oldHosted->getParameterID() == newHosted->getParameterID()
+                            && op->getNumSteps() == params[ni]->getNumSteps()
+                            && std::fabs (op->getDefaultValue() - params[ni]->getDefaultValue()) < 1.0e-6f
+                            && op->getText (0.0f, 100) == params[ni]->getText (0.0f, 100)
+                            && op->getText (0.5f, 100) == params[ni]->getText (0.5f, 100)
+                            && op->getText (1.0f, 100) == params[ni]->getText (1.0f, 100))
+                            ++stableIds;
+                        break;
+                    }
+            }
+            check (oldUserParams > 0 && stableIds == oldUserParams,
+                   "все прежние VST3 ParamID, шаги и defaults сохранены",
+                   String (stableIds) + "/" + String (oldUserParams));
             AudioProcessorParameter* oldP1 = nullptr;
             for (auto* p : old->getParameters()) if (p->getName (64) == "sA_P1") oldP1 = p;
             if (oldP1 != nullptr) oldP1->setValueNotifyingHost (0.713f);
+            std::array<AudioProcessorParameter*, 13> oldPowers {};
+            AudioProcessorParameter *oldChorusMode = nullptr, *oldGlitchMode = nullptr, *oldDriveMix = nullptr;
+            for (auto* parameter : old->getParameters())
+            {
+                const auto name = parameter->getName (64);
+                for (int i = 0; i < 13; ++i) if (name == rackNames[i]) oldPowers[(size_t) i] = parameter;
+                if (name == "Chorus Mix Mode") oldChorusMode = parameter;
+                if (name == "Glitch Timing") oldGlitchMode = parameter;
+                if (name == "Drive Mix") oldDriveMix = parameter;
+            }
+            const bool hasPowers = oldPowers[0] != nullptr;
+            if (hasPowers) for (int i = 0; i < 13; ++i)
+                if (oldPowers[(size_t) i]) oldPowers[(size_t) i]->setValueNotifyingHost ((i == 0 || i == 2 || i == 3 || i == 6) ? 1.0f : 0.0f);
+            if (oldChorusMode) oldChorusMode->setValueNotifyingHost (0.5f);
+            if (oldGlitchMode) oldGlitchMode->setValueNotifyingHost (1.0f);
+            if (oldDriveMix) oldDriveMix->setValueNotifyingHost (0.73f);
             MemoryBlock oldState;
             old->getStateInformation (oldState);
             for (auto* p : reverseParams) if (p != nullptr) p->setValueNotifyingHost (0.9f);
@@ -363,12 +521,20 @@ int main (int argc, char** argv)
                    && std::fabs (restoredP1->getValue() - 0.713f) < 0.002f && zeros == 8,
                    "реальная сессия предыдущего VST3 сохраняет старый P1 и сбрасывает Reverse",
                    String (zeros) + "/8, P1=" + (restoredP1 != nullptr ? String (restoredP1->getValue(), 4) : "нет"));
-            int legacyFxOn = 0;
-            for (auto* parameter : rackParams) if (parameter != nullptr && parameter->getValue() > 0.5f) ++legacyFxOn;
-            check (legacyFxOn == 13 && rackMix != nullptr && std::fabs (rackMix->getValue() - 1.0f) < 0.001f,
-                   "реальная старая сессия VST3 включает прежний тракт", String (legacyFxOn) + "/13");
-            check (monoParams[0] && monoParams[1] && monoParams[0]->getValue() < .001f && monoParams[1]->getValue() < .001f,
-                   "реальная старая сессия выбирает Legacy для CHORUS и GLITCH");
+            int matchingPower = 0;
+            for (int i = 0; i < 13; ++i)
+            {
+                const bool expected = hasPowers ? (i == 0 || i == 2 || i == 3 || i == 6) : true;
+                if (rackParams[i] && (rackParams[i]->getValue() > .5f) == expected) ++matchingPower;
+            }
+            const float expectedMix = oldDriveMix ? .73f : 1.0f;
+            check (matchingPower == 13 && rackMix != nullptr && std::fabs (rackMix->getValue() - expectedMix) < .002f,
+                   "реальная старая сессия VST3 сохраняет power и Drive Mix", String (matchingPower) + "/13");
+            const float expectedChorus = oldChorusMode ? .5f : 0.0f;
+            const float expectedGlitch = oldGlitchMode ? 1.0f : 0.0f;
+            check (monoParams[0] && monoParams[1] && std::fabs (monoParams[0]->getValue() - expectedChorus) < .002f
+                   && std::fabs (monoParams[1]->getValue() - expectedGlitch) < .002f,
+                   "реальная старая сессия сохраняет режимы CHORUS и GLITCH или выбирает Legacy");
 
             // Both plugin instances render the very same legacy state/MIDI.
             old->prepareToPlay (48000.0, 128); inst->prepareToPlay (48000.0, 128);
