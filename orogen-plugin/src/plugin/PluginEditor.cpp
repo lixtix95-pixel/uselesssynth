@@ -53,7 +53,8 @@ namespace
     {
         switch ((EngineType) type)
         {
-            case EngineType::FM: case EngineType::Harmonic: return 0;
+            case EngineType::FM: return 9;
+            case EngineType::Harmonic: return 0;
             case EngineType::Chop: return (int) LoopKind::Count;
             case EngineType::Wavetable: case EngineType::Sample: case EngineType::Granular:
             case EngineType::Modal: case EngineType::Resynth: case EngineType::Organics: return 8;
@@ -67,6 +68,12 @@ namespace
         switch ((EngineType) type)
         {
             case EngineType::Wavetable: return tableKindName ((TableKind) index);
+            case EngineType::FM:
+            {
+                static constexpr const char* names[] = { "Legacy", "Algorithm 1", "Algorithm 2", "Algorithm 3", "Algorithm 4",
+                                                         "Algorithm 5", "Algorithm 6", "Algorithm 7", "Algorithm 8" };
+                return names[index];
+            }
             case EngineType::Sample: case EngineType::Granular:
             case EngineType::Resynth: case EngineType::Organics: return oneShotName ((OneShotKind) index);
             case EngineType::Modal:
@@ -2068,6 +2075,8 @@ static std::uint64_t previewPatchHash (const Patch& patch, int selectedSlot)
         mix ((std::uint32_t) slot.type); mix ((std::uint32_t) slot.filterType);
         mix ((std::uint32_t) slot.params.table);
         mix (slot.params.wtUser ? 1u : 0u);
+        mix ((std::uint32_t) slot.params.fmAlgorithm);
+        mf (slot.params.fmRatioC); mf (slot.params.fmRatioB1); mf (slot.params.fmRatioB2); mf (slot.params.fmMix);
         for (float v : slot.params.p) mf (v);
         mf (slot.params.level); mf (slot.params.pan); mf (slot.params.tuneSemis); mf (slot.params.detune);
         mf (slot.params.grainReverse);
@@ -2192,6 +2201,11 @@ void OrogenEditor::buildCentre()
     {
         const int index = sourceBox.getSelectedId() - 1;
         const int type = pi (slotId ("type"));
+        if (type == (int) EngineType::FM && sourceFmAtt != nullptr)
+        {
+            if (index >= 0 && index <= 8) sourceFmAtt->setValueAsCompleteGesture ((float) index);
+            return;
+        }
         if (type == (int) EngineType::Wavetable && sourceUserAtt != nullptr)
         {
             if (index == 8 && userWtPresent) { sourceUserAtt->setValueAsCompleteGesture (1.0f); return; }
@@ -2202,6 +2216,10 @@ void OrogenEditor::buildCentre()
     };
     addAndMakeVisible (wtLoadButton);
     addAndMakeVisible (wtResynthButton);
+    addAndMakeVisible (fmEditButton);
+    fmEditButton.setName ("Open FM operator parameters");
+    fmEditButton.setTooltip ("Edit Ratio C, Ratio B1, Ratio B2 and X/Y Mix for this slot in PARAMS.");
+    fmEditButton.onClick = [this] { showPage (201 + selectedSlot); };
     wtLoadButton.setName ("Import packed WAV wavetable");
     wtResynthButton.setName ("Resynthesize WAV recording");
     wtLoadButton.setTooltip ("Load a packed WAV wavetable; choose the frame length first (Serum/Vital: 2048). Left channel, up to 256 frames.");
@@ -2423,7 +2441,9 @@ void OrogenEditor::selectSlot (int slot)
     filterAtt.reset();
     sourceAtt.reset();
     sourceUserAtt.reset();
+    sourceFmAtt.reset();
     sourceUserValue = pv (slotId ("wtUser"));
+    sourceFmValue = pv (slotId ("fmAlgorithm"));
     if (! paramsOpen && ! fxOpen) rebuildPreview (true);
 
     engineAtt = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (
@@ -2437,15 +2457,24 @@ void OrogenEditor::selectSlot (int slot)
     if (auto* parameter = proc.apvts.getParameter (slotId ("wtUser")))
         sourceUserAtt = std::make_unique<juce::ParameterAttachment> (*parameter,
             [this] (float value) { sourceUserValue = value; updateSourceSelection (pv (slotId ("table"))); });
+    if (auto* parameter = proc.apvts.getParameter (slotId ("fmAlgorithm")))
+        sourceFmAtt = std::make_unique<juce::ParameterAttachment> (*parameter,
+            [this] (float value) { sourceFmValue = value; updateSourceSelection (pv (slotId ("table"))); });
 
     refreshEngineContext();
     if (sourceAtt != nullptr) sourceAtt->sendInitialUpdate();
     if (sourceUserAtt != nullptr) sourceUserAtt->sendInitialUpdate();
+    if (sourceFmAtt != nullptr) sourceFmAtt->sendInitialUpdate();
     repaint();
 }
 
 juce::String OrogenEditor::selectedMacroLabel (int macro) const
 {
+    if (pi (slotId ("type")) == (int) EngineType::FM && pi (slotId ("fmAlgorithm")) > 0)
+    {
+        static constexpr const char* names[] = { "RATIO A", "FM A", "FM B", "FEEDBACK" };
+        if (macro >= 0 && macro < 4) return names[macro];
+    }
     return engineMacroName (pi (slotId ("type")), macro);
 }
 
@@ -2473,6 +2502,8 @@ void OrogenEditor::refreshEngineContext()
             sourceBox.addItem (userWtPresent ? "USER: " + userWtName.toUpperCase() : "USER: LOAD WAV FIRST", 9);
             sourceBox.setItemEnabled (9, userWtPresent);
         }
+        sourceBox.getProperties().set ("paramId", slotId (type == (int) EngineType::FM ? "fmAlgorithm" : "table"));
+        fmEditButton.setVisible (type == (int) EngineType::FM);
         wtLoadButton.setVisible (type == (int) EngineType::Wavetable);
         wtResynthButton.setVisible (type == (int) EngineType::Wavetable);
         wtLoadButton.setEnabled (! wtImportBusy);
@@ -2496,6 +2527,11 @@ void OrogenEditor::updateSourceSelection (float denormalisedValue)
     if (count == 0)
     {
         sourceBox.setSelectedId (0, juce::dontSendNotification);
+        return;
+    }
+    if (pi (slotId ("type")) == (int) EngineType::FM)
+    {
+        sourceBox.setSelectedId (juce::jlimit (0, 8, juce::roundToInt (sourceFmValue)) + 1, juce::dontSendNotification);
         return;
     }
     // CHOP DSP clamps legacy/host table values 3..7 to loop #3. Display the
@@ -2711,6 +2747,7 @@ juce::StringArray OrogenEditor::mainScreenParamIds() const
     for (auto* k : centreKnobs) out.add (k->slider.getProperties().getWithDefault ("paramId", {}).toString());
     for (auto* b : centreBars)  out.add (b->slider.getProperties().getWithDefault ("paramId", {}).toString());
     out.add (slotId ("type")); out.add (slotId ("filter")); out.add (slotId ("table"));
+    out.add (slotId ("wtUser")); out.add (slotId ("fmAlgorithm"));
     out.removeEmptyStrings();
     return out;
 }
@@ -2745,6 +2782,7 @@ void OrogenEditor::resized()
     sourceBox.setBounds (R (570.0f, 92.0f, 195.0f, 20.0f));
     wtLoadButton.setBounds (R (772.0f, 92.0f, 91.0f, 20.0f));
     wtResynthButton.setBounds (R (869.0f, 92.0f, 94.0f, 20.0f));
+    fmEditButton.setBounds (R (772.0f, 92.0f, 118.0f, 20.0f));
 
     for (int i = 0; i < centreKnobs.size(); ++i)
     {
@@ -3021,7 +3059,7 @@ void OrogenEditor::repaintChangedValues()
     // previewPatchHash специально игнорирует его звуковые параметры.
     VisualHash display;
     display.add ((float) selectedSlot);
-    for (const auto* field : { "on", "type", "table", "filter", "grainReverse", "wtUser" }) display.add (pv (slotId (field)));
+    for (const auto* field : { "on", "type", "table", "filter", "grainReverse", "wtUser", "fmAlgorithm" }) display.add (pv (slotId (field)));
     display.add (pv ("gl_mode")); display.add (pv ("gl_morph"));
     if (changed (display.value, displayVisualHash)) repaint (R (248.0f, 66.0f, 736.0f, 214.0f));
     visualHashesValid = true;
@@ -3296,6 +3334,11 @@ juce::String OrogenEditor::selectedSourceLabel() const
 {
     const int type = pi (slotId ("type"));
     const int table = juce::jlimit (0, 7, pi (slotId ("table")));
+    if (type == (int) EngineType::FM)
+    {
+        const int algorithm = pi (slotId ("fmAlgorithm"));
+        return algorithm == 0 ? "FM LEGACY" : "FM ALGORITHM " + juce::String (algorithm);
+    }
     if (type == (int) EngineType::Wavetable)
     {
         if (pv (slotId ("wtUser")) > 0.5f && userWtPresent)
@@ -3364,7 +3407,8 @@ void OrogenEditor::paintDisplay (juce::Graphics& g)
                    Palette::textFaint, 6.0f);
     draw::caption (g, "filter", { (int) area.getX() + 190, (int) area.getY() + 18, 100, 10 },
                    Palette::textFaint, 6.0f);
-    draw::caption (g, "source", { 570, 84, 195, 10 }, Palette::textFaint, 6.0f);
+    draw::caption (g, pi (slotId ("type")) == (int) EngineType::FM ? "algorithm" : "source",
+                   { 570, 84, 195, 10 }, Palette::textFaint, 6.0f);
     draw::caption (g, "drag x: " + selectedMacroLabel (0) + " / y: " + selectedMacroLabel (1),
                    { 775, 84, 195, 10 }, Palette::textFaint, 5.8f);
     // Не новый контрол: статус уже существующего параметра выбранного слота.

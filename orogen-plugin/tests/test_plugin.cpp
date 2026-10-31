@@ -798,7 +798,7 @@ static void testGuiRegressions()
     const auto chopSource = editor->selectedSourceLabel();
     std::printf ("   источник: FM=%s; Granular=%s; Chop=%s\n",
                  fmSource.toRawUTF8(), granularSource.toRawUTF8(), chopSource.toRawUTF8());
-    check (fmSource == "NO TABLE" && granularSource.contains ("CHOIR AH 3/8")
+    check (fmSource == "FM LEGACY" && granularSource.contains ("CHOIR AH 3/8")
            && chopSource.contains ("DUB STABS 3/3 MAX"),
            "источники в дисплее соответствуют фактическому банку движка");
 
@@ -2111,7 +2111,16 @@ static void testSourcePicker()
         {
             setP (p, slotPrefix (slot) + "type", (float) type);
             mm->runDispatchLoopUntil (60); // message thread also covers host type automation
-            const int count = type == 1 || type == 2 ? 0 : type == 8 ? 3 : 8;
+            if (type == 1)
+            {
+                if (source->getNumItems() == 9 && source->isEnabled()) ++lists;
+                // FM now has its own real algorithm parameter; the historical
+                // table parameter must remain untouched.
+                setP (p, id, 7.0f);
+                if (p.apvts.getRawParameterValue (id)->load() == 7.0f) ++disabled;
+                continue;
+            }
+            const int count = type == 2 ? 0 : type == 8 ? 3 : 8;
             if (source->getNumItems() == count + (type == 0 ? 1 : 0) && source->isEnabled() == (count > 0)
                 && (type != 0 || ! source->isItemEnabled (9))) ++lists;
             if (count == 0)
@@ -2166,7 +2175,7 @@ static void testSourcePicker()
     std::printf ("   списки %d/72, названия %d/%d, выбор %d/%d, изоляция %d/%d, Patch %d/%d, жесты %d/%d, host→GUI %d/8\n",
                  lists, names, expectedChoices, choices, expectedChoices, isolated, expectedChoices,
                  patches, expectedChoices, gestures, expectedChoices, hostChanges);
-    check (lists == 72 && disabled == 16, "9 контекстов на A–H; FM/Harmonic не предлагают фиктивный источник");
+    check (lists == 72 && disabled == 16, "9 контекстов на A–H; FM выбирает алгоритм, Harmonic не предлагает фиктивный источник");
     check (names == expectedChoices && choices == expectedChoices && isolated == expectedChoices && patches == expectedChoices,
            "реальные имена источников и индексы выбираются независимо в каждом слоте");
     check (gestures == expectedChoices && hostChanges == 8,
@@ -2307,18 +2316,18 @@ static void testNativeSourceMenu (bool force = false)
                 editor.setSize (width, width * 5 / 8); mm->runDispatchLoopUntil (150);
                 const float scale = (float) width / 1280.0f;
                 for (int slot = 0; slot < 8; ++slot)
-                    for (int type : { 0, 8 })
+                    for (int type : { 0, 8, 1 })
                     {
                         editor.showPage ((slot + 1) % 8);
                         click (editor.localPointToGlobal (juce::Point<int> (juce::roundToInt (35 * scale), juce::roundToInt ((113 + 70 * slot) * scale))), 140);
                         const bool card = editor.visiblePage() % 8 == slot; if (card) ++cards;
-                        const auto id = slotPrefix (slot) + "table";
+                        const auto id = slotPrefix (slot) + (type == 1 ? "fmAlgorithm" : "table");
                         setP (p, slotPrefix (slot) + "type", (float) type);
-                        const int count = type == 0 ? 8 : 3;
+                        const int count = type == 0 ? 8 : type == 1 ? 9 : 3;
                         const int target = slot % count;
                         setP (p, id, (float) ((target + 1) % count)); mm->runDispatchLoopUntil (90);
                         std::array<int, 8> before {};
-                        for (int s = 0; s < 8; ++s) before[(size_t) s] = juce::roundToInt (p.apvts.getRawParameterValue (slotPrefix (s) + "table")->load());
+                        for (int s = 0; s < 8; ++s) before[(size_t) s] = juce::roundToInt (p.apvts.getRawParameterValue (slotPrefix (s) + (type == 1 ? "fmAlgorithm" : "table"))->load());
                         GestureTrace trace (p, id);
                         click (source->getScreenBounds().getCentre(), 250);
                         auto* menu = juce::Component::getCurrentlyModalComponent();
@@ -2334,18 +2343,18 @@ static void testNativeSourceMenu (bool force = false)
                         if (card && value == target && source->getSelectedId() == target + 1) ++selected;
                         bool others = true;
                         for (int s = 0; s < 8; ++s) if (s != slot)
-                            others &= juce::roundToInt (p.apvts.getRawParameterValue (slotPrefix (s) + "table")->load()) == before[(size_t) s];
+                            others &= juce::roundToInt (p.apvts.getRawParameterValue (slotPrefix (s) + (type == 1 ? "fmAlgorithm" : "table"))->load()) == before[(size_t) s];
                         if (others) ++isolated;
                         Patch patch; FxChain::Settings fx; p.collectPatch (patch, fx);
-                        if (patch.slots[(size_t) slot].params.table == target) ++patches;
+                        if ((type == 1 ? patch.slots[(size_t) slot].params.fmAlgorithm : patch.slots[(size_t) slot].params.table) == target) ++patches;
                         if (trace.balanced()) ++gestures;
                     }
             }
-        constexpr int n = 3 * 8 * 2;
+        constexpr int n = 3 * 8 * 3;
         std::printf ("   карта %d/%d, меню %d/%d, выбор %d/%d, изоляция %d/%d, Patch %d/%d, gestures %d/%d\n",
                      cards,n,menus,n,selected,n,isolated,n,patches,n,gestures,n);
         check (cards == n && menus == n && selected == n && isolated == n && patches == n && gestures == n,
-               "XTEST выбирает Wavetable и CHOP для всех слотов на трёх размерах с host gestures");
+               "XTEST выбирает Wavetable, CHOP и FM для всех слотов на трёх размерах с host gestures");
         juce::PopupMenu::dismissAllActiveMenus(); editor.removeFromDesktop();
     }
     close (dpy);
@@ -2918,6 +2927,25 @@ static void testAudioCallbackAllocations()
            "Wavetable: 256 аудиоблоков со сменой таблицы, Warp/Fold и OS без аллокаций/NaN",
            "alloc=" + juce::String ((juce::int64) wtAlloc) + ", nonfinite=" + juce::String (wtBad)
            + ", energy=" + num (energy, 6));
+
+    OrogenProcessor fm; fm.setPlayConfigDetails (0, 2, 48000.0, 128); fm.prepareToPlay (48000.0, 128);
+    soloSlot (fm, 0, (int) EngineType::FM);
+    setP (fm, "sA_p1", .5f); setP (fm, "sA_p2", .3f); setP (fm, "sA_fmAlgorithm", 1);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil (100);
+    fm.processBlock (wave, note);
+    std::uint64_t fmAlloc = 0; int fmBad = 0;
+    for (int change = 0; change < 45; ++change)
+    {
+        setP (fm, "sA_fmAlgorithm", (float) (change % 9));
+        start();
+        for (int block = 0; block < 8; ++block) fm.processBlock (wave, noMidi);
+        fmAlloc += stop();
+        for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < 128; ++i)
+            if (! std::isfinite (wave.getSample (ch, i))) ++fmBad;
+    }
+    check (fmAlloc == 0 && fmBad == 0, "held-note FM algorithm changes: no callback allocations or nonfinite samples",
+           "alloc=" + juce::String ((juce::int64) fmAlloc) + ", nonfinite=" + juce::String (fmBad));
+    fm.releaseResources();
    #else
     check (false, "этот allocation probe рассчитан на Linux/glibc");
    #endif
@@ -3313,6 +3341,116 @@ static void testUserWavetableGui()
            "custom table remains isolated to its original slot");
 }
 
+static void testFmAlgorithmsPlugin()
+{
+    std::printf ("\n--- FM algorithms: GUI, state, compatibility and audio ---\n");
+    OrogenProcessor p;
+    p.setPlayConfigDetails (0,2,48000,256); p.prepareToPlay (48000,256);
+    soloSlot (p, 0, (int) EngineType::FM);
+    for (int slot=0;slot<8;++slot)
+    {
+        const auto pre=slotPrefix(slot);
+        setP(p,pre+"fmAlgorithm",(float)(slot+1));
+        setP(p,pre+"fmRatioC",1.0f+.25f*slot);
+        setP(p,pre+"fmRatioB1",2.0f+.25f*slot);
+        setP(p,pre+"fmRatioB2",3.0f+.25f*slot);
+        setP(p,pre+"fmMix",.1f*slot);
+    }
+    setP(p,"sA_p0",(2.0f-.5f)/15.5f); setP(p,"sA_p1",.45f); setP(p,"sA_p2",.35f);setP(p,"sA_p3",.15f);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil (90);
+    juce::MemoryBlock state;p.getStateInformation(state);
+    OrogenProcessor q;q.setStateInformation(state.getData(),(int)state.getSize());
+    Patch pp,qq;FxChain::Settings fx;
+    p.collectPatch(pp,fx);q.collectPatch(qq,fx);
+    int matches=0;
+    for(int i=0;i<8;++i)if(qq.slots[i].params.fmAlgorithm==i+1
+        && std::abs(qq.slots[i].params.fmRatioC-pp.slots[i].params.fmRatioC)<.001f
+        && std::abs(qq.slots[i].params.fmRatioB1-pp.slots[i].params.fmRatioB1)<.001f
+        && std::abs(qq.slots[i].params.fmRatioB2-pp.slots[i].params.fmRatioB2)<.001f
+        && std::abs(qq.slots[i].params.fmMix-pp.slots[i].params.fmMix)<.001f)++matches;
+    check(matches==8,"all 8 slots' algorithm and ratios survive DAW state",juce::String(matches)+"/8");
+    q.setPlayConfigDetails(0,2,48000,256);q.prepareToPlay(48000,256);
+    const auto a=renderBlocks(p,30000,48000),b=renderBlocks(q,30000,48000);
+    double d=0;for(int ch=0;ch<2;++ch)for(int i=0;i<a.getNumSamples();++i){double x=a.getSample(ch,i)-b.getSample(ch,i);d+=x*x;}
+    d=std::sqrt(d/(2*a.getNumSamples()));
+    check(rmsOf(a)>1e-4&&d<1e-6,"FM audio is identical after state roundtrip","delta RMS "+num(d,9));
+    const auto file=juce::File::getSpecialLocation(juce::File::tempDirectory).getChildFile("orogen-fm-test.orogenpreset");
+    check(p.savePresetFile(file,"FM routes"),"FM JSON preset saved");
+    OrogenProcessor fromFile;const bool loaded=fromFile.loadPresetFile(file);Patch r;fromFile.collectPatch(r,fx);
+    matches=0;for(int i=0;i<8;++i)if(r.slots[i].params.fmAlgorithm==i+1&&std::abs(r.slots[i].params.fmRatioB2-pp.slots[i].params.fmRatioB2)<.001f)++matches;
+    check(loaded&&matches==8,"FM JSON preset restores all slots",juce::String(matches)+"/8");file.deleteFile();
+    auto old=p.apvts.copyState();
+    for(int i=0;i<8;++i)for(const char* suffix:{"fmAlgorithm","fmRatioC","fmRatioB1","fmRatioB2","fmMix"})
+        if(auto node=old.getChildWithProperty("id",slotPrefix(i)+suffix);node.isValid())old.removeChild(node,nullptr);
+    juce::MemoryBlock oldBlob;if(auto xml=old.createXml())juce::AudioProcessor::copyXmlToBinary(*xml,oldBlob);
+    q.setStateInformation(oldBlob.getData(),(int)oldBlob.getSize());q.collectPatch(qq,fx);
+    bool oldOk=true;for(const auto& slot:qq.slots)oldOk &= slot.params.fmAlgorithm==0&&std::abs(slot.params.fmRatioC-1)<.001f;
+    check(oldOk,"old DAW projects select Legacy and default ratios, even over modern state");
+
+    // Real AudioProcessor path on a held note, compared against an unchanged
+    // instance; catches a selector that only changes its label.
+    OrogenProcessor live, reference;
+    for (auto* proc : { &live, &reference })
+    {
+        proc->setPlayConfigDetails (0, 2, 48000, 128); proc->prepareToPlay (48000, 128);
+        soloSlot (*proc, 0, (int) EngineType::FM);
+        setP (*proc, "sA_fmAlgorithm", 1); setP (*proc, "sA_detune", 0);
+        setP (*proc, "sA_p0", (2.0f-.5f)/15.5f); setP (*proc, "sA_p1", .5f); setP (*proc, "sA_p2", .35f);
+        setP (*proc, "sA_fmRatioB1", 3); setP (*proc, "sA_fmRatioB2", 2);
+    }
+    juce::MessageManager::getInstance()->runDispatchLoopUntil (100);
+    juce::AudioBuffer<float> x (2,128), y (2,128); juce::MidiBuffer first, empty;
+    first.addEvent (juce::MidiMessage::noteOn (1,60,.8f),0);
+    double beforeDifference=0, afterDifference=0, referenceEnergy=0; int nonfinite=0;
+    for(int block=0;block<200;++block)
+    {
+        if(block==50)setP(live,"sA_fmAlgorithm",8);
+        live.processBlock(x,block==0?first:empty);reference.processBlock(y,block==0?first:empty);
+        for(int ch=0;ch<2;++ch)for(int i=0;i<128;++i)
+        {
+            const double a=x.getSample(ch,i),b=y.getSample(ch,i),delta=a-b;
+            if(!std::isfinite(a)||!std::isfinite(b))++nonfinite;
+            if(block>=20&&block<45)beforeDifference+=delta*delta;
+            if(block>=80){afterDifference+=delta*delta;referenceEnergy+=b*b;}
+        }
+    }
+    beforeDifference=std::sqrt(beforeDifference/(25.0*256.0));
+    afterDifference=std::sqrt(afterDifference/(120.0*256.0));
+    referenceEnergy=std::sqrt(referenceEnergy/(120.0*256.0));
+    check(nonfinite==0&&beforeDifference<1e-8&&afterDifference>1e-4&&referenceEnergy>1e-4,
+          "changing algorithm during a held MIDI note changes AudioProcessor output",
+          "before ΔRMS="+num(beforeDifference,9)+", after="+num(afterDifference,9)+", reference="+num(referenceEnergy,6));
+
+    OrogenProcessor g;OrogenEditor editor(g);editor.setSize(1280,800);editor.setVisible(true);editor.setAnimationsEnabled(false);
+    juce::ComboBox* source=nullptr;juce::Button* edit=nullptr;
+    for(auto* c:editor.getChildren()){
+        if(c->getName()=="Source for selected slot")source=dynamic_cast<juce::ComboBox*>(c);
+        if(c->getName()=="Open FM operator parameters")edit=dynamic_cast<juce::Button*>(c);
+    }
+    check(source&&edit,"FM algorithm selector and edit button exist");
+    if(!source||!edit)return;
+    auto* mm=juce::MessageManager::getInstance();int selected=0,gestures=0,untouched=0;
+    for(int slot=0;slot<8;++slot)
+    {
+        editor.showPage(slot);const auto pre=slotPrefix(slot);setP(g,pre+"type",1);mm->runDispatchLoopUntil(65);
+        setP(g,pre+"table",6);GestureTrace trace(g,pre+"fmAlgorithm");
+        for(int alg=0;alg<=8;++alg)
+        {
+            setP(g,pre+"fmAlgorithm",(float)((alg+1)%9));trace.clear();
+            source->setSelectedId(alg+1,juce::sendNotificationSync);
+            if(juce::roundToInt(g.apvts.getRawParameterValue(pre+"fmAlgorithm")->load())==alg&&source->getSelectedId()==alg+1)++selected;
+            if(trace.balanced())++gestures;
+            if(g.apvts.getRawParameterValue(pre+"table")->load()==6)++untouched;
+        }
+    }
+    check(selected==72&&gestures==72&&untouched==72,"all algorithms send gestures and do not change legacy source ID",
+          juce::String(selected)+"/72, gestures "+juce::String(gestures)+"/72");
+    check(edit->isVisible()&&editor.selectedSourceLabel().contains("ALGORITHM"),"FM EDIT and current algorithm displayed");
+    editor.showPage(0);setP(g,"sA_type",1);mm->runDispatchLoopUntil(60);
+    edit->triggerClick();mm->runDispatchLoopUntil(100);
+    check(editor.paramsOverlay()!=nullptr&&editor.paramsOverlay()->isVisible(),"FM EDIT opens the slot parameter overlay");
+}
+
 static bool writeTestWav (const juce::File& file, bool packed)
 {
     constexpr int sr = 48000;
@@ -3430,6 +3568,13 @@ int main (int argc, char** argv)
     auto* mm = juce::MessageManager::getInstance();
     std::printf ("OROGEN test_plugin: старт\n");
     juce::ignoreUnused (mm);
+    if (argc > 1 && juce::String (argv[1]) == "--fm-algorithms-only")
+    {
+        testFmAlgorithmsPlugin();
+        juce::DeletedAtShutdown::deleteAll();
+        juce::MessageManager::deleteInstance();
+        return failures == 0 ? 0 : 1;
+    }
     if (argc > 1 && juce::String (argv[1]) == "--wavetable-import-only")
     {
         testUserWavetablePlugin();
@@ -3582,7 +3727,10 @@ int main (int argc, char** argv)
         const int legacyCount = 306 + FxChain::ModuleCount + extraFxCount + 2 + 5;
         int fxCount = 0; fxParamTable (fxCount);
         const int perCopy = fxCount + FxChain::ModuleCount + extraFxCount + 21;
-        const int expectedCount = legacyCount + (FxChain::kCopiesPerModule - 1) * perCopy + FxChain::kNodeCount;
+        // Eight imported-table selectors and five FM controls per slot were
+        // appended after the original FX rack parameters.
+        const int expectedCount = legacyCount + (FxChain::kCopiesPerModule - 1) * perCopy
+                                + FxChain::kNodeCount + 8 * (1 + 5);
         check (count == expectedCount, "все параметры объявлены", num (count, 0));
 
         // Снимок последовательности ID rev21 до добавления Plate. Хэшируем
@@ -4479,8 +4627,8 @@ int main (int argc, char** argv)
             int seenAll = 0;
             if (auto* overlay = ore->paramsOverlay())
                 seenAll = countBoundControls (*overlay, tabs[0]);
-            // вкладка SLOT: 8 слотов × 22 параметра
-            check (seenAll == 176, "страница ALL вкладки SLOT показывает все 176",
+            // 8 слотов × 28 параметров, включая импорт таблицы и FM.
+            check (seenAll == 224, "страница ALL вкладки SLOT показывает все 224",
                    num ((double) seenAll, 0));
 
             // снимок оверлея — заодно проверяем, что он отрисовывается
@@ -5868,6 +6016,9 @@ int main (int argc, char** argv)
     testGranularReverseProcessor();
     testGranularPitchProcessorRegression();
     testDelayProcessorRegression();
+    testUserWavetablePlugin();
+    testUserWavetableGui();
+    testFmAlgorithmsPlugin();
     juce::DeletedAtShutdown::deleteAll();
     juce::MessageManager::deleteInstance();
 

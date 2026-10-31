@@ -141,6 +141,8 @@ void OrogenProcessor::cachePointers()
         r.filter = apvts.getRawParameterValue (pre + "filter");
         r.grainReverse = apvts.getRawParameterValue (pre + "grainReverse");
         r.wtUser = apvts.getRawParameterValue (pre + "wtUser");
+        const char* fmNames[5] = { "fmAlgorithm", "fmRatioC", "fmRatioB1", "fmRatioB2", "fmMix" };
+        for (int k = 0; k < 5; ++k) r.fm[(size_t) k] = apvts.getRawParameterValue (pre + fmNames[k]);
         r.f.clear();
         for (int i = 0; i < n; ++i)
             r.f.push_back (apvts.getRawParameterValue (pre + st[i].id));
@@ -257,6 +259,7 @@ std::uint64_t OrogenProcessor::hashParams() const noexcept
         if (r.filter) mix (r.filter->load());
         if (r.grainReverse) mix (r.grainReverse->load());
         if (r.wtUser) mix (r.wtUser->load());
+        for (auto* f : r.fm) if (f) mix (f->load());
         for (auto* f : r.f) if (f) mix (f->load());
     }
     for (auto* g : globRefs) if (g) mix (g->load());
@@ -395,6 +398,11 @@ void OrogenProcessor::collectPatch (Patch& p, FxChain::Settings& fx) const noexc
         sp.params.detune     = r.f[(size_t) kDetune]->load();
         sp.params.grainReverse = r.grainReverse->load();
         sp.params.wtUser = r.wtUser->load() > 0.5f;
+        sp.params.fmAlgorithm = (int) std::lround (r.fm[0]->load());
+        sp.params.fmRatioC = r.fm[1]->load();
+        sp.params.fmRatioB1 = r.fm[2]->load();
+        sp.params.fmRatioB2 = r.fm[3]->load();
+        sp.params.fmMix = r.fm[4]->load();
         sp.params.p[0] = r.f[(size_t) kP0]->load();
         sp.params.p[1] = r.f[(size_t) kP1]->load();
         sp.params.p[2] = r.f[(size_t) kP2]->load();
@@ -579,6 +587,11 @@ void OrogenProcessor::applyToParams (const Patch& p, const FxChain::Settings& fx
             set (pre + "p" + juce::String (k), sp.params.p[k]);
         set (pre + "table", (float) sp.params.table);
         set (pre + "wtUser", sp.params.wtUser ? 1.0f : 0.0f);
+        set (pre + "fmAlgorithm", (float) sp.params.fmAlgorithm);
+        set (pre + "fmRatioC", sp.params.fmRatioC);
+        set (pre + "fmRatioB1", sp.params.fmRatioB1);
+        set (pre + "fmRatioB2", sp.params.fmRatioB2);
+        set (pre + "fmMix", sp.params.fmMix);
         set (pre + "attack", sp.attack);
         set (pre + "decay", sp.decay);
         set (pre + "sustain", sp.sustain);
@@ -1147,6 +1160,8 @@ void OrogenProcessor::setStateInformation (const void* data, int sizeInBytes)
     {
         restoreMissingDefault (slotPrefix (s) + "grainReverse");
         restoreMissingDefault (slotPrefix (s) + "wtUser");
+        for (const char* suffix : { "fmAlgorithm", "fmRatioC", "fmRatioB1", "fmRatioB2", "fmMix" })
+            restoreMissingDefault (slotPrefix (s) + suffix);
     }
 
     // A state with NO rack power IDs predates the switch feature. In that

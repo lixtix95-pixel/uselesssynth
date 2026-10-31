@@ -16,6 +16,7 @@
 #pragma once
 
 #include "engine.h"
+#include "digitone_fm.h"
 
 namespace orogen {
 
@@ -34,6 +35,8 @@ public:
         idxSm.setTime    (sr, 15.0);
         idx2Sm.setTime   (sr, 15.0);
         fbSm.setTime     (sr, 20.0);
+        for (auto& voice : digitone) voice.setSampleRate (sr);
+        algorithmFadeLength = std::max (1, (int) std::lround (sr * 0.005));
     }
 
     void start (int midiNote, float velocity) override
@@ -43,6 +46,9 @@ public:
         ph1 = ph2 = ph3 = 0.0f;
         fbState = 0.0f;
         driftCents = rng.nextBipolar() * 5.0f;
+        for (auto& voice : digitone) voice.start();
+        currentAlgorithm = nextAlgorithm = requestedAlgorithm = 0;
+        digitoneCurrent = 0; algorithmFade = 0;
         needSnap = true;
         active = true;
     }
@@ -51,6 +57,7 @@ public:
 
     void prepare (const EngineParams& p) override
     {
+        const bool firstSetup = needSnap;
         // ---- ratio: 1..16 (непрерывный; 0.5 и целые — самые музыкальные точки)
         const float ratio = 0.5f + clamp (p.p[0], 0.0f, 1.0f) * 15.5f;
 
@@ -95,9 +102,63 @@ public:
         needsMod = (idxTarget > 1.0e-4f) || (idx2Target > 1.0e-4f) || (fbTarget > 1.0e-4f);
         gain = kGainTrim * (0.4f + 0.6f * clamp (p.level, 0.0f, 1.0f));
         dcCoef = (float) std::exp (-kTwoPi * 7.0 / sampleRate);
+
+        latestParameters = p;
+        requestedAlgorithm = clamp (p.fmAlgorithm, 0, 8);
+        if (firstSetup)
+        {
+            currentAlgorithm = requestedAlgorithm;
+            nextAlgorithm = currentAlgorithm;
+            algorithmFade = 0;
+        }
+        if (currentAlgorithm > 0 || requestedAlgorithm > 0 || (algorithmFade > 0 && nextAlgorithm > 0))
+            for (auto& voice : digitone) voice.prepare (p, note, driftCents);
     }
 
     inline float render (const EngineParams&) override
+    {
+        if (! active) return 0.0f;
+        if (algorithmFade == 0 && currentAlgorithm != requestedAlgorithm)
+        {
+            nextAlgorithm = requestedAlgorithm;
+            if (nextAlgorithm > 0)
+            {
+                auto& target = digitone[(size_t) (1 - digitoneCurrent)];
+                if (currentAlgorithm > 0) target = digitone[(size_t) digitoneCurrent];
+                else { target.start(); target.prepare (latestParameters, note, driftCents); }
+            }
+            else
+            {
+                // Seed the original oscillator at the corresponding phases;
+                // the old code itself remains unchanged in stable Legacy mode.
+                const auto& source = digitone[(size_t) digitoneCurrent];
+                ph1 = source.getPhase (OpC); ph2 = source.getPhase (OpA); ph3 = source.getPhase (OpB2);
+                fbState = dcX = dcY = 0.0f;
+                ratioCur = 0.5f + clamp (latestParameters.p[0], 0.0f, 1.0f) * 15.5f;
+                ratioSm.snap (ratioCur); idxSm.snap (idxTarget); idx2Sm.snap (idx2Target); fbSm.snap (fbTarget);
+            }
+            algorithmFade = algorithmFadeLength;
+        }
+        if (algorithmFade > 0)
+        {
+            const float oldSignal = currentAlgorithm == 0 ? renderLegacy()
+                : digitone[(size_t) digitoneCurrent].render (currentAlgorithm);
+            const float newSignal = nextAlgorithm == 0 ? renderLegacy()
+                : digitone[(size_t) (1 - digitoneCurrent)].render (nextAlgorithm);
+            const float mixValue = 1.0f - (float) algorithmFade / (float) algorithmFadeLength;
+            const float out = oldSignal + (newSignal - oldSignal) * mixValue;
+            if (--algorithmFade == 0)
+            {
+                if (nextAlgorithm > 0) digitoneCurrent = 1 - digitoneCurrent;
+                currentAlgorithm = nextAlgorithm;
+            }
+            return out;
+        }
+        return currentAlgorithm == 0 ? renderLegacy() : digitone[(size_t) digitoneCurrent].render (currentAlgorithm);
+    }
+
+    // Original three-operator path, kept sample-for-sample for old projects.
+    inline float renderLegacy()
     {
         if (! active) return 0.0f;
 
@@ -166,6 +227,10 @@ private:
     float  gain = 0.5f, dcX = 0.0f, dcY = 0.0f, dcCoef = 0.999f;
 
     SmoothedValue ratioSm, idxSm, idx2Sm, fbSm;
+    std::array<DigitoneFmVoice, 2> digitone;
+    EngineParams latestParameters {};
+    int currentAlgorithm = 0, nextAlgorithm = 0, requestedAlgorithm = 0;
+    int digitoneCurrent = 0, algorithmFade = 0, algorithmFadeLength = 240;
     Rng rng { 0x2468ACEu };
 };
 

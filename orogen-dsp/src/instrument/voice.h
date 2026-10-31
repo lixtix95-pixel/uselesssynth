@@ -468,7 +468,9 @@ private:
 
     static bool paramsEqual (const EngineParams& a, const EngineParams& b) noexcept
     {
-        if (a.table != b.table || a.wtUser != b.wtUser) return false;
+        if (a.table != b.table || a.wtUser != b.wtUser || a.fmAlgorithm != b.fmAlgorithm) return false;
+        if (std::fabs (a.fmRatioC - b.fmRatioC) > 1.0e-4f || std::fabs (a.fmRatioB1 - b.fmRatioB1) > 1.0e-4f
+            || std::fabs (a.fmRatioB2 - b.fmRatioB2) > 1.0e-4f || std::fabs (a.fmMix - b.fmMix) > 1.0e-4f) return false;
         for (int k = 0; k < 4; ++k) if (std::fabs (a.p[k] - b.p[k]) > 1.0e-4f) return false;
         return std::fabs (a.tuneSemis - b.tuneSemis) < 1.0e-3f
             && std::fabs (a.detune - b.detune) < 1.0e-4f

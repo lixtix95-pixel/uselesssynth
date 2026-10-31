@@ -20,6 +20,9 @@ struct EngineParams
     float detune   = 0.3f;                        // 0..1 -> разброс в центах, свой на голос
     int   table    = 0;                           // выбор контента (таблица/источник/тело)
     bool  wtUser   = false;                      // select the per-slot imported wavetable
+    int   fmAlgorithm = 0;                       // 0 = legacy, 1..8 = four-operator routes
+    float fmRatioC = 1.0f, fmRatioB1 = 1.0f, fmRatioB2 = 1.0f;
+    float fmMix = 0.5f;                          // X -> Y carrier mix for the new routes
     bool  on       = true;
     float grainReverse = 0.0f;                    // Granular: вероятность реверса нового зерна, 0..1
 };

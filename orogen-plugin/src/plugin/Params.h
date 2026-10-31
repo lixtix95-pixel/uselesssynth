@@ -520,6 +520,20 @@ inline juce::AudioProcessorValueTreeState::ParameterLayout makeLayout()
         layout.add (std::make_unique<AudioParameterBool> (ParameterID { id, 1 },
                                                           slotPrefix (s) + "User Wavetable", false));
     }
+    // FM graph + operator ratios are appended after all previously published
+    // IDs. Choice 0 keeps the original FM engine for old projects.
+    for (int s = 0; s < kNumSlots; ++s)
+    {
+        const auto pre = slotPrefix (s);
+        layout.add (std::make_unique<AudioParameterChoice> (
+            ParameterID { pre + "fmAlgorithm", 1 }, pre + "FM Algorithm",
+            StringArray { "Legacy", "Algorithm 1", "Algorithm 2", "Algorithm 3", "Algorithm 4",
+                          "Algorithm 5", "Algorithm 6", "Algorithm 7", "Algorithm 8" }, 0));
+        addFloat (pre + "fmRatioC", pre + "FM Ratio C", .25f, 16.0f, 1.0f, .01f);
+        addFloat (pre + "fmRatioB1", pre + "FM Ratio B1", .25f, 16.0f, 1.0f, .01f);
+        addFloat (pre + "fmRatioB2", pre + "FM Ratio B2", .25f, 16.0f, 1.0f, .01f);
+        addFloat (pre + "fmMix", pre + "FM X/Y Mix", 0.0f, 1.0f, .5f, .001f);
+    }
     return std::move (layout.result);
 }
 

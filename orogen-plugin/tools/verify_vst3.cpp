@@ -17,7 +17,7 @@
 
 using namespace juce;
 
-static constexpr int kNumApvtsParams = 890;   // см. Params.h / test_plugin
+static constexpr int kNumApvtsParams = 938;   // см. Params.h / test_plugin
 
 static int failures = 0;
 static void check (bool ok, const String& what, const String& detail = {})

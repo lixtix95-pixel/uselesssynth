@@ -122,6 +122,7 @@ private:
         std::atomic<float>* on = nullptr;
         std::atomic<float>* filter = nullptr;
         std::atomic<float>* wtUser = nullptr;
+        std::array<std::atomic<float>*, 5> fm {};
         std::atomic<float>* grainReverse = nullptr; // добавлен в конец layout, вне старой таблицы
         std::vector<std::atomic<float>*> f;     // по порядку slotParamTable
     };
