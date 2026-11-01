@@ -39,6 +39,7 @@ public:
         sampleRate = sr;
         airSm.setTime (sr, 25.0);
         bodySm.setTime (sr, 35.0);
+        updateBodyCoefficients();
     }
 
     void start (int midiNote, float velocity) override
@@ -129,10 +130,13 @@ public:
         {
             double f = f0 * ratios[i];
             if (f > 0.44 * sampleRate) f = 0.44 * sampleRate * 0.5;    // выше Найквиста — не строим
-            body[(size_t) i].freq = (float) f;
-            body[(size_t) i].gain = (float) gains[i];
-            body[(size_t) i].q    = 6.0f + 10.0f * bodyT;
+            auto& b = body[(size_t) i];
+            b.freq = (float) f;
+            b.gain = (float) gains[i];
+            b.q = 6.0f + 10.0f * bodyT;
         }
+        // prepare() runs at control rate; keep exp/cos out of the sample loop.
+        updateBodyCoefficients();
 
         bloomCoef = (float) (1.0 / (bloomTime * sampleRate));
         gain = kGainTrim * (0.4f + 0.6f * clamp (p.level, 0.0f, 1.0f));
@@ -227,12 +231,7 @@ public:
             for (auto& b : body)
             {
                 // полосовой резонатор (двухполюсный) с нормировкой на резонанс
-                const float w = (float) kTwoPi * b.freq / (float) sampleRate;
-                const float r = std::exp (-w / (2.0f * b.q));
-                const float a1 = 2.0f * r * std::cos (w);
-                const float a2 = -r * r;
-                const float drive = (1.0f - r) * 4.0f;
-                float y = drive * src + a1 * b.z1 + a2 * b.z2;
+                float y = b.drive * src + b.a1 * b.z1 + b.a2 * b.z2;
                 y = antiDenormal (y);
                 b.z2 = b.z1; b.z1 = y;
                 bodyOut += y * b.gain;
@@ -269,8 +268,21 @@ private:
     struct Body
     {
         float freq = 300.0f, q = 10.0f, gain = 1.0f;
+        float a1 = 0.0f, a2 = 0.0f, drive = 1.0f;
         float z1 = 0.0f, z2 = 0.0f;
     };
+
+    void updateBodyCoefficients() noexcept
+    {
+        for (auto& b : body)
+        {
+            const float w = (float) kTwoPi * b.freq / (float) sampleRate;
+            const float r = std::exp (-w / (2.0f * b.q));
+            b.a1 = 2.0f * r * std::cos (w);
+            b.a2 = -r * r;
+            b.drive = (1.0f - r) * 4.0f;
+        }
+    }
 
     const SampleBank* bank = nullptr;
     const OneShot*    shot = nullptr;

@@ -76,7 +76,7 @@ LICENSE         GPL-3.0 (весь проект), NOTICE.md — что чьё
 | 5 | Granular | стенд 49/49 + reverse 8/8 + огибающая 28/28 + потоки Reverse 7/7 и Spread 5/5; headroom Choir остаётся открытым | [ENGINE-05-granular.md](ENGINE-05-granular.md) |
 | 6 | Modal | **готов**: алиасинг −92.9 дБ, T60 0.25…12 с, 0.38 % CPU/голос | [ENGINE-06-modal.md](ENGINE-06-modal.md) |
 | 7 | Resynth | **готов**: алиасинг −73.6 дБ, stretch 0.25…4× независим от питча, 1.19 % CPU/голос | [ENGINE-07-resynth.md](ENGINE-07-resynth.md) |
-| 8 | Organics | исправлены склейка и короткий источник; остальные перепады требуют отдельной доводки | [ENGINE-08-organics.md](ENGINE-08-organics.md) |
+| 8 | Organics | BODY hot-loop ускорен на ≈15,6 % по медиане без изменения вывода; перепады между источниками ещё требуют доводки | [ENGINE-08-organics.md](ENGINE-08-organics.md) |
 | 9 | CHOP | текущий стенд 21/21, лупы и слайсы | [ENGINE-09-chop.md](ENGINE-09-chop.md) |
 
 ## Перепроверка (24.10.2026)
