@@ -28,7 +28,7 @@ inline WavetableLoadResult loadWavetableWav (const juce::File& file, bool resynt
         return { {}, "Resynthesis accepts WAV files up to 120 seconds; nothing was imported." };
     if (! resynth && (cycleLength < 32 || n > (juce::int64) cycleLength * kUserWtMaxFrames
                       || n % cycleLength != 0))
-        return { {}, "Packed WAV must contain 1–256 complete frames of the selected length. Use RESYNTH for ordinary recordings." };
+        return { {}, "Packed WAV must contain 1-256 complete frames of the selected length. Use RESYNTH for ordinary recordings." };
     if (n > (juce::int64) std::numeric_limits<int>::max()) return { {}, "WAV is too large." };
     // Deliberately use the left channel, as common wavetable formats do;
     // averaging stereo can cancel an out-of-phase source.

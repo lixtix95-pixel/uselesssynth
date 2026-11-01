@@ -9,6 +9,7 @@
 #include "UiParamMap.h"
 #include "EngineUi.h"
 #include "WavetableFile.h"
+#include "GranularFile.h"
 #include "content/wavetable_bank.h"
 
 #include <array>
@@ -1916,11 +1917,12 @@ public:
         waitForThreadToExit (-1);
     }
 
-    void submit (const Patch& p, const Instrument::UserTables& tables, std::uint64_t generation)
+    void submit (const Patch& p, const Instrument::UserTables& tables, const Instrument::UserSamples& samples, std::uint64_t generation)
     {
         const juce::ScopedLock guard (lock);
         pendingPatch = p;
         pendingTables = tables;
+        pendingSamples = samples;
         pendingGeneration = generation;
         hasPending = true;
         latest.store (generation, std::memory_order_release);
@@ -1949,6 +1951,7 @@ private:
         {
             Patch patch;
             Instrument::UserTables tables;
+            Instrument::UserSamples samples;
             std::uint64_t generation = 0;
             {
                 const juce::ScopedLock guard (lock);
@@ -1956,6 +1959,7 @@ private:
                 {
                     patch = pendingPatch;
                     tables = pendingTables;
+                    samples = pendingSamples;
                     generation = pendingGeneration;
                     hasPending = false;
                 }
@@ -1972,6 +1976,12 @@ private:
                 {
                     bank.userWavetables[i] = tables[i];
                     ++bank.userWtGeneration[i];
+                }
+            for (size_t i = 0; i < samples.size(); ++i)
+                if (bank.userSamples[i] != samples[i])
+                {
+                    bank.userSamples[i] = samples[i];
+                    ++bank.userSampleGeneration[i];
                 }
             voice.stageSlots (patch, bank);
             voice.applyPendingEngines();
@@ -2038,6 +2048,7 @@ private:
     juce::WaitableEvent wake;
     Patch pendingPatch;
     Instrument::UserTables pendingTables {};
+    Instrument::UserSamples pendingSamples {};
     std::uint64_t pendingGeneration = 0;
     std::atomic<std::uint64_t> latest { 0 };
     bool hasPending = false, hasResult = false;
@@ -2077,6 +2088,8 @@ static std::uint64_t previewPatchHash (const Patch& patch, int selectedSlot)
         mix ((std::uint32_t) slot.type); mix ((std::uint32_t) slot.filterType);
         mix ((std::uint32_t) slot.params.table);
         mix (slot.params.wtUser ? 1u : 0u);
+        mix (slot.params.grainUser ? 1u : 0u);
+        mix ((std::uint32_t) slot.params.grainRootNote);
         mix ((std::uint32_t) slot.params.fmAlgorithm);
         mf (slot.params.fmRatioC); mf (slot.params.fmRatioB1); mf (slot.params.fmRatioB2); mf (slot.params.fmMix);
         for (float v : slot.params.p) mf (v);
@@ -2087,6 +2100,60 @@ static std::uint64_t previewPatchHash (const Patch& patch, int selectedSlot)
     }
     return h;
 }
+
+// File drag feedback covers the main page but never intercepts mouse hits.
+class OrogenEditor::FileDropOverlay final : public juce::Component
+{
+public:
+    explicit FileDropOverlay (OrogenEditor& e) : owner (e)
+    {
+        setName ("File drop overlay");
+        setInterceptsMouseClicks (false, false);
+    }
+    void paint (juce::Graphics& g) override
+    {
+        g.fillAll (juce::Colours::black.withAlpha (0.93f));
+        const float scale = owner.kx();
+        const bool wt = owner.fileDropEngine == (int) EngineType::Wavetable;
+        g.setColour (juce::Colours::white);
+        g.setFont (orFont (22.0f * scale, true));
+        const auto slot = juce::String::charToString ((juce::juce_wchar) kSlotLetters[juce::jlimit (0, 7, owner.fileDropSlot)]);
+        g.drawFittedText ((wt ? "DROP WAV INTO SLOT " : "DROP SAMPLE INTO SLOT ") + slot,
+                          owner.R (220, 145, 840, 35), juce::Justification::centred, 1);
+        g.setColour (juce::Colours::white.withAlpha (0.55f));
+        g.setFont (orFont (11.0f * scale));
+        g.drawFittedText (owner.fileDropName, owner.R (220, 185, 840, 24), juce::Justification::centred, 1);
+        const int zones = wt ? 2 : 1;
+        for (int i = 0; i < zones; ++i)
+        {
+            const auto box = owner.fileDropBounds (i);
+            const bool active = owner.fileDropZone == i;
+            g.setColour (juce::Colours::white.withAlpha (active ? 0.12f : 0.025f));
+            g.fillRect (box);
+            g.setColour (juce::Colours::white.withAlpha (active ? 1.0f : 0.42f));
+            g.drawRect (box.toFloat(), juce::jmax (1.0f, scale));
+            g.setFont (orFont (17.0f * scale, true));
+            const auto title = ! wt ? juce::String ("DROP AUDIO SAMPLE")
+                              : i == 0 ? juce::String ("READY WAVETABLE") : juce::String ("RESYNTH RECORDING");
+            g.drawFittedText (title, box.withTrimmedTop (juce::roundToInt (55 * scale)).withHeight (juce::roundToInt (32 * scale)),
+                              juce::Justification::centred, 1);
+            g.setColour (juce::Colours::white.withAlpha (0.62f));
+            g.setFont (orFont (11.0f * scale));
+            const auto detail = ! wt ? juce::String ("WAV / AIFF / FLAC  /  first channel")
+                               : i == 0 ? juce::String ("2048 samples per frame  /  1-256 frames")
+                                        : juce::String ("ordinary WAV to 64 spectral frames");
+            g.drawFittedText (detail, box.withTrimmedTop (juce::roundToInt (94 * scale)).withHeight (juce::roundToInt (28 * scale)),
+                              juce::Justification::centred, 1);
+        }
+        g.setColour (juce::Colours::white.withAlpha (0.48f));
+        g.setFont (orFont (10.5f * scale));
+        g.drawFittedText (wt ? "Drop in a box or directly on WAV WT / RESYNTH. Other frame sizes: click WAV WT."
+                             : "Drop inside the box. Original speed: root note C4 by default.",
+                          owner.R (220, 470, 840, 28), juce::Justification::centred, 1);
+    }
+private:
+    OrogenEditor& owner;
+};
 
 //============================================================================
 // Конструктор редактора.
@@ -2151,6 +2218,8 @@ OrogenEditor::OrogenEditor (OrogenProcessor& p)
     buildColumns();
     buildParamsPage();
     buildFxPage();
+    fileDropOverlay = std::make_unique<FileDropOverlay> (*this);
+    addChildComponent (*fileDropOverlay);
 
     selectSlot (0);
     setSection (1);              // по умолчанию открыта мод-матрица (как на макете)
@@ -2162,6 +2231,7 @@ OrogenEditor::~OrogenEditor()
 {
     stopTimer();
     if (wtImportThread.joinable()) wtImportThread.join();
+    if (sampleImportThread.joinable()) sampleImportThread.join();
     releaseMain();
     if (vectorPad != nullptr) vectorPad->finishGesture();
     previewWorker.reset();                  // ждём воркер до уничтожения редактора
@@ -2198,7 +2268,7 @@ void OrogenEditor::buildCentre()
     addAndMakeVisible (sourceBox);
     sourceBox.setName ("Source for selected slot");
     sourceBox.setTextWhenNothingSelected ("NO SOURCE NEEDED");
-    sourceBox.setTooltip ("Select the selected slot's table, source, material or loop. WAV WT and RESYNTH load a user table into this slot.");
+    sourceBox.setTooltip ("Select the slot source. Drag a WAV onto Wavetable, or an audio sample onto Granular; the imported source appears here.");
     sourceBox.onChange = [this]
     {
         const int index = sourceBox.getSelectedId() - 1;
@@ -2213,19 +2283,37 @@ void OrogenEditor::buildCentre()
             if (index == 8 && userWtPresent) { sourceUserAtt->setValueAsCompleteGesture (1.0f); return; }
             if (index >= 0 && index < 8) sourceUserAtt->setValueAsCompleteGesture (0.0f);
         }
+        if (type == (int) EngineType::Granular && sourceGrainAtt != nullptr)
+        {
+            if (index == 8 && userSamplePresent) { sourceGrainAtt->setValueAsCompleteGesture (1.0f); return; }
+            if (index >= 0 && index < 8) sourceGrainAtt->setValueAsCompleteGesture (0.0f);
+        }
         if (sourceAtt != nullptr && index >= 0 && index < sourceCountForEngine (type))
             sourceAtt->setValueAsCompleteGesture ((float) index);
     };
     addAndMakeVisible (wtLoadButton);
     addAndMakeVisible (wtResynthButton);
     addAndMakeVisible (fmEditButton);
+    addAndMakeVisible (grainLoadButton);
+    addAndMakeVisible (grainRootBox);
+    grainLoadButton.setName ("Import Granular audio sample");
+    grainLoadButton.setTooltip ("Drop WAV, AIFF or FLAC here, or click to browse. First channel, up to 30 s / 1,440,000 frames.");
+    grainLoadButton.onClick = [this] { showGranularImport(); };
+    grainRootBox.setName ("Granular root note");
+    grainRootBox.setTooltip ("The MIDI key that plays the user sample at its original rate. Default: C4 (60).");
+    for (int n = 0; n < 128; ++n)
+        grainRootBox.addItem ("ROOT " + juce::MidiMessage::getMidiNoteName (n, true, true, 4), n + 1);
+    grainRootBox.onChange = [this] {
+        if (sourceRootAtt != nullptr && grainRootBox.getSelectedId() > 0)
+            sourceRootAtt->setValueAsCompleteGesture ((float) (grainRootBox.getSelectedId() - 1));
+    };
     fmEditButton.setName ("Open FM operator parameters");
     fmEditButton.setTooltip ("Edit Ratio C, Ratio B1, Ratio B2 and X/Y Mix for this slot in PARAMS.");
     fmEditButton.onClick = [this] { showPage (201 + selectedSlot); };
     wtLoadButton.setName ("Import packed WAV wavetable");
     wtResynthButton.setName ("Resynthesize WAV recording");
-    wtLoadButton.setTooltip ("Load a packed WAV wavetable; choose the frame length first (Serum/Vital: 2048). Left channel, up to 256 frames.");
-    wtResynthButton.setTooltip ("Convert a regular WAV recording to 64 spectral frames. Left channel; maximum 120 seconds.");
+    wtLoadButton.setTooltip ("Drop a packed 2048-frame WAV here, or click to choose another frame length. First channel, up to 256 frames.");
+    wtResynthButton.setTooltip ("Drop an ordinary WAV here to resynthesize it, or click to browse. First channel; up to 120 seconds.");
     wtLoadButton.onClick = [this]
     {
         juce::PopupMenu menu;
@@ -2445,6 +2533,9 @@ void OrogenEditor::selectSlot (int slot)
     sourceAtt.reset();
     sourceUserAtt.reset();
     sourceFmAtt.reset();
+    sourceGrainAtt.reset();
+    sourceRootAtt.reset();
+    sourceGrainValue = pv (slotId ("grainUser"));
     sourceUserValue = pv (slotId ("wtUser"));
     sourceFmValue = pv (slotId ("fmAlgorithm"));
     if (! paramsOpen && ! fxOpen) rebuildPreview (true);
@@ -2464,10 +2555,19 @@ void OrogenEditor::selectSlot (int slot)
         sourceFmAtt = std::make_unique<juce::ParameterAttachment> (*parameter,
             [this] (float value) { sourceFmValue = value; updateSourceSelection (pv (slotId ("table"))); });
 
+    if (auto* parameter = proc.apvts.getParameter (slotId ("grainUser")))
+        sourceGrainAtt = std::make_unique<juce::ParameterAttachment> (*parameter,
+            [this] (float value) { sourceGrainValue = value; updateSourceSelection (pv (slotId ("table"))); });
+    if (auto* parameter = proc.apvts.getParameter (slotId ("grainRoot")))
+        sourceRootAtt = std::make_unique<juce::ParameterAttachment> (*parameter,
+            [this] (float value) { grainRootBox.setSelectedId (juce::jlimit (0, 127, juce::roundToInt (value)) + 1, juce::dontSendNotification); });
+
     refreshEngineContext();
     if (sourceAtt != nullptr) sourceAtt->sendInitialUpdate();
     if (sourceUserAtt != nullptr) sourceUserAtt->sendInitialUpdate();
     if (sourceFmAtt != nullptr) sourceFmAtt->sendInitialUpdate();
+    if (sourceGrainAtt != nullptr) sourceGrainAtt->sendInitialUpdate();
+    if (sourceRootAtt != nullptr) sourceRootAtt->sendInitialUpdate();
     repaint();
 }
 
@@ -2494,6 +2594,8 @@ void OrogenEditor::refreshEngineContext()
             sourceBox.addItem (juce::String (sourceNameForEngine (type, i)).toUpperCase(), i + 1);
         userWtPresent = false;
         userWtName = {};
+        userSamplePresent = false;
+        userSampleName = {};
         if (type == (int) EngineType::Wavetable)
         {
             auto tables = proc.engine().getUserWavetables();
@@ -2505,10 +2607,24 @@ void OrogenEditor::refreshEngineContext()
             sourceBox.addItem (userWtPresent ? "USER: " + userWtName.toUpperCase() : "USER: LOAD WAV FIRST", 9);
             sourceBox.setItemEnabled (9, userWtPresent);
         }
+        if (type == (int) EngineType::Granular)
+        {
+            auto samples = proc.engine().getUserSamples();
+            if (const auto& sample = samples[(size_t) selectedSlot])
+            {
+                userSamplePresent = true;
+                userSampleName = juce::String::fromUTF8 (sample->shot.name.c_str());
+            }
+            sourceBox.addItem (userSamplePresent ? "USER: " + userSampleName.toUpperCase() : "USER: LOAD SAMPLE FIRST", 9);
+            sourceBox.setItemEnabled (9, userSamplePresent);
+        }
         sourceBox.getProperties().set ("paramId", slotId (type == (int) EngineType::FM ? "fmAlgorithm" : "table"));
         fmEditButton.setVisible (type == (int) EngineType::FM);
         wtLoadButton.setVisible (type == (int) EngineType::Wavetable);
         wtResynthButton.setVisible (type == (int) EngineType::Wavetable);
+        grainLoadButton.setVisible (type == (int) EngineType::Granular);
+        grainRootBox.setVisible (type == (int) EngineType::Granular);
+        grainLoadButton.setEnabled (! sampleImportBusy);
         wtLoadButton.setEnabled (! wtImportBusy);
         wtResynthButton.setEnabled (! wtImportBusy);
         sourceBox.setEnabled (count > 0);
@@ -2541,6 +2657,12 @@ void OrogenEditor::updateSourceSelection (float denormalisedValue)
     // effective loop without rewriting the saved/automated host value.
     if (pi (slotId ("type")) == (int) EngineType::Wavetable
         && sourceUserValue > 0.5f && userWtPresent)
+    {
+        sourceBox.setSelectedId (9, juce::dontSendNotification);
+        return;
+    }
+    if (pi (slotId ("type")) == (int) EngineType::Granular
+        && sourceGrainValue > 0.5f && userSamplePresent)
     {
         sourceBox.setSelectedId (9, juce::dontSendNotification);
         return;
@@ -2786,6 +2908,9 @@ void OrogenEditor::resized()
     wtLoadButton.setBounds (R (772.0f, 92.0f, 91.0f, 20.0f));
     wtResynthButton.setBounds (R (869.0f, 92.0f, 94.0f, 20.0f));
     fmEditButton.setBounds (R (772.0f, 92.0f, 118.0f, 20.0f));
+    grainLoadButton.setBounds (R (772.0f, 92.0f, 91.0f, 20.0f));
+    grainRootBox.setBounds (R (869.0f, 92.0f, 94.0f, 20.0f));
+    if (fileDropOverlay != nullptr) fileDropOverlay->setBounds (getLocalBounds());
 
     for (int i = 0; i < centreKnobs.size(); ++i)
     {
@@ -2875,7 +3000,7 @@ void OrogenEditor::rebuildPreview (bool force)
     prevHashValid = true;
     prevStampMs = now;
     prevPending = true;
-    previewWorker->submit (patch, proc.engine().getUserWavetables(), ++prevGeneration);
+    previewWorker->submit (patch, proc.engine().getUserWavetables(), proc.engine().getUserSamples(), ++prevGeneration);
     repaint (R (248.0f, 66.0f, 736.0f, 214.0f));
 }
 
@@ -3062,7 +3187,7 @@ void OrogenEditor::repaintChangedValues()
     // previewPatchHash специально игнорирует его звуковые параметры.
     VisualHash display;
     display.add ((float) selectedSlot);
-    for (const auto* field : { "on", "type", "table", "filter", "grainReverse", "wtUser", "fmAlgorithm" }) display.add (pv (slotId (field)));
+    for (const auto* field : { "on", "type", "table", "filter", "grainReverse", "grainUser", "grainRoot", "wtUser", "fmAlgorithm" }) display.add (pv (slotId (field)));
     display.add (pv ("gl_mode")); display.add (pv ("gl_morph"));
     if (changed (display.value, displayVisualHash)) repaint (R (248.0f, 66.0f, 736.0f, 214.0f));
     visualHashesValid = true;
@@ -3081,6 +3206,17 @@ void OrogenEditor::timerCallback()
     if (wtRevision != seenWtRevision)
     {
         seenWtRevision = wtRevision;
+        contextEngine = -1;
+        refreshEngineContext();
+        prevHashValid = false;
+        if (! paramsOpen && ! fxOpen) rebuildPreview (true);
+        changed = true;
+    }
+
+    const auto sampleRevision = proc.userSampleRevision();
+    if (sampleRevision != seenSampleRevision)
+    {
+        seenSampleRevision = sampleRevision;
         contextEngine = -1;
         refreshEngineContext();
         prevHashValid = false;
@@ -3351,6 +3487,8 @@ juce::String OrogenEditor::selectedSourceLabel() const
             return juce::String (bank.tables[(size_t) table].name.c_str()).toUpperCase()
                  + " " + juce::String (table + 1) + "/" + juce::String ((int) bank.tables.size());
     }
+    if (type == (int) EngineType::Granular && pv (slotId ("grainUser")) > 0.5f && userSamplePresent)
+        return "USER: " + userSampleName.toUpperCase();
     if (type == (int) EngineType::Sample || type == (int) EngineType::Granular
         || type == (int) EngineType::Resynth || type == (int) EngineType::Organics)
         return juce::String (oneShotName ((OneShotKind) table)).toUpperCase()
@@ -3422,7 +3560,7 @@ void OrogenEditor::paintDisplay (juce::Graphics& g)
         const int reverse = juce::roundToInt (100.0f * juce::jlimit (0.0f, 1.0f, pv (slotId ("grainReverse"))));
         g.setColour (Palette::textDim);
         g.setFont (orFont (8.5f));
-        g.drawText ("GRAIN REV " + juce::String (reverse) + "%", juce::Rectangle<int> (840, 96, 130, 10),
+        g.drawText ("GRAIN REV " + juce::String (reverse) + "%", juce::Rectangle<int> (830, 252, 130, 10),
                     juce::Justification::centredRight, false);
     }
 
@@ -4264,6 +4402,128 @@ void OrogenEditor::mouseUp (const juce::MouseEvent& e)
     if ((dragTarget == MainHit::fxChip || dragTarget == MainHit::fxChipPage) && ! dragMoved)
         clickMain (designPos);
     releaseMain();
+}
+
+juce::Rectangle<int> OrogenEditor::fileDropBounds (int zone) const
+{
+    if (fileDropEngine == (int) EngineType::Wavetable)
+        return zone == 0 ? R (255, 230, 330, 200) : R (600, 230, 330, 200);
+    if (fileDropEngine == (int) EngineType::Granular && zone == 0)
+        return R (330, 220, 620, 220);
+    return {};
+}
+
+int OrogenEditor::fileDropZoneAt (int x, int y) const
+{
+    if (! fileDropActive) return -1;
+    // The persistent buttons are also drop targets. This remains usable when
+    // an OS/host supplies file names only at release rather than during hover.
+    if (fileDropEngine == (int) EngineType::Wavetable)
+    {
+        if (wtLoadButton.getBounds().contains (x, y)) return 0;
+        if (wtResynthButton.getBounds().contains (x, y)) return 1;
+    }
+    if (fileDropEngine == (int) EngineType::Granular && grainLoadButton.getBounds().contains (x, y)) return 0;
+    if (fileDropBounds (0).contains (x, y)) return 0;
+    if (fileDropEngine == (int) EngineType::Wavetable && fileDropBounds (1).contains (x, y)) return 1;
+    return -1;
+}
+
+bool OrogenEditor::isInterestedInFileDrag (const juce::StringArray& files)
+{
+    if (paramsOpen || fxOpen || files.size() != 1 || files[0].isEmpty()) return false;
+    const auto file = juce::File (files[0]);
+    const int type = pi (slotId ("type"));
+    return (type == (int) EngineType::Wavetable && ! wtImportBusy && file.hasFileExtension ("wav"))
+        || (type == (int) EngineType::Granular && ! sampleImportBusy && granularFileExtensionSupported (file));
+}
+
+void OrogenEditor::fileDragEnter (const juce::StringArray& files, int x, int y)
+{
+    if (! isInterestedInFileDrag (files)) return;
+    fileDropActive = true;
+    fileDropSlot = selectedSlot;
+    fileDropEngine = pi (slotId ("type"));
+    fileDropName = juce::File (files[0]).getFileName();
+    fileDropZone = fileDropZoneAt (x, y);
+    if (fileDropOverlay != nullptr) { fileDropOverlay->setVisible (true); fileDropOverlay->toFront (false); fileDropOverlay->repaint(); }
+}
+
+void OrogenEditor::fileDragMove (const juce::StringArray&, int x, int y)
+{
+    if (! fileDropActive) return;
+    const int next = fileDropZoneAt (x, y);
+    if (next != fileDropZone) { fileDropZone = next; if (fileDropOverlay != nullptr) fileDropOverlay->repaint(); }
+}
+
+void OrogenEditor::fileDragExit (const juce::StringArray&)
+{
+    fileDropActive = false; fileDropZone = -1;
+    if (fileDropOverlay != nullptr) fileDropOverlay->setVisible (false);
+}
+
+void OrogenEditor::filesDropped (const juce::StringArray& files, int x, int y)
+{
+    const int zone = fileDropZoneAt (x, y), slot = fileDropSlot, type = fileDropEngine;
+    fileDragExit (files);
+    if (zone < 0 || slot < 0 || slot >= kNumSlots || files.size() != 1) return;
+    // Keep the destination captured on drag enter, even if another slot is
+    // selected while hovering. A host-side engine change cancels the drop.
+    if (pi (slotPrefix (slot) + "type") != type) return;
+    const juce::File file (files[0]);
+    if (type == (int) EngineType::Wavetable && file.hasFileExtension ("wav"))
+        beginWavetableFileImport (file, zone == 1, 2048, slot);
+    else if (type == (int) EngineType::Granular && granularFileExtensionSupported (file))
+        beginGranularFileImport (file, slot);
+}
+
+void OrogenEditor::showGranularImport()
+{
+    if (sampleImportBusy) return;
+    const int slot = selectedSlot;
+    auto chooser = std::make_shared<juce::FileChooser> (
+        "Load a Granular sample", juce::File::getSpecialLocation (juce::File::userDocumentsDirectory),
+        "*.wav;*.aif;*.aiff;*.flac");
+    juce::Component::SafePointer<OrogenEditor> safe (this);
+    chooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+        [safe, chooser, slot] (const juce::FileChooser& fc)
+        {
+            if (safe != nullptr && fc.getResult() != juce::File())
+                safe->beginGranularFileImport (fc.getResult(), slot);
+        });
+}
+
+void OrogenEditor::beginGranularFileImport (juce::File file, int slot)
+{
+    if (sampleImportBusy) return;
+    if (sampleImportThread.joinable()) sampleImportThread.join();
+    sampleImportBusy = true;
+    grainLoadButton.setEnabled (false); grainLoadButton.setButtonText ("LOADING...");
+    juce::Component::SafePointer<OrogenEditor> safe (this);
+    sampleImportThread = std::thread ([safe, file, slot]
+    {
+        auto result = loadGranularSample (file);
+        juce::MessageManager::callAsync ([safe, result = std::move (result), slot]() mutable
+        {
+            if (safe == nullptr) return;
+            safe->sampleImportBusy = false;
+            safe->grainLoadButton.setButtonText ("LOAD SAMPLE");
+            safe->grainLoadButton.setEnabled (true);
+            if (! result.sample)
+            {
+                juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
+                                                        "Sample import", result.error, "OK");
+                return;
+            }
+            safe->proc.installUserSample (slot, std::move (result.sample));
+            safe->seenSampleRevision = safe->proc.userSampleRevision();
+            safe->contextEngine = -1;
+            safe->refreshEngineContext();
+            safe->prevHashValid = false;
+            if (! safe->paramsOpen && ! safe->fxOpen) safe->rebuildPreview (true);
+            safe->repaint();
+        });
+    });
 }
 
 void OrogenEditor::showWavetableImport (bool resynth, int cycleLength)

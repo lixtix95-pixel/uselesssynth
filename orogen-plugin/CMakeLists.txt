@@ -34,6 +34,10 @@ else()
     FetchContent_MakeAvailable(JUCE)
 endif()
 
+# JUCE's Linux Xdnd timestamp fix is generated in the build directory only.
+include(cmake/PatchJuceXdnd.cmake)
+orogen_patch_juce_xdnd()
+
 # ---------------------------------------------------------------------------
 # DSP-ядро (orogen-dsp) — header-only, без JUCE
 # ---------------------------------------------------------------------------
@@ -191,5 +195,15 @@ orogen_console_app(test_plugin tests/test_plugin.cpp
 orogen_console_app(verify_vst3 tools/verify_vst3.cpp)
 # хостинг VST3 внутри стенда: без этого заголовка VST3PluginFormat не существует
 target_compile_definitions(verify_vst3 PRIVATE JUCE_PLUGINHOST_VST3=1)
+
+# The optional Linux native file-drop tests act as an X11 Xdnd source. JUCE
+# itself loads Xlib dynamically, but this test helper uses the Xlib API directly.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    find_package(X11 REQUIRED)
+    target_sources(test_plugin PRIVATE tests/xdnd_test.cpp)
+    target_sources(verify_vst3 PRIVATE tests/xdnd_test.cpp)
+    target_link_libraries(test_plugin PRIVATE X11::X11)
+    target_link_libraries(verify_vst3 PRIVATE X11::X11)
+endif()
 
 endif()   # OROGEN_BUILD_STANDS

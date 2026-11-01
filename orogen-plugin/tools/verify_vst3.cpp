@@ -7,17 +7,19 @@
 //
 //   verify_vst3 <путь к OROGEN.vst3> [секунды]
 #include <juce_audio_processors/juce_audio_processors.h>
+#include <juce_audio_formats/juce_audio_formats.h>
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <set>
 
 using namespace juce;
 
-static constexpr int kNumApvtsParams = 938;   // см. Params.h / test_plugin
+static constexpr int kNumApvtsParams = 954;   // см. Params.h / test_plugin
 
 static int failures = 0;
 static void check (bool ok, const String& what, const String& detail = {})
@@ -52,6 +54,8 @@ struct HostGestureTrace : AudioProcessorParameter::Listener
     bool balanced() const { return p != nullptr && begins == 1 && ends == 1 && ! active && ! invalid && valueInside; }
     String info() const { return String (begins) + "/" + String (values) + "/" + String (ends); }
 };
+
+#include "../tests/test_hosted_sample.h"
 
 static void testHostedGuiGestures (AudioPluginFormat& format, const PluginDescription& d)
 {
@@ -241,7 +245,8 @@ int main (int argc, char** argv)
     for (const char* probe : { "sA_Level", "sA_Cutoff", "sA_Filter", "sA_Engine",
                                "Reverb Mix", "Comb Hz A", "Master", "mod1_Amount",
                                "Arp On", "lfo1_Rate", "Plate Pre Filter", "Plate Input Diff 1",
-                               "Plate Input Diff 2", "Plate Output", "sA_Grain Reverse", "sH_Grain Reverse" })
+                               "Plate Input Diff 2", "Plate Output", "sA_Grain Reverse", "sH_Grain Reverse",
+                               "sA_User Granular Sample", "sH_User Granular Sample", "sA_Granular Root Note", "sH_Granular Root Note" })
         check (names.count (String (probe)) == 1, String::fromUTF8 ("виден хосту: ") + probe);
 
     const char* rackNames[] = { "DRIVE On", "COMB On", "CHORUS On", "DELAY On", "REVERB On", "PLATE On",
@@ -733,6 +738,7 @@ int main (int argc, char** argv)
     }
 
     testHostedGuiGestures (*format, d);
+    testHostedSampleDrop (*format, d);
     inst->setStateInformation (initialState.getData(), (int) initialState.getSize());
 
     // --- редактор ---

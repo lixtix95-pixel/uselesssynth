@@ -2,7 +2,7 @@
 
 Исходники DSP-проекта предоставлены на условиях **GNU GPL-3.0-or-later**
 (текст — `LICENSE`), но некоторые включённые файлы обозначены **GPL-3.0-only**
-(в частности, ParallelComb). Сборка VST3 дополнительно использует JUCE 8,
+(в частности, ParallelComb и маршрутизации Digitone-style FM). Сборка VST3 дополнительно использует JUCE 8,
 доступный по AGPL-3.0 либо по отдельной коммерческой лицензии. Лицензии
 компонентов и их авторство следует учитывать вместе; условия и тексты GPL,
 AGPL и JUCE поставляются с архивами. Код с GPL-3.0-only сохраняет собственные
@@ -13,6 +13,7 @@ SPDX-метки и уведомления об авторстве.
 | компонент | путь | лицензия | правообладатель |
 |---|---|---|---|
 | JUCE 8.0.15 (VST3-обёртка) | FetchContent, https://github.com/juce-framework/JUCE | AGPL-3.0 или коммерческая | © Raw Material Software Limited |
+| ChoralRoot FM-1: адаптированные графы маршрутизации | `src/engines/digitone_routing.h`, https://github.com/Quixotic7/ChoralRootFM1 | GPL-3.0-only | ChoralRoot FM-1 contributors; upstream commit `ec9c54fdd7a0a544e8ec82bec196db745868f057` |
 | Dattorro plate reverb | `third_party/dattorro-verb/` | MIT | © 2022 Pauli Pölkki |
 | WDF (схемная сатурация) | `third_party/chowdsp_wdf/` | BSD-3-Clause | © Jatin Chowdhury |
 | Odin 2 comb (перенос) | `third_party/monojuice/dsp/OdinComb.h` | **GPL-3.0-or-later** | © 2020-2021 TheWaveWarden |
@@ -29,3 +30,11 @@ SPDX-метки и уведомления об авторстве.
 пользователем с разрешением использовать код. Корневой LICENSE этого
 репозитория не обнаружен, поэтому его общая лицензия не утверждается;
 перед распространением следует уточнить права у правообладателя.
+
+Linux-сборка JUCE 8.0.15 использует локальную при сборке правку Xdnd в
+`orogen-plugin/cmake/PatchJuceXdnd.cmake`: она компилирует копию исходного
+файла JUCE с исправлениями timestamp/hover, не изменяя исходный каталог JUCE.
+Лицензию JUCE следует учитывать и для этой копии. Исходный архив OROGEN не
+включает дерево JUCE; точную версию 8.0.15 необходимо получить отдельно по
+инструкциям сборки. При дальнейшей передаче бинарников обеспечьте получателям
+соответствующий исходный код и соблюдение применимых лицензий.

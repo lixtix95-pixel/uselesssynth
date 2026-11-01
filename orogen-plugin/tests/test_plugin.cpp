@@ -27,7 +27,9 @@ static void crashTrace (int sig)
     std::_Exit (3);
 }
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <limits>
 #include <ctime>
 #include <functional>
 #include <vector>
@@ -724,10 +726,10 @@ static void testGuiRegressions()
         const auto lfo = nativeChange ("lfo1_amount", 0.90f, { 262, 356, 708, 44 });
         const auto rail = nativeChange ("sB_type", 4.0f, { 16, 136, 216, 62 });
         const auto pad = nativeChange ("gl_morph", 0.80f, { 1108, 646, 156, 138 });
-        const auto reverseOff = nativeChange ("sA_grainReverse", 0.73f, { 840, 96, 130, 10 });
+        const auto reverseOff = nativeChange ("sA_grainReverse", 0.73f, { 830, 252, 130, 10 });
         setP (p, "sA_on", 1.0f);
         juce::MessageManager::getInstance()->runDispatchLoopUntil (500);
-        const auto reverseOn = nativeChange ("sA_grainReverse", 0.31f, { 840, 96, 130, 10 });
+        const auto reverseOn = nativeChange ("sA_grainReverse", 0.31f, { 830, 252, 130, 10 });
         std::printf ("   native/fresh px: значение %d/%d, FX %d/%d, LFO %d/%d, слот B %d/%d, pad %d/%d, Reverse off/on %d/%d / %d/%d\n",
                      label[0], label[1], chip[0], chip[1], lfo[0], lfo[1], rail[0], rail[1], pad[0], pad[1],
                      reverseOff[0], reverseOff[1], reverseOn[0], reverseOn[1]);
@@ -2121,8 +2123,8 @@ static void testSourcePicker()
                 continue;
             }
             const int count = type == 2 ? 0 : type == 8 ? 3 : 8;
-            if (source->getNumItems() == count + (type == 0 ? 1 : 0) && source->isEnabled() == (count > 0)
-                && (type != 0 || ! source->isItemEnabled (9))) ++lists;
+            if (source->getNumItems() == count + ((type == 0 || type == 4) ? 1 : 0) && source->isEnabled() == (count > 0)
+                && ((type != 0 && type != 4) || ! source->isItemEnabled (9))) ++lists;
             if (count == 0)
             {
                 setP (p, id, 7.0f);
@@ -2930,6 +2932,39 @@ static void testAudioCallbackAllocations()
            "alloc=" + juce::String ((juce::int64) wtAlloc) + ", nonfinite=" + juce::String (wtBad)
            + ", energy=" + num (energy, 6));
 
+    // Prepared on the control thread, then swapped on a held Granular note.
+    // Count processBlock only; sample decoding/MIP and staging may allocate.
+    std::vector<float> sampleRawA (24000), sampleRawB (24000);
+    for (int i = 0; i < 24000; ++i)
+    {
+        sampleRawA[(size_t) i] = (float) (0.3 * std::sin (kTwoPi * 220.0 * i / 48000.0));
+        sampleRawB[(size_t) i] = (float) (0.3 * std::sin (kTwoPi * 440.0 * i / 48000.0));
+    }
+    auto grainA = makeUserSample (std::move (sampleRawA), 48000, "alloc A");
+    auto grainB = makeUserSample (std::move (sampleRawB), 48000, "alloc B");
+    OrogenProcessor grain; grain.setPlayConfigDetails (0, 2, 48000.0, 128); grain.prepareToPlay (48000.0, 128);
+    soloSlot (grain, 0, (int) EngineType::Granular);
+    grain.installUserSample (0, grainA);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil (100);
+    juce::MidiBuffer grainNote; grainNote.addEvent (juce::MidiMessage::noteOn (1, 60, .8f), 0);
+    grain.processBlock (wave, grainNote);
+    std::uint64_t grainAlloc = 0; int grainBad = 0;
+    for (int update = 0; update < 20; ++update)
+    {
+        grain.installUserSample (0, (update & 1) ? grainA : grainB);
+        setP (grain, "sA_grainRoot", (update & 1) ? 60.0f : 48.0f);
+        start();
+        for (int block = 0; block < 8; ++block) grain.processBlock (wave, noMidi);
+        grainAlloc += stop();
+        for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < 128; ++i)
+            if (! std::isfinite (wave.getSample (ch, i))) ++grainBad;
+        grain.engine().drainRetired();
+    }
+    check (grainAlloc == 0 && grainBad == 0,
+           "held-note Granular sample publication, root automation and crossfade: no callback allocations/nonfinite",
+           "alloc=" + juce::String ((juce::int64) grainAlloc) + ", nonfinite=" + juce::String (grainBad));
+    grain.releaseResources();
+
     OrogenProcessor fm; fm.setPlayConfigDetails (0, 2, 48000.0, 128); fm.prepareToPlay (48000.0, 128);
     soloSlot (fm, 0, (int) EngineType::FM);
     setP (fm, "sA_p1", .5f); setP (fm, "sA_p2", .3f); setP (fm, "sA_fmAlgorithm", 1);
@@ -3663,6 +3698,10 @@ static void testUserWavetablePlugin()
     packed.deleteFile(); ordinary.deleteFile(); preset.deleteFile(); bank.deleteFile();
 }
 
+bool nativeFileDrop (juce::Component&, juce::Point<int>, const juce::File&,
+                     const std::function<bool()>&, bool&, int&);
+#include "test_user_samples.h"
+
 int main (int argc, char** argv)
 {
     // Голова без X11: GUI-инициализация здесь упала бы (нет дисплея), а
@@ -3683,6 +3722,21 @@ int main (int argc, char** argv)
     if (argc > 1 && juce::String (argv[1]) == "--fm-algorithms-only")
     {
         testFmAlgorithmsPlugin();
+        juce::DeletedAtShutdown::deleteAll();
+        juce::MessageManager::deleteInstance();
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "--native-file-drop-only")
+    {
+        testNativeAudioFileDrop();
+        juce::DeletedAtShutdown::deleteAll();
+        juce::MessageManager::deleteInstance();
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "--user-samples-only")
+    {
+        testGranularUserFilesAndState();
+        testAudioFileDropUi();
         juce::DeletedAtShutdown::deleteAll();
         juce::MessageManager::deleteInstance();
         return failures == 0 ? 0 : 1;
@@ -3839,10 +3893,10 @@ int main (int argc, char** argv)
         const int legacyCount = 306 + FxChain::ModuleCount + extraFxCount + 2 + 5;
         int fxCount = 0; fxParamTable (fxCount);
         const int perCopy = fxCount + FxChain::ModuleCount + extraFxCount + 21;
-        // Eight imported-table selectors and five FM controls per slot were
-        // appended after the original FX rack parameters.
+        // Imported-table selector, five FM controls, and two Granular user
+        // sample/root controls per slot follow the original FX parameters.
         const int expectedCount = legacyCount + (FxChain::kCopiesPerModule - 1) * perCopy
-                                + FxChain::kNodeCount + 8 * (1 + 5);
+                                + FxChain::kNodeCount + 8 * (1 + 5 + 2);
         check (count == expectedCount, "все параметры объявлены", num (count, 0));
 
         // Снимок последовательности ID rev21 до добавления Plate. Хэшируем
@@ -4739,8 +4793,8 @@ int main (int argc, char** argv)
             int seenAll = 0;
             if (auto* overlay = ore->paramsOverlay())
                 seenAll = countBoundControls (*overlay, tabs[0]);
-            // 8 слотов × 28 параметров, включая импорт таблицы и FM.
-            check (seenAll == 224, "страница ALL вкладки SLOT показывает все 224",
+            // 8 слотов × 30 параметров, включая импорт WT, FM и user sample.
+            check (seenAll == 240, "страница ALL вкладки SLOT показывает все 240",
                    num ((double) seenAll, 0));
 
             // снимок оверлея — заодно проверяем, что он отрисовывается
@@ -4762,25 +4816,41 @@ int main (int argc, char** argv)
         const char* names[9] = { "Wavetable", "FM", "Harmonic", "Sample",
                                  "Granular", "Modal", "Resynth", "Organics", "Chop" };
         double rms[9] = {};
+        std::array<juce::AudioBuffer<float>, 9> renders;
         for (int t = 0; t < 9; ++t)
         {
             OrogenProcessor p;
-            auto b = renderWithSetup (p, 24000, sr, [t] (OrogenProcessor& pr) { soloSlot (pr, 0, t); });
-            rms[t] = rmsOf (b);
+            renders[(size_t) t] = renderWithSetup (p, 24000, sr, [t] (OrogenProcessor& pr) { soloSlot (pr, 0, t); });
+            rms[t] = rmsOf (renders[(size_t) t]);
             std::printf ("   тип %d %-9s RMS %.4f\n", t, names[t], rms[t]);
             check (rms[t] > 0.0015, (juce::String ("движок звучит: ") + names[t]).toRawUTF8(), num (rms[t], 4));
         }
 
-        // 7.2 типы отличимы друг от друга
+        // 7.2 Сравниваем форму сигнала, а не только его уровень. Разные
+        // движки могут иметь одинаковый RMS; такая пара не является копией.
         int distinct = 0, pairs = 0;
+        double worstDelta = std::numeric_limits<double>::infinity();
+        int worstA = -1, worstB = -1;
         for (int a = 0; a < 9; ++a)
             for (int b = a + 1; b < 9; ++b)
             {
+                double sum = 0.0;
+                for (int channel = 0; channel < 2; ++channel)
+                    for (int frame = 0; frame < 24000; ++frame)
+                    {
+                        const double delta = renders[(size_t) a].getSample (channel, frame)
+                                           - renders[(size_t) b].getSample (channel, frame);
+                        sum += delta * delta;
+                    }
+                const double deltaRms = std::sqrt (sum / (2.0 * 24000));
+                if (deltaRms < worstDelta) { worstDelta = deltaRms; worstA = a; worstB = b; }
                 ++pairs;
-                if (std::fabs (rms[a] - rms[b]) > 0.02 * std::max (rms[a], rms[b])) ++distinct;
+                if (deltaRms > 0.02 * std::max (rms[a], rms[b])) ++distinct;
             }
-        std::printf ("   различаются по RMS: %d из %d пар\n", distinct, pairs);
-        check (distinct >= 24, "движки не подменяются друг другом",
+        std::printf ("   отличаются по форме: %d/%d; min delta RMS %.9f (%s / %s)\n",
+                     distinct, pairs, worstDelta, worstA >= 0 ? names[worstA] : "-",
+                     worstB >= 0 ? names[worstB] : "-");
+        check (distinct == pairs && pairs == 36, "все пары движков отличаются по форме сигнала",
                juce::String (distinct) + " / " + juce::String (pairs));
 
         // 7.3 смена типа на лету у одного процессора
@@ -6130,6 +6200,8 @@ int main (int argc, char** argv)
     testDelayProcessorRegression();
     testUserWavetablePlugin();
     testUserWavetableGui();
+    testGranularUserFilesAndState();
+    testAudioFileDropUi();
     testFmAlgorithmsPlugin();
     testMaterialMidiProcessor();
     juce::DeletedAtShutdown::deleteAll();

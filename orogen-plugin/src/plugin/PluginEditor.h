@@ -19,6 +19,7 @@ namespace orogen
 {
 
 class OrogenEditor : public juce::AudioProcessorEditor,
+                     public juce::FileDragAndDropTarget,
                      private juce::Timer
 {
 public:
@@ -27,6 +28,11 @@ public:
 
     void paint (juce::Graphics&) override;
     void resized() override;
+    bool isInterestedInFileDrag (const juce::StringArray& files) override;
+    void fileDragEnter (const juce::StringArray& files, int x, int y) override;
+    void fileDragMove (const juce::StringArray& files, int x, int y) override;
+    void fileDragExit (const juce::StringArray& files) override;
+    void filesDropped (const juce::StringArray& files, int x, int y) override;
     int visiblePage() const;
     juce::Component* fxOverlay();
     juce::StringArray fxRackParamIds() const;
@@ -112,6 +118,7 @@ private:
     class IconButton;        // кнопка-иконка секции
     class VectorPad;         // векторный блок справа внизу
     class PreviewWorker;     // владеет DSP-голосом вне message/audio thread
+    class FileDropOverlay;
 
     void timerCallback() override;
     void syncLfoPreviewCycles (int cycles);
@@ -176,11 +183,18 @@ private:
 
     int selectedSlot = 0;
     int contextSlot = -1, contextEngine = -1;
-    std::uint64_t seenWtRevision = 0;
-    juce::String userWtName;
-    bool userWtPresent = false, wtImportBusy = false;
-    float sourceUserValue = 0.0f, sourceFmValue = 0.0f;
-    std::thread wtImportThread;
+    std::uint64_t seenWtRevision = 0, seenSampleRevision = 0;
+    juce::String userWtName, userSampleName;
+    bool userWtPresent = false, userSamplePresent = false;
+    bool wtImportBusy = false, sampleImportBusy = false;
+    float sourceUserValue = 0.0f, sourceFmValue = 0.0f, sourceGrainValue = 0.0f;
+    std::thread wtImportThread, sampleImportThread;
+    std::unique_ptr<FileDropOverlay> fileDropOverlay;
+    bool fileDropActive = false;
+    int fileDropSlot = -1, fileDropEngine = -1, fileDropZone = -1;
+    juce::String fileDropName;
+    juce::Rectangle<int> fileDropBounds (int zone) const;
+    int fileDropZoneAt (int x, int y) const;
     int section = 0;                 // 0 FX · 1 MATRIX · 2 ARP · 3 LFO
     bool paramsOpen = false, fxOpen = false;
 
@@ -194,15 +208,18 @@ private:
     juce::ComboBox programBox;
 
     // выбор движка и фильтра выбранного слота (sA_type … sH_type / sA_filter …)
-    juce::ComboBox engineBox, filterBox, sourceBox;
+    juce::ComboBox engineBox, filterBox, sourceBox, grainRootBox;
     juce::TextButton wtLoadButton { "WAV WT" }, wtResynthButton { "RESYNTH" }, fmEditButton { "FM EDIT" };
+    juce::TextButton grainLoadButton { "LOAD SAMPLE" };
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> engineAtt, filterAtt;
     // table — прежний stepped float 0..7, а не Choice. Для CHOP три пункта,
     // поэтому стандартный ComboBoxAttachment (масштабирует по числу пунктов)
     // здесь неверен; ParameterAttachment принимает реальные индексы 0,1,2.
-    std::unique_ptr<juce::ParameterAttachment> sourceAtt, sourceUserAtt, sourceFmAtt;
+    std::unique_ptr<juce::ParameterAttachment> sourceAtt, sourceUserAtt, sourceFmAtt, sourceGrainAtt, sourceRootAtt;
     void showWavetableImport (bool resynth, int cycleLength = 2048);
     void beginWavetableFileImport (juce::File file, bool resynth, int cycleLength, int slot);
+    void showGranularImport();
+    void beginGranularFileImport (juce::File file, int slot);
 
     juce::OwnedArray<SlotCard> cards;
     juce::OwnedArray<Bound> centreKnobs, centreBars;    // 3 + 3, зависят от слота

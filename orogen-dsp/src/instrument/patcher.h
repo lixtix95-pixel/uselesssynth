@@ -58,6 +58,8 @@ struct EngineBank
     // Accessed by serialized staging operations, never by the audio thread.
     std::array<std::shared_ptr<const UserWavetable>, 8> userWavetables {};
     std::array<std::uint64_t, 8> userWtGeneration {};
+    std::array<std::shared_ptr<const UserSample>, 8> userSamples {};
+    std::array<std::uint64_t, 8> userSampleGeneration {};
     SampleBank    smp;
     ResynthBank   rs;
 
@@ -222,6 +224,8 @@ inline std::unique_ptr<EngineBase> makeEngine (EngineType t, const EngineBank& b
         {
             auto e = std::make_unique<GranularEngine>();
             e->setBank (&b.smp);
+            if (slot >= 0 && slot < (int) b.userSamples.size())
+                e->setUserSample (b.userSamples[(size_t) slot]);
             return e;
         }
         case EngineType::Modal:    return std::make_unique<ModalEngine>();

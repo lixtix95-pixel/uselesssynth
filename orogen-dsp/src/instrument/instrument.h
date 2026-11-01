@@ -83,6 +83,7 @@ public:
     }
 
     using UserTables = std::array<std::shared_ptr<const UserWavetable>, 8>;
+    using UserSamples = std::array<std::shared_ptr<const UserSample>, 8>;
 
     // Producer only: assets and new engines are constructed/published off the
     // audio thread. Old engines retain their immutable table until retired.
@@ -115,6 +116,39 @@ public:
     {
         const std::lock_guard<std::mutex> lock (stageMutex);
         return bank.userWavetables;
+    }
+
+    // Prepared samples and all voice objects are installed on a producer
+    // thread; active audio engines keep their own immutable shared ownership.
+    void stageUserSamples (const UserSamples& samples, const Patch& p)
+    {
+        const std::lock_guard<std::mutex> lock (stageMutex);
+        bool changed = false;
+        for (size_t i = 0; i < samples.size(); ++i)
+            if (bank.userSamples[i] != samples[i])
+            {
+                bank.userSamples[i] = samples[i];
+                ++bank.userSampleGeneration[i];
+                changed = true;
+            }
+        if (changed) for (auto& v : voices) v.stageSlots (p, bank);
+    }
+
+    void stageUserSample (int slot, std::shared_ptr<const UserSample> sample, const Patch& p)
+    {
+        if (slot < 0 || slot >= 8) return;
+        const std::lock_guard<std::mutex> lock (stageMutex);
+        const auto i = (size_t) slot;
+        if (bank.userSamples[i] == sample) return;
+        bank.userSamples[i] = std::move (sample);
+        ++bank.userSampleGeneration[i];
+        for (auto& v : voices) v.stageSlots (p, bank);
+    }
+
+    UserSamples getUserSamples() const
+    {
+        const std::lock_guard<std::mutex> lock (stageMutex);
+        return bank.userSamples;
     }
 
     void applyPatch (const Patch& p) noexcept

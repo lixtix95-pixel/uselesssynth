@@ -534,6 +534,15 @@ inline juce::AudioProcessorValueTreeState::ParameterLayout makeLayout()
         addFloat (pre + "fmRatioB2", pre + "FM Ratio B2", .25f, 16.0f, 1.0f, .01f);
         addFloat (pre + "fmMix", pre + "FM X/Y Mix", 0.0f, 1.0f, .5f, .001f);
     }
+    // Appended after FM to keep every previously published host ID/index.
+    for (int s = 0; s < kNumSlots; ++s)
+    {
+        const auto pre = slotPrefix (s);
+        layout.add (std::make_unique<AudioParameterBool> (ParameterID { pre + "grainUser", 1 },
+                                                          pre + "User Granular Sample", false));
+        layout.add (std::make_unique<AudioParameterInt> (ParameterID { pre + "grainRoot", 1 },
+                                                         pre + "Granular Root Note", 0, 127, 60));
+    }
     return std::move (layout.result);
 }
 

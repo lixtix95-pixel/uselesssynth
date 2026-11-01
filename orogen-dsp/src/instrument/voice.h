@@ -79,9 +79,10 @@ public:
             auto type = p.slots[i].type;
             if ((int) type < 0 || (int) type >= (int) EngineType::Count)
                 type = EngineType::Wavetable;
-            const auto generation = type == EngineType::Wavetable ? bank.userWtGeneration[(size_t) i] : 0;
+            const auto generation = type == EngineType::Wavetable ? bank.userWtGeneration[(size_t) i]
+                                  : type == EngineType::Granular ? bank.userSampleGeneration[(size_t) i] : 0;
             if (stagedValid[(size_t) i] && stagedType[(size_t) i] == type
-                && stagedWtGeneration[(size_t) i] == generation) continue;
+                && stagedContentGeneration[(size_t) i] == generation) continue;
 
             auto next = makeEngine (type, bank, i);
             if (! next) continue;
@@ -94,7 +95,7 @@ public:
                 EngineStats::deleted.fetch_add (1, std::memory_order_relaxed);
             }
             stagedType[(size_t) i] = type;
-            stagedWtGeneration[(size_t) i] = generation;
+            stagedContentGeneration[(size_t) i] = generation;
             stagedValid[(size_t) i] = true;
         }
     }
@@ -132,12 +133,12 @@ public:
             if ((mask & (1u << i)) == 0) continue;
             EngineBase* next = pending[(size_t) i].exchange (nullptr, std::memory_order_acq_rel);
             if (next == nullptr) continue;
-            // A table replacement on a held note must not reset the slot ADSR.
+            // A table/sample replacement on a held note must not reset the slot ADSR.
             // Crossfade both prepared engines for 5 ms and retire the old one
             // via the same control-thread bin used by the existing handoff.
             if (active && slotStarted[(size_t) i] && engines[(size_t) i]
-                && slotType[(size_t) i] == EngineType::Wavetable
-                && next->preparedSlotType == (int) EngineType::Wavetable
+                && (slotType[(size_t) i] == EngineType::Wavetable || slotType[(size_t) i] == EngineType::Granular)
+                && next->preparedSlotType == (int) slotType[(size_t) i]
                 && next->preparedContentGeneration != engines[(size_t) i]->preparedContentGeneration)
             {
                 fadingEngines[(size_t) i] = engines[(size_t) i].release();
@@ -468,7 +469,8 @@ private:
 
     static bool paramsEqual (const EngineParams& a, const EngineParams& b) noexcept
     {
-        if (a.table != b.table || a.wtUser != b.wtUser || a.fmAlgorithm != b.fmAlgorithm) return false;
+        if (a.table != b.table || a.wtUser != b.wtUser || a.fmAlgorithm != b.fmAlgorithm
+            || a.grainUser != b.grainUser || a.grainRootNote != b.grainRootNote) return false;
         if (std::fabs (a.fmRatioC - b.fmRatioC) > 1.0e-4f || std::fabs (a.fmRatioB1 - b.fmRatioB1) > 1.0e-4f
             || std::fabs (a.fmRatioB2 - b.fmRatioB2) > 1.0e-4f || std::fabs (a.fmMix - b.fmMix) > 1.0e-4f) return false;
         for (int k = 0; k < 4; ++k) if (std::fabs (a.p[k] - b.p[k]) > 1.0e-4f) return false;
@@ -656,7 +658,7 @@ private:
     std::array<std::atomic<EngineBase*>, kSlots> pending {};
     // Only the staging thread (serialized by Instrument) reads/writes these.
     std::array<EngineType, kSlots> stagedType {};
-    std::array<std::uint64_t, kSlots> stagedWtGeneration {};
+    std::array<std::uint64_t, kSlots> stagedContentGeneration {};
     std::array<bool, kSlots> stagedValid {};
     EngineRetireBin* retireBin = nullptr;
     std::array<Adsr, kSlots> env;

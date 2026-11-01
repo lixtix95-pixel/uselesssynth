@@ -137,11 +137,11 @@ clean.bat                      удаляет build-vs2022 и dist
 orogen-plugin/
   CMakeLists.txt               цель OROGEN_VST3 + опции
   CMakePresets.json            пресеты «vs2022» и «vs2022-local-juce»
-  src/plugin/                  процессор, редактор, параметры (890), пресеты
+  src/plugin/                  процессор, редактор, параметры (954), пресеты
   tests/test_plugin.cpp        проверки обёртки, FX и GUI
   tools/                       офлайн-рендер и скриншоты UI
 orogen-dsp/
-  src/                         DSP-ядро: 9 движков, 16 фильтров, 16 эффектов,
+  src/                         DSP-ядро: 9 движков, 16 фильтров, 13 типов FX,
                                арпеджиатор, мод-матрица (header-only)
   tests/                       DSP-стенды и регрессии
   third_party/                 исходники эффектов и их лицензии
@@ -156,13 +156,19 @@ NOTICE.md                      сторонние лицензии
 | свойство | значение |
 |---|---|
 | формат | VST3 3.8.0, инструмент (synth), MIDI-вход |
-| параметров | **890** (`sA_…`–`sH_…`, `fx_*`, `mod1_*`…`mod8_*`, `arp*`, `gl_*`) |
+| параметров | **954** (`sA_…`–`sH_…`, `fx_*`, `mod1_*`…`mod8_*`, `arp*`, `gl_*`) |
 | движков | 9 (Wavetable, FM, Harmonic, Sample, Granular, Modal, Resynth, Organics, Chop) |
 | моделей фильтра | 16 на слот |
-| эффектов | 16, общая цепочка |
+| FX | 13 типов, до 16 экземпляров в цепочке и 4 копии одного типа |
 | пресетов | 7 фабричных (`.orogenpreset` — JSON, свой формат) |
 | задержка | сухая задержка ROBIN 1024 сэмпла даже при OFF; при Spectre/прошивочном Chorus может быть больше |
 | лицензия | DSP: GPL-3.0; JUCE 8: AGPL-3.0 или коммерческая; условия — в LICENSE, NOTICE.md и licenses/ |
+
+Wavetable: выберите слот и ENGINE → Wavetable; кнопки WAV WT / RESYNTH
+импортируют готовый WAV или ресинтезируют запись. Granular: выберите
+ENGINE → Granular, затем LOAD SAMPLE для WAV/AIFF/FLAC; ROOT задаёт исходную
+ноту, по умолчанию C4. Реализован drag-and-drop; Windows-реализация здесь
+не проверялась. Сэмплы и таблицы встраиваются в состояние и пресеты.
 
 На главном экране нажмите FX RACK или X. Выберите тип и нажмите + ADD;
 UP / DOWN меняют порядок обработки, REMOVE удаляет строку, ON/OFF включает

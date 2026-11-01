@@ -40,6 +40,8 @@ inline juce::var slotToVar (const SlotPatch& s)
     o->setProperty ("grainReverse", s.params.grainReverse);
     o->setProperty ("table", s.params.table);
     o->setProperty ("wtUser", s.params.wtUser);
+    o->setProperty ("grainUser", s.params.grainUser);
+    o->setProperty ("grainRoot", s.params.grainRootNote);
     o->setProperty ("fmAlgorithm", s.params.fmAlgorithm);
     o->setProperty ("fmRatioC", s.params.fmRatioC);
     o->setProperty ("fmRatioB1", s.params.fmRatioB1);
@@ -73,6 +75,8 @@ inline void slotFromVar (const juce::var& v, SlotPatch& s)
     s.params.grainReverse = f ("grainReverse", 0.0f);
     s.params.table  = (int) o->getProperty ("table");
     s.params.wtUser = o->hasProperty ("wtUser") && (bool) o->getProperty ("wtUser");
+    s.params.grainUser = o->hasProperty ("grainUser") && (bool) o->getProperty ("grainUser");
+    s.params.grainRootNote = o->hasProperty ("grainRoot") ? juce::jlimit (0, 127, (int) o->getProperty ("grainRoot")) : 60;
     s.params.fmAlgorithm = o->hasProperty ("fmAlgorithm") ? (int) o->getProperty ("fmAlgorithm") : 0;
     s.params.fmRatioC = f ("fmRatioC", 1.0f);
     s.params.fmRatioB1 = f ("fmRatioB1", 1.0f);

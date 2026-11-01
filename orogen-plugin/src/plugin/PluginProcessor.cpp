@@ -2,6 +2,7 @@
 #include "PluginEditor.h"
 #include "UiParamMap.h"
 #include "WavetableFile.h"
+#include "GranularFile.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -141,6 +142,8 @@ void OrogenProcessor::cachePointers()
         r.filter = apvts.getRawParameterValue (pre + "filter");
         r.grainReverse = apvts.getRawParameterValue (pre + "grainReverse");
         r.wtUser = apvts.getRawParameterValue (pre + "wtUser");
+        r.grainUser = apvts.getRawParameterValue (pre + "grainUser");
+        r.grainRoot = apvts.getRawParameterValue (pre + "grainRoot");
         const char* fmNames[5] = { "fmAlgorithm", "fmRatioC", "fmRatioB1", "fmRatioB2", "fmMix" };
         for (int k = 0; k < 5; ++k) r.fm[(size_t) k] = apvts.getRawParameterValue (pre + fmNames[k]);
         r.f.clear();
@@ -224,7 +227,7 @@ void OrogenProcessor::cachePointers()
     for (int i = 0; i < kNumSlots; ++i)
     {
         const auto& r = slotRefs[(size_t) i];
-        if (r.type == nullptr || r.on == nullptr || r.filter == nullptr || r.grainReverse == nullptr || r.wtUser == nullptr)
+        if (r.type == nullptr || r.on == nullptr || r.filter == nullptr || r.grainReverse == nullptr || r.wtUser == nullptr || r.grainUser == nullptr || r.grainRoot == nullptr)
             std::fprintf (stderr, "OROGEN: не найден параметр слота %d\n", i);
         for (size_t k = 0; k < r.f.size(); ++k)
             if (r.f[k] == nullptr)
@@ -259,6 +262,8 @@ std::uint64_t OrogenProcessor::hashParams() const noexcept
         if (r.filter) mix (r.filter->load());
         if (r.grainReverse) mix (r.grainReverse->load());
         if (r.wtUser) mix (r.wtUser->load());
+        if (r.grainUser) mix (r.grainUser->load());
+        if (r.grainRoot) mix (r.grainRoot->load());
         for (auto* f : r.fm) if (f) mix (f->load());
         for (auto* f : r.f) if (f) mix (f->load());
     }
@@ -398,6 +403,8 @@ void OrogenProcessor::collectPatch (Patch& p, FxChain::Settings& fx) const noexc
         sp.params.detune     = r.f[(size_t) kDetune]->load();
         sp.params.grainReverse = r.grainReverse->load();
         sp.params.wtUser = r.wtUser->load() > 0.5f;
+        sp.params.grainUser = r.grainUser->load() > 0.5f;
+        sp.params.grainRootNote = (int) std::lround (r.grainRoot->load());
         sp.params.fmAlgorithm = (int) std::lround (r.fm[0]->load());
         sp.params.fmRatioC = r.fm[1]->load();
         sp.params.fmRatioB1 = r.fm[2]->load();
@@ -587,6 +594,8 @@ void OrogenProcessor::applyToParams (const Patch& p, const FxChain::Settings& fx
             set (pre + "p" + juce::String (k), sp.params.p[k]);
         set (pre + "table", (float) sp.params.table);
         set (pre + "wtUser", sp.params.wtUser ? 1.0f : 0.0f);
+        set (pre + "grainUser", sp.params.grainUser ? 1.0f : 0.0f);
+        set (pre + "grainRoot", (float) sp.params.grainRootNote);
         set (pre + "fmAlgorithm", (float) sp.params.fmAlgorithm);
         set (pre + "fmRatioC", sp.params.fmRatioC);
         set (pre + "fmRatioB1", sp.params.fmRatioB1);
@@ -951,6 +960,19 @@ void OrogenProcessor::installUserWavetable (int slot, std::shared_ptr<const User
     }
 }
 
+void OrogenProcessor::installUserSample (int slot, std::shared_ptr<const UserSample> sample)
+{
+    if (slot < 0 || slot >= kNumSlots || ! sample) return;
+    Patch current; FxChain::Settings fx;
+    collectPatch (current, fx);
+    inst.stageUserSample (slot, std::move (sample), current);
+    sampleRevision.fetch_add (1, std::memory_order_release);
+    if (auto* p = apvts.getParameter (slotPrefix (slot) + "grainUser"))
+    {
+        p->beginChangeGesture(); p->setValueNotifyingHost (1.0f); p->endChangeGesture();
+    }
+}
+
 // ---------- программы и состояние ------------------------------------------
 
 juce::StringArray OrogenProcessor::presetNames() const
@@ -971,8 +993,10 @@ void OrogenProcessor::loadPreset (int index)
     applyToParams (patch, fxSettings);
     restoreRack (presets[(size_t) index].rack);
     inst.stageUserWavetables (presets[(size_t) index].tables, patch);
+    inst.stageUserSamples (presets[(size_t) index].samples, patch);
     inst.stagePatch (patch);
     wtRevision.fetch_add (1, std::memory_order_release);
+    sampleRevision.fetch_add (1, std::memory_order_release);
     // FX are applied from the APVTS snapshot by the audio thread.
     stagedTypeHash = slotTypeHash();
     if (auto* ed = getActiveEditor()) ed->repaint();
@@ -1000,13 +1024,17 @@ bool OrogenProcessor::loadPresetFile (const juce::File& f)
     if (! presetFromVar (parsed, p, fx, name)) return false;
     Instrument::UserTables tables;
     if (! userWavetablesFromVar (parsed.getProperty ("wavetables", {}), tables)) return false;
+    Instrument::UserSamples samples;
+    if (! userSamplesFromVar (parsed.getProperty ("samples", {}), samples)) return false;
 
     patch = p;
     fxSettings = fx;
     applyToParams (patch, fxSettings);
     restoreRack (parsed.getProperty ("rack", {}));
     inst.stageUserWavetables (tables, patch);
+    inst.stageUserSamples (samples, patch);
     wtRevision.fetch_add (1, std::memory_order_release);
+    sampleRevision.fetch_add (1, std::memory_order_release);
     inst.stagePatch (patch);            // движки построит message thread
     // FX are applied from the APVTS snapshot by the audio thread.
     stagedTypeHash = slotTypeHash();
@@ -1024,6 +1052,7 @@ bool OrogenProcessor::savePresetFile (const juce::File& f, const juce::String& n
     {
         obj->setProperty ("rack", captureRack());
         obj->setProperty ("wavetables", userWavetablesToVar (inst.getUserWavetables()));
+        obj->setProperty ("samples", userSamplesToVar (inst.getUserSamples()));
     }
     const auto json = juce::JSON::toString (preset, false);
     return f.replaceWithText (json);
@@ -1043,6 +1072,7 @@ juce::var OrogenProcessor::bankToVar() const
         {
             obj->setProperty ("rack", pr.rack);
             obj->setProperty ("wavetables", userWavetablesToVar (pr.tables));
+            obj->setProperty ("samples", userSamplesToVar (pr.samples));
         }
         list.add (preset);
     }
@@ -1078,8 +1108,10 @@ bool OrogenProcessor::loadBankFile (const juce::File& f)
             if (! presetFromVar (item, p, fx, name)) return false;
             Instrument::UserTables tables;
             if (! userWavetablesFromVar (item.getProperty ("wavetables", {}), tables)) return false;
+            Instrument::UserSamples samples;
+            if (! userSamplesFromVar (item.getProperty ("samples", {}), samples)) return false;
             if (name.isEmpty()) name = "Program " + juce::String ((int) loaded.size() + 1);
-            loaded.push_back ({ name, p, fx, item.getProperty ("rack", {}), std::move (tables) });
+            loaded.push_back ({ name, p, fx, item.getProperty ("rack", {}), std::move (tables), std::move (samples) });
         }
 
         presets = std::move (loaded);
@@ -1095,8 +1127,10 @@ bool OrogenProcessor::loadBankFile (const juce::File& f)
     if (! presetFromVar (parsed, p, fx, name)) return false;
     Instrument::UserTables tables;
     if (! userWavetablesFromVar (parsed.getProperty ("wavetables", {}), tables)) return false;
+    Instrument::UserSamples samples;
+    if (! userSamplesFromVar (parsed.getProperty ("samples", {}), samples)) return false;
     presets.clear();
-    presets.push_back ({ name.isEmpty() ? juce::String ("Program 1") : name, p, fx, parsed.getProperty ("rack", {}), std::move (tables) });
+    presets.push_back ({ name.isEmpty() ? juce::String ("Program 1") : name, p, fx, parsed.getProperty ("rack", {}), std::move (tables), std::move (samples) });
     currentProgram = 0;
     loadPreset (0);
     return true;
@@ -1108,7 +1142,7 @@ int OrogenProcessor::addProgram (const juce::String& name)
     FxChain::Settings fx;
     collectPatch (p, fx);
     presets.push_back ({ name.isEmpty() ? juce::String ("Program ") + juce::String ((int) presets.size() + 1)
-                                         : name, p, fx, captureRack(), inst.getUserWavetables() });
+                                         : name, p, fx, captureRack(), inst.getUserWavetables(), inst.getUserSamples() });
     return (int) presets.size() - 1;
 }
 
@@ -1119,6 +1153,7 @@ void OrogenProcessor::getStateInformation (juce::MemoryBlock& dest)
     juce::ValueTree state = apvts.copyState();
     state.setProperty ("patchName", juce::String (patch.name), nullptr);
     state.setProperty ("wavetable_assets", juce::JSON::toString (userWavetablesToVar (inst.getUserWavetables()), true), nullptr);
+    state.setProperty ("granular_assets", juce::JSON::toString (userSamplesToVar (inst.getUserSamples()), true), nullptr);
     if (auto xml = state.createXml())
         copyXmlToBinary (*xml, dest);
 }
@@ -1137,6 +1172,16 @@ void OrogenProcessor::setStateInformation (const void* data, int sizeInBytes)
         if (dataText.length() > 24 * 1024 * 1024 || juce::JSON::parse (dataText, decoded).failed()
             || decoded.getArray() == nullptr || ! userWavetablesFromVar (decoded, tables)) return;
         state.removeProperty ("wavetable_assets", nullptr);
+    }
+
+    Instrument::UserSamples samples;
+    if (state.hasProperty ("granular_assets"))
+    {
+        const auto dataText = state.getProperty ("granular_assets").toString();
+        juce::var decoded;
+        if (dataText.length() > 64 * 1024 * 1024 || juce::JSON::parse (dataText, decoded).failed()
+            || decoded.getArray() == nullptr || ! userSamplesFromVar (decoded, samples)) return;
+        state.removeProperty ("granular_assets", nullptr);
     }
 
     // JUCE при replaceState сохраняет ТЕКУЩЕЕ значение отсутствующего
@@ -1160,6 +1205,8 @@ void OrogenProcessor::setStateInformation (const void* data, int sizeInBytes)
     {
         restoreMissingDefault (slotPrefix (s) + "grainReverse");
         restoreMissingDefault (slotPrefix (s) + "wtUser");
+        restoreMissingDefault (slotPrefix (s) + "grainUser");
+        restoreMissingDefault (slotPrefix (s) + "grainRoot");
         for (const char* suffix : { "fmAlgorithm", "fmRatioC", "fmRatioB1", "fmRatioB2", "fmMix" })
             restoreMissingDefault (slotPrefix (s) + suffix);
     }
@@ -1207,7 +1254,9 @@ void OrogenProcessor::setStateInformation (const void* data, int sizeInBytes)
     collectPatch (patch, fxSettings);
     patch.setName (state.getProperty ("patchName", "Untitled").toString().toRawUTF8());
     inst.stageUserWavetables (tables, patch);
+    inst.stageUserSamples (samples, patch);
     wtRevision.fetch_add (1, std::memory_order_release);
+    sampleRevision.fetch_add (1, std::memory_order_release);
     inst.stagePatch (patch);
     // FX are applied from the APVTS snapshot by the audio thread.
     stagedTypeHash = slotTypeHash();

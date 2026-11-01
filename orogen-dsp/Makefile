@@ -7,7 +7,7 @@ INC      := -Isrc
 MONOJUICE_OBJ := build/monojuice_chorus.o build/monojuice_adapter.o
 
 TEST_BINS := build/test_wavetable build/test_wavetable_safety build/test_wavetable_import build/test_wavetable_handoff build/test_fm build/test_fm_digitone build/test_material_follow build/test_harmonic build/test_sample \
-             build/test_granular build/test_granular_reverse build/test_granular_envelope build/test_granular_streams build/test_granular_randomness build/test_vocal_vibrato build/test_granular_vocal \
+             build/test_granular build/test_user_granular build/test_granular_reverse build/test_granular_envelope build/test_granular_streams build/test_granular_randomness build/test_vocal_vibrato build/test_granular_vocal \
              build/test_modal build/test_resynth build/test_organics \
              build/test_instrument build/test_engine_handoff build/test_meters build/test_fx build/test_fx_bypass build/test_fx_extra build/test_fx_monohuice build/test_fx_dynamic build/test_fx_rack_handoff build/test_chop
 DEMO_BINS := build/render_demo build/render_demo_sample build/render_demo_granular build/render_demo_modal \
@@ -75,6 +75,26 @@ build/test_modal: tests/test_modal.cpp tests/engine_suite.h src/engines/modal.h 
 build/test_granular: tests/test_granular.cpp tests/engine_suite.h src/engines/granular.h src/engines/engine.h src/engines/mip_reader.h src/engines/sinc_interp.h src/content/sample_bank.h src/engines/vibrato_phase.h src/engines/halfband.h src/core/*.h
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(INC) tests/test_granular.cpp -o $@
+
+build/test_user_granular: tests/test_user_granular.cpp src/instrument/*.h src/engines/*.h src/content/*.h src/core/*.h $(MONOJUICE_OBJ)
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) $(INC) -pthread $< $(MONOJUICE_OBJ) -o $@
+
+build/test_user_granular_asan: tests/test_user_granular.cpp src/instrument/*.h src/engines/*.h src/content/*.h src/core/*.h third_party/monojuice/dsp/*.cpp third_party/monojuice/dsp/*.h
+	@mkdir -p build
+	$(CXX) -O1 -g1 -std=c++17 -fsanitize=address,undefined -fno-omit-frame-pointer -pthread $(INC) $< third_party/monojuice/dsp/ChorusCore.cpp third_party/monojuice/dsp/AudioAdapter.cpp -o $@
+
+.PHONY: asan-user-granular
+asan-user-granular: build/test_user_granular_asan
+	ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 ./build/test_user_granular_asan
+
+build/test_user_granular_tsan: tests/test_user_granular.cpp src/instrument/*.h src/engines/*.h src/content/*.h src/core/*.h third_party/monojuice/dsp/*.cpp third_party/monojuice/dsp/*.h
+	@mkdir -p build
+	$(CXX) -O1 -g1 -std=c++17 -fsanitize=thread -fno-omit-frame-pointer -no-pie -pthread $(INC) $< third_party/monojuice/dsp/ChorusCore.cpp third_party/monojuice/dsp/AudioAdapter.cpp -o $@
+
+.PHONY: tsan-user-granular
+tsan-user-granular: build/test_user_granular_tsan
+	OROGEN_USER_HANDOFF_ONLY=1 TSAN_OPTIONS=halt_on_error=1 ./build/test_user_granular_tsan
 
 build/test_granular_reverse: tests/test_granular_reverse.cpp tests/engine_suite.h src/engines/granular.h src/engines/engine.h src/engines/mip_reader.h src/engines/sinc_interp.h src/content/sample_bank.h src/engines/vibrato_phase.h src/engines/halfband.h src/core/*.h
 	@mkdir -p build
@@ -300,6 +320,10 @@ build/render_granular_reverse: tools/render_granular_reverse.cpp src/engines/gra
 build/bench_granular_reverse: tools/bench_granular_reverse.cpp src/engines/granular.h src/engines/engine.h src/engines/mip_reader.h src/engines/sinc_interp.h src/content/sample_bank.h src/engines/vibrato_phase.h src/engines/halfband.h src/core/*.h
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(INC) tools/bench_granular_reverse.cpp -o $@
+
+build/bench_user_granular: tools/bench_user_granular.cpp src/engines/*.h src/content/*.h src/core/*.h
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) $(INC) $< -o $@
 
 build/render_granular_transient: tools/render_granular_transient.cpp src/engines/granular.h src/engines/engine.h src/engines/mip_reader.h src/engines/sinc_interp.h src/content/sample_bank.h src/engines/vibrato_phase.h src/engines/halfband.h src/core/*.h
 	@mkdir -p build

@@ -17,6 +17,7 @@
 #include "engine.h"
 #include "mip_reader.h"
 #include "../content/sample_bank.h"
+#include "../content/user_sample.h"
 
 namespace orogen {
 
@@ -28,6 +29,8 @@ public:
     static constexpr float kGainTrim  = 2.3f;    // калибровка под RMS 0.20 (замер в tests/test_granular.cpp)
 
     void setBank (const SampleBank* b) noexcept { bank = b; }
+    // Immutable ownership is prepared before publication, not touched in render.
+    void setUserSample (std::shared_ptr<const UserSample> s) noexcept { userSample = std::move (s); }
 
     const char* name() const override { return "Granular"; }
     float costFactor() const override { return 4.0f; }
@@ -90,16 +93,20 @@ public:
 
     void prepare (const EngineParams& p) override
     {
-        if (bank == nullptr || bank->shots.empty()) return;
-        const OneShot& s = bank->shots[(size_t) clamp (p.table, 0, (int) bank->shots.size() - 1)];
+        const bool useUser = p.grainUser && userSample != nullptr;
+        if (! useUser && (bank == nullptr || bank->shots.empty())) { shot = nullptr; return; }
+        const OneShot& s = useUser ? userSample->shot
+                                   : bank->shots[(size_t) clamp (p.table, 0, (int) bank->shots.size() - 1)];
         shot = &s;
 
         // Detune = до ±10 центов для конкретной ноты; при 0 звук и
         // планировщик идентичны прежнему коду. Новая высота назначается
         // только новым зёрнам: активные сохраняют свои безопасные MIP/границы.
         const double cents = 10.0 * (double) noteRandom * (double) clamp (p.detune, 0.0f, 1.0f);
-        baseRate = (float) std::pow (2.0, ((double) note - (double) s.rootNote
-                                          + (double) p.tuneSemis + cents / 100.0) / 12.0);
+        const int root = useUser ? clamp (p.grainRootNote, 0, 127) : s.rootNote;
+        const double sourceRateRatio = useUser ? userSample->sourceRate / sampleRate : 1.0;
+        baseRate = (float) (sourceRateRatio * std::pow (2.0, ((double) note - (double) root
+                                          + (double) p.tuneSemis + cents / 100.0) / 12.0));
         bodyRms = std::max (1.0e-4f, bodyLevel (s));
 
         // p[0] — позиция чтения по записи, p[1] — размер зерна, p[2] — плотность, p[3] — спред
@@ -339,6 +346,7 @@ private:
     }
 
     const SampleBank* bank = nullptr;
+    std::shared_ptr<const UserSample> userSample;
     const OneShot*    shot = nullptr;
     Grain grains[kMaxGrains];
 
