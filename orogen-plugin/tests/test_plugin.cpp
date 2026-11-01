@@ -2821,6 +2821,8 @@ static void testFxRackStateAndMap()
            "GLITCH LENGTH EXT: FOLLOW или действительные 1–500 мс с шагом 1 мс");
 }
 
+static void configureMaterialFollowTest (OrogenProcessor&, bool);
+
 // Run with the optional Linux/glibc LD_PRELOAD probe. It intercepts malloc,
 // calloc, realloc and aligned allocation in this calling thread, including C++
 // new; it intentionally does not count preparation on the FX worker.
@@ -2946,6 +2948,27 @@ static void testAudioCallbackAllocations()
     check (fmAlloc == 0 && fmBad == 0, "held-note FM algorithm changes: no callback allocations or nonfinite samples",
            "alloc=" + juce::String ((juce::int64) fmAlloc) + ", nonfinite=" + juce::String (fmBad));
     fm.releaseResources();
+
+    OrogenProcessor material; configureMaterialFollowTest (material, true);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil (100);
+    juce::MidiBuffer low, high, initial;
+    initial.addEvent (juce::MidiMessage::noteOn (1, 48, .8f), 0);
+    low.addEvent (juce::MidiMessage::noteOff (1, 60), 12);
+    low.addEvent (juce::MidiMessage::noteOn (1, 48, .8f), 24);
+    high.addEvent (juce::MidiMessage::noteOff (1, 48), 12);
+    high.addEvent (juce::MidiMessage::noteOn (1, 60, .8f), 24);
+    material.processBlock (wave, initial);
+    std::uint64_t materialAlloc = 0; int materialBad = 0;
+    for (int change = 0; change < 60; ++change)
+    {
+        start(); material.processBlock (wave, (change & 1) ? low : high); materialAlloc += stop();
+        for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < 128; ++i)
+            if (! std::isfinite (wave.getSample (ch, i))) ++materialBad;
+    }
+    check (materialAlloc == 0 && materialBad == 0,
+           "MIDI note changes with Material FOLLOW: no callback allocations or nonfinite samples",
+           "alloc=" + juce::String ((juce::int64) materialAlloc) + ", nonfinite=" + juce::String (materialBad));
+    material.releaseResources();
    #else
     check (false, "этот allocation probe рассчитан на Linux/glibc");
    #endif
@@ -3341,6 +3364,88 @@ static void testUserWavetableGui()
            "custom table remains isolated to its original slot");
 }
 
+static void configureMaterialFollowTest (OrogenProcessor& p, bool follow)
+{
+    p.setPlayConfigDetails (0, 2, 48000, 128); p.prepareToPlay (48000, 128);
+    soloSlot (p, 0, (int) EngineType::Wavetable);
+    setP (p, "sA_detune", 0.0f); setP (p, "sA_attack", .001f); setP (p, "sA_sustain", 1.0f);
+    for (int module = 0; module < FxChain::ModuleCount; ++module)
+        setP (p, kFxModules[module].onId, 0.0f);
+    setP (p, "fx_materialOn", 1.0f); setP (p, "fx_materialMix", .8f);
+    setP (p, "fx_materialMode", 0.0f); setP (p, "fx_materialExcite", .8f);
+    setP (p, "fx_materialTone", .5f); setP (p, "fx_materialSize", .2f);
+    setP (p, "fx_materialDamp", .15f); setP (p, "fx_materialFeedback", .7f);
+    setP (p, "fx_materialFollow", follow ? 1.0f : 0.0f);
+}
+
+static void testMaterialMidiProcessor()
+{
+    std::printf ("\n--- Material FOLLOW through AudioProcessor and dynamic rack ---\n");
+    OrogenProcessor follow, legacy;
+    configureMaterialFollowTest (follow, true); configureMaterialFollowTest (legacy, false);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil (120);
+    juce::AudioBuffer<float> a (2, 128), b (2, 128);
+    juce::MidiBuffer note, empty;
+    note.addEvent (juce::MidiMessage::noteOn (1, 48, .8f), 37);
+    double delta = 0.0, reference = 0.0; int invalid = 0;
+    for (int block = 0; block < 300; ++block)
+    {
+        follow.processBlock (a, block == 0 ? note : empty);
+        legacy.processBlock (b, block == 0 ? note : empty);
+        for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < 128; ++i)
+        {
+            const double x = a.getSample (ch, i), y = b.getSample (ch, i);
+            if (! std::isfinite (x) || ! std::isfinite (y)) ++invalid;
+            if (block >= 32) { delta += (x - y) * (x - y); reference += y * y; }
+        }
+    }
+    delta = std::sqrt (delta / (268.0 * 256.0));
+    reference = std::sqrt (reference / (268.0 * 256.0));
+    check (invalid == 0 && delta > 1e-4 && reference > 1e-4 && follow.engine().materialFollowNote() == 48,
+           "MIDI C3 changes real AudioProcessor audio with Material FOLLOW on",
+           "delta RMS " + num (delta, 9) + ", reference " + num (reference, 6));
+
+    // The note is already held when each worker prepares a new Material copy.
+    unsigned generation = follow.engine().fxCopyGeneration(); int ready = 0;
+    for (int copy = 1; copy < 4; ++copy)
+    {
+        const int node = follow.addRackEffect (FxChain::Material);
+        for (int wait = 0; wait < 400 && follow.engine().fxCopyGeneration() == generation; ++wait)
+            juce::Thread::sleep (5);
+        const auto next = follow.engine().fxCopyGeneration();
+        if (node != FxChain::Material + copy * FxChain::ModuleCount || next <= generation) break;
+        generation = next; ++ready;
+        for (int block = 0; block < 8; ++block) follow.processBlock (a, empty);
+    }
+    auto targets = [&] (int midiNote) {
+        int n = 0; const auto hz = midiToHz ((double) midiNote);
+        for (int copy = 0; copy < 4; ++copy)
+            if (std::abs (follow.engine().materialFollowTargetHz (copy) - hz) < 1.0e-8) ++n;
+        return n;
+    };
+    const int held = targets (48);
+    juce::MidiBuffer onHigh, offHigh, offLow;
+    onHigh.addEvent (juce::MidiMessage::noteOn (1, 60, .8f), 47);
+    offHigh.addEvent (juce::MidiMessage::noteOff (1, 60), 59);
+    offLow.addEvent (juce::MidiMessage::noteOff (1, 48), 63);
+    follow.processBlock (a, onHigh); const int high = targets (60);
+    follow.processBlock (a, offHigh); const int fallback = targets (48);
+    follow.processBlock (a, offLow); const int tail = targets (48);
+    check (ready == 3 && held == 4 && high == 4 && fallback == 4 && tail == 4,
+           "real MIDI and note-off fallback reach all four independently staged Material copies",
+           "ready " + juce::String (ready) + ", held/high/fallback/tail " + juce::String (held)
+           + "/" + juce::String (high) + "/" + juce::String (fallback) + "/" + juce::String (tail));
+
+    juce::MemoryBlock saved; follow.getStateInformation (saved);
+    OrogenProcessor restored; restored.setStateInformation (saved.getData(), (int) saved.getSize());
+    int follows = 0;
+    for (int copy = 0; copy < 4; ++copy)
+        if (auto* p = restored.apvts.getRawParameterValue (fxCopyId ("fx_materialFollow", copy)))
+            if (p->load() > .5f) ++follows;
+    check (follows == 4 && restored.rackOrder().size() == follow.rackOrder().size(),
+           "FOLLOW and the four Material nodes survive DAW state", juce::String (follows) + "/4");
+}
+
 static void testFmAlgorithmsPlugin()
 {
     std::printf ("\n--- FM algorithms: GUI, state, compatibility and audio ---\n");
@@ -3568,6 +3673,13 @@ int main (int argc, char** argv)
     auto* mm = juce::MessageManager::getInstance();
     std::printf ("OROGEN test_plugin: старт\n");
     juce::ignoreUnused (mm);
+    if (argc > 1 && juce::String (argv[1]) == "--material-follow-only")
+    {
+        testMaterialMidiProcessor();
+        juce::DeletedAtShutdown::deleteAll();
+        juce::MessageManager::deleteInstance();
+        return failures == 0 ? 0 : 1;
+    }
     if (argc > 1 && juce::String (argv[1]) == "--fm-algorithms-only")
     {
         testFmAlgorithmsPlugin();
@@ -6019,6 +6131,7 @@ int main (int argc, char** argv)
     testUserWavetablePlugin();
     testUserWavetableGui();
     testFmAlgorithmsPlugin();
+    testMaterialMidiProcessor();
     juce::DeletedAtShutdown::deleteAll();
     juce::MessageManager::deleteInstance();
 

@@ -903,6 +903,7 @@ class OrogenEditor::FxPage : public juce::Component, private juce::Timer
             if (logicalId == "fx_glitchFeedback") label = "FEEDBACK";
             if (logicalId == "fx_spectreWindow") label = "WINDOW / SAMPLES";
             if (logicalId == "fx_spectreWindowExt") label = "WINDOW EXT / SAMPLES";
+            if (logicalId == "fx_materialFollow") label = "MIDI FOLLOW";
             // Drop redundant group names to leave more room for meaningful text.
             if (label.startsWithIgnoreCase (group + " ")) label = label.substring (group.length() + 1);
             label = label.toUpperCase();
@@ -914,6 +915,7 @@ class OrogenEditor::FxPage : public juce::Component, private juce::Timer
             if (logicalId == "fx_spectreWindowExt") tip += " / 512 to 65536 samples";
             if (logicalId == "fx_chorusMode") tip += " / Legacy preserves old OROGEN; V1 internal mix; V2 external mix";
             if (logicalId == "fx_glitchTimingMode") tip += " / Host rate is correct; Legacy preserves old OROGEN timing";
+            if (logicalId == "fx_materialFollow") tip += " / Tracks the last played MIDI/ARP note; SIZE and TONE do not detune it";
             getProperties().set ("paramId", id);
             if (auto* choice = dynamic_cast<juce::AudioParameterChoice*> (param))
             {
@@ -2295,10 +2297,11 @@ void OrogenEditor::buildBottom()
 
     // 4 переключателя: реальные булевы параметры
     static const char* ids[4] = { "arpOn", "arpLatch", "fx_combNegative", "fx_materialFollow" };
-    static const char* names[4] = { "ARP", "LATCH", "COMB −", "FOLLOW" };
+    static const char* names[4] = { "ARP", "LATCH", "COMB −", "MAT MIDI" };
     for (int i = 0; i < 4; ++i)
     {
         auto* t = new juce::ToggleButton (names[i]);
+        if (i == 3) t->setTooltip ("Material #1: follow the last MIDI or arpeggiator note; SIZE and TONE do not change pitch");
         addAndMakeVisible (t);
         switchButtons.add (t);
         switchAtts.add (std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (

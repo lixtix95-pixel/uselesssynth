@@ -586,6 +586,28 @@ public:
 
     unsigned getCopyGeneration() const noexcept { return copyGeneration.load (std::memory_order_acquire); }
 
+    // Audio thread only: the rack is a shared post-voice bus. All prepared
+    // Material instances follow the same last sounding MIDI note, whether or
+    // not they are currently present in the active layout.
+    void setMaterialMidiPitchHz (double hz) noexcept
+    {
+        if (! std::isfinite (hz) || hz <= 0.0) return;
+        materialMidiHz = hz;
+        material.setMidiPitchHz (hz);
+        for (int copy = 1; copy < kCopiesPerModule; ++copy)
+            if (auto* instance = copies[(size_t) ((copy - 1) * ModuleCount + Material)].load (std::memory_order_acquire))
+                instance->material.setMidiPitchHz (hz);
+    }
+
+    // Diagnostics only: read on the audio thread or while audio is stopped.
+    double materialMidiTargetHz (int copy) const noexcept
+    {
+        if (copy == 0) return material.midiPitchTargetHz();
+        if (copy < 0 || copy >= kCopiesPerModule) return 0.0;
+        auto* instance = copies[(size_t) ((copy - 1) * ModuleCount + Material)].load (std::memory_order_acquire);
+        return instance != nullptr ? instance->material.midiPitchTargetHz() : 0.0;
+    }
+
     // Audio thread only. Pointer snapshots and fixed-size insertion sort mean
     // no allocation, deletion, locks or waiting in the callback. A change in
     // order or ready copies is faded out before the new graph is installed.
@@ -601,7 +623,11 @@ public:
             FxChain* instance = node < ModuleCount ? this
                 : copies[(size_t) (node - ModuleCount)].load (std::memory_order_acquire);
             if (instance != nullptr && instance != this)
+            {
                 instance->set (settings[(size_t) (node / ModuleCount)]);
+                // A copy may have been prepared after the last note-on.
+                if (node % ModuleCount == Material) instance->material.setMidiPitchHz (materialMidiHz);
+            }
             const Ranked candidate { rank, node, instance };
             int at = 0;
             while (at < count && (ordered[(size_t) at].rank < rank
@@ -1013,6 +1039,7 @@ private:
     WdfClipper wdf;
     DriveFx drive;
     MaterialFx material;
+    double materialMidiHz = 261.6255653006; // C4 before the first note
     SpectreFx spectre;
     SpectreClassicFx spectreClassic;
     GlitchFx glitch;

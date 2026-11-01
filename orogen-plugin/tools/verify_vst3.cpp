@@ -339,6 +339,151 @@ int main (int argc, char** argv)
         else check (false, "два VST3-инстанса для сравнения порядка", errorA + " / " + errorB);
     }
 
+    // New FM algorithm selection exercised through an actual VST3 host:
+    // switch 1 -> 8 on a held note and compare with an unchanged instance.
+    {
+        String errorA, errorB;
+        auto changed = format->createInstanceFromDescription (d, 48000.0, 128, errorA);
+        auto unchanged = format->createInstanceFromDescription (d, 48000.0, 128, errorB);
+        const auto find = [] (AudioPluginInstance& plugin, const String& name) -> AudioProcessorParameter* {
+            for (auto* parameter : plugin.getParameters()) if (parameter->getName (64) == name) return parameter;
+            return nullptr;
+        };
+        const auto set = [&] (AudioPluginInstance& plugin, const String& name, float value) {
+            if (auto* p = find (plugin, name)) { p->setValueNotifyingHost (value); return true; }
+            return false;
+        };
+        bool configured = changed != nullptr && unchanged != nullptr;
+        if (configured)
+        {
+            for (auto* plugin : { changed.get(), unchanged.get() })
+            {
+                for (int i = 0; i < 13; ++i) configured = set (*plugin, rackNames[i], 0.0f) && configured;
+                for (const char* name : { "sB_On", "sC_On", "sD_On", "sE_On", "sF_On", "sG_On", "sH_On" })
+                    configured = set (*plugin, name, 0.0f) && configured;
+                configured = set (*plugin, "sA_On", 1.0f) && configured;
+                configured = set (*plugin, "sA_Engine", 1.0f/8.0f) && configured;
+                configured = set (*plugin, "sA_FM Algorithm", 1.0f/8.0f) && configured;
+                configured = set (*plugin, "sA_Detune", 0.0f) && configured;
+                configured = set (*plugin, "sA_P1", .1f) && configured;
+                configured = set (*plugin, "sA_P2", .5f) && configured;
+                configured = set (*plugin, "sA_P3", .35f) && configured;
+                configured = set (*plugin, "sA_Attack", 0.0f) && configured;
+                configured = set (*plugin, "sA_Sustain", 1.0f) && configured;
+                configured = set (*plugin, "Patch Mode", 0.0f) && configured;
+                configured = set (*plugin, "Arp On", 0.0f) && configured;
+                plugin->prepareToPlay (48000.0, 128);
+            }
+            MessageManager::getInstance()->runDispatchLoopUntil (250);
+            AudioBuffer<float> x (2, 128), y (2, 128); MidiBuffer onA, onB, emptyA, emptyB;
+            onA.addEvent (MidiMessage::noteOn (1, 60, .8f), 0);
+            onB.addEvent (MidiMessage::noteOn (1, 60, .8f), 0);
+            double before = 0, after = 0, energy = 0; int invalid = 0;
+            for (int block = 0; block < 220; ++block)
+            {
+                if (block == 70) configured = set (*changed, "sA_FM Algorithm", 1.0f) && configured;
+                x.clear(); y.clear();
+                changed->processBlock (x, block == 0 ? onA : emptyA);
+                unchanged->processBlock (y, block == 0 ? onB : emptyB);
+                for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < 128; ++i)
+                {
+                    const double a = x.getSample (ch, i), b = y.getSample (ch, i), delta = a-b;
+                    if (! std::isfinite (a) || ! std::isfinite (b)) ++invalid;
+                    if (block >= 20 && block < 65) before += delta*delta;
+                    if (block >= 100) { after += delta*delta; energy += b*b; }
+                }
+            }
+            before = std::sqrt (before / (45.0 * 256.0));
+            after = std::sqrt (after / (120.0 * 256.0));
+            energy = std::sqrt (energy / (120.0 * 256.0));
+            check (configured && invalid == 0 && before < 1.0e-6 && after > 1.0e-4 && energy > 1.0e-4,
+                   "VST3: алгоритм FM меняет звук удержанной ноты",
+                   "до ΔRMS=" + String (before, 9) + ", после=" + String (after, 9));
+            MemoryBlock state; changed->getStateInformation (state);
+            set (*changed, "sA_FM Algorithm", 0.0f);
+            changed->setStateInformation (state.getData(), (int) state.getSize());
+            auto* algorithm = find (*changed, "sA_FM Algorithm");
+            check (state.getSize() > 0 && algorithm && algorithm->getValue() > .99f,
+                   "VST3 host state восстанавливает алгоритм FM");
+            changed->releaseResources(); unchanged->releaseResources();
+        }
+        else check (false, "два VST3-инстанса FM", errorA + " / " + errorB);
+    }
+
+    // Real VST3 instances, same audio/MIDI, with Material FOLLOW switched
+    // only by a host parameter. Pitch accuracy itself is measured separately
+    // from isolated resonator audio in test_material_follow.
+    {
+        String errorA, errorB;
+        auto tracked = format->createInstanceFromDescription (d, 48000.0, 128, errorA);
+        auto legacy = format->createInstanceFromDescription (d, 48000.0, 128, errorB);
+        const auto find = [] (AudioPluginInstance& plugin, const String& name) -> AudioProcessorParameter* {
+            for (auto* parameter : plugin.getParameters()) if (parameter->getName (64) == name) return parameter;
+            return nullptr;
+        };
+        const auto set = [&] (AudioPluginInstance& plugin, const String& name, float value) {
+            if (auto* p = find (plugin, name)) { p->setValueNotifyingHost (value); return true; }
+            return false;
+        };
+        bool configured = tracked != nullptr && legacy != nullptr;
+        if (configured)
+        {
+            for (auto* plugin : { tracked.get(), legacy.get() })
+            {
+                for (int i = 0; i < 13; ++i) configured = set (*plugin, rackNames[i], i == 7 ? 1.0f : 0.0f) && configured;
+                for (const char* name : { "sB_On", "sC_On", "sD_On", "sE_On", "sF_On", "sG_On", "sH_On" })
+                    configured = set (*plugin, name, 0.0f) && configured;
+                configured = set (*plugin, "sA_On", 1.0f) && configured;
+                configured = set (*plugin, "sA_Engine", 0.0f) && configured;
+                configured = set (*plugin, "sA_Detune", 0.0f) && configured;
+                configured = set (*plugin, "sA_Attack", 0.0f) && configured;
+                configured = set (*plugin, "sA_Sustain", 1.0f) && configured;
+                configured = set (*plugin, "Patch Mode", 0.0f) && configured;
+                configured = set (*plugin, "Arp On", 0.0f) && configured;
+                configured = set (*plugin, "Material Mix", .8f) && configured;
+                configured = set (*plugin, "Material Mode", 0.0f) && configured;
+                configured = set (*plugin, "Mat Excite", .8f) && configured;
+                configured = set (*plugin, "Mat Tone", .5f) && configured;
+                configured = set (*plugin, "Mat Size", .2f) && configured;
+                configured = set (*plugin, "Mat Damp", .15f) && configured;
+                configured = set (*plugin, "Mat Fb", .7f) && configured;
+            }
+            configured = set (*tracked, "Material Follow", 1.0f) && configured;
+            configured = set (*legacy, "Material Follow", 0.0f) && configured;
+            tracked->prepareToPlay (48000.0, 128); legacy->prepareToPlay (48000.0, 128);
+            MessageManager::getInstance()->runDispatchLoopUntil (250);
+            AudioBuffer<float> x (2, 128), y (2, 128); MidiBuffer onA, onB, emptyA, emptyB;
+            onA.addEvent (MidiMessage::noteOn (1, 48, .8f), 37);
+            onB.addEvent (MidiMessage::noteOn (1, 48, .8f), 37);
+            double difference = 0.0, energy = 0.0; int invalid = 0;
+            for (int block = 0; block < 300; ++block)
+            {
+                x.clear(); y.clear();
+                tracked->processBlock (x, block == 0 ? onA : emptyA);
+                legacy->processBlock (y, block == 0 ? onB : emptyB);
+                for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < 128; ++i)
+                {
+                    const double a = x.getSample (ch, i), b = y.getSample (ch, i);
+                    if (! std::isfinite (a) || ! std::isfinite (b)) ++invalid;
+                    if (block >= 32) { difference += (a-b)*(a-b); energy += b*b; }
+                }
+            }
+            const double rms = std::sqrt (difference / (268.0 * 256.0));
+            const double ref = std::sqrt (energy / (268.0 * 256.0));
+            check (configured && invalid == 0 && rms > .0001 && ref > .0001,
+                   "VST3: Material FOLLOW и MIDI C3 меняют реальный аудиотракт",
+                   "delta RMS=" + String (rms, 9) + ", ref=" + String (ref, 6));
+            MemoryBlock saved; tracked->getStateInformation (saved);
+            set (*tracked, "Material Follow", 0.0f);
+            tracked->setStateInformation (saved.getData(), (int) saved.getSize());
+            auto* follow = find (*tracked, "Material Follow");
+            check (saved.getSize() > 0 && follow && follow->getValue() > .5f,
+                   "VST3 host state восстанавливает Material FOLLOW");
+            tracked->releaseResources(); legacy->releaseResources();
+        }
+        else check (false, "два VST3-инстанса Material FOLLOW", errorA + " / " + errorB);
+    }
+
     // The host must receive changes in algorithmic latency, including an
     // OFF duplicate ROBIN and the return to the fixed 1024-sample dry path.
     {

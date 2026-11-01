@@ -45,6 +45,8 @@ public:
         fx.prepare (sr);
         fx.set (fxSettings);
         arpeggiator.prepare (sr);
+        materialHeld.fill (0); materialSerial = 0; materialLastNote = 60;
+        fx.setMaterialMidiPitchHz (midiToHz (60));
         lastNote = 60;
         sampleCounter = 0;
         resetStats();
@@ -59,6 +61,7 @@ public:
         for (auto& v : voices) v.setSampleRate (sr);
         fx.prepare (sr);
         fx.set (fxSettings);
+        fx.setMaterialMidiPitchHz (midiToHz ((double) materialLastNote));
         arpeggiator.prepare (sr);
         resetMetering (sr);
     }
@@ -181,8 +184,23 @@ public:
     // Инструмент остаётся прежним: арпеджиатор стоит до голосов.
     Arpeggiator& arp() { return arpeggiator; }
     const Arpeggiator& arp() const { return arpeggiator; }
-    void setArp (const ArpSettings& s) { arpeggiator.setSettings (s); }
+    void setArp (const ArpSettings& s)
+    {
+        if (arpeggiator.getSettings().on != s.on)
+        {
+            // Switching the event source must not leave the previous source's
+            // notes in the Material stack (or leave those voices stuck).
+            for (auto& v : voices) if (v.isActive() && ! v.isReleased()) v.noteOff();
+            materialHeld.fill (0);
+        }
+        arpeggiator.setSettings (s);
+    }
     void setTempo (double bpm) { arpeggiator.setBpm (bpm); fx.setTempo (bpm); }
+
+    // Read on the audio thread or while audio is stopped. The shared FX bus
+    // is monophonic: last sounding note wins; it retains pitch for tails.
+    int materialFollowNote() const noexcept { return materialLastNote; }
+    double materialFollowTargetHz (int copy = 0) const noexcept { return fx.materialMidiTargetHz (copy); }
 
     void noteOn (int note, float velocity)
     {
@@ -224,6 +242,12 @@ private:
         if (! slot) return;
 
         slot->start (patch, note, velocity, (float) lastNote, (uint32_t) (notesStarted + 1));
+        if (note >= 0 && note < 128)
+        {
+            materialHeld[(size_t) note] = ++materialSerial;
+            materialLastNote = note;
+            fx.setMaterialMidiPitchHz (midiToHz ((double) note));
+        }
         lastNote = note;
         ++notesStarted;
     }
@@ -232,17 +256,37 @@ private:
     {
         for (auto& v : voices)
             if (v.isActive() && ! v.isReleased() && v.note() == note) v.noteOff();
+        if (note < 0 || note >= 128 || materialHeld[(size_t) note] == 0) return;
+        materialHeld[(size_t) note] = 0;
+        std::uint64_t newest = 0;
+        int fallback = -1;
+        for (int n = 0; n < 128; ++n)
+            if (materialHeld[(size_t) n] > newest)
+            {
+                newest = materialHeld[(size_t) n];
+                fallback = n;
+            }
+        if (fallback >= 0)
+        {
+            materialLastNote = fallback;
+            fx.setMaterialMidiPitchHz (midiToHz ((double) fallback));
+        }
+        // No held notes: retain the last target for existing release/FX tails.
     }
 
 public:
     void allNotesOff()
     {
         for (auto& v : voices) if (v.isActive()) v.noteOff();
+        arpeggiator.allNotesOff();
+        materialHeld.fill (0);
     }
 
     void panic()
     {
         for (auto& v : voices) v.kill();
+        arpeggiator.allNotesOff();
+        materialHeld.fill (0);
     }
 
     // Один сэмпл стерео на выходе (после эффектов).
@@ -386,6 +430,9 @@ private:
     long long sampleCounter = 0;
     int numVoices = kMaxVoices;
     int lastNote = 60;
+    std::array<std::uint64_t, 128> materialHeld {};
+    std::uint64_t materialSerial = 0;
+    int materialLastNote = 60;
     float masterGain = 0.8f;
 
     int activeVoices = 0, peakActiveVoices = 0, stolenVoices = 0, notesStarted = 0;
