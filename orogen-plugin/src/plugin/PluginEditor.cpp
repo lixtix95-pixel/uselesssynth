@@ -840,15 +840,41 @@ class OrogenEditor::FxPage : public juce::Component, private juce::Timer
     class SelectButton : public juce::Button
     {
     public:
-        SelectButton (int n, const juce::String& title) : juce::Button (title), number (n) {}
+        SelectButton (int n, const juce::String& title) : juce::Button (title), nodeId (n), position (n) {}
         void setSelected (bool b) { selected = b; repaint(); }
-        void setPosition (int n) { number = n; repaint(); }
+        void setPosition (int n) { position = n; repaint(); }
+        void setDropTarget (bool b) { if (dropTarget != b) { dropTarget = b; repaint(); } }
+        std::function<void (int, juce::Point<int>)> onDragTo;
+        std::function<void (int)> onDragEnd;
+
+        void mouseDown (const juce::MouseEvent& e) override
+        {
+            dragging = false;
+            juce::Button::mouseDown (e);
+        }
+        void mouseDrag (const juce::MouseEvent& e) override
+        {
+            juce::Button::mouseDrag (e);
+            if (! dragging && e.getDistanceFromDragStart() >= 5)
+            {
+                dragging = true;
+                repaint();
+            }
+            if (dragging && onDragTo) onDragTo (nodeId, e.getScreenPosition());
+        }
+        void mouseUp (const juce::MouseEvent& e) override
+        {
+            juce::Button::mouseUp (e);
+            if (dragging && onDragEnd) onDragEnd (nodeId);
+            dragging = false;
+            repaint();
+        }
         void paintButton (juce::Graphics& g, bool over, bool down) override
         {
             auto box = getLocalBounds().toFloat().reduced (0.5f);
-            draw::panel (g, box, 3.0f, selected ? juce::Colour (0xff1b1b1b)
-                                                : over || down ? Palette::panelAlt : Palette::panel,
-                         selected ? Palette::lineHi : Palette::line);
+            const auto outline = dropTarget || dragging || selected ? Palette::lineHi : Palette::line;
+            draw::panel (g, box, 3.0f, selected || dragging ? juce::Colour (0xff1b1b1b)
+                                                : over || down ? Palette::panelAlt : Palette::panel, outline);
             const float scale = juce::jlimit (0.70f, 2.0f, box.getHeight() / 39.0f);
             if (selected)
             {
@@ -856,10 +882,20 @@ class OrogenEditor::FxPage : public juce::Component, private juce::Timer
                 g.fillRoundedRectangle (box.getX() + 1.0f, box.getY() + 7.0f * scale,
                                         2.0f * scale, box.getHeight() - 14.0f * scale, 1.0f);
             }
+            // Three small grip bars make the row's drag affordance visible
+            // without stealing the number or effect name.
+            g.setColour (dragging || over ? Palette::text : Palette::textDim);
+            const float gripX = box.getX() + 4.0f * scale;
+            const float gripW = juce::jmax (4.0f, 5.0f * scale);
+            const float gripH = juce::jmax (1.75f, 2.0f * scale);
+            const float gripGap = juce::jmax (4.5f, 6.0f * scale);
+            for (int i = -1; i <= 1; ++i)
+                g.fillRoundedRectangle (gripX, box.getCentreY() + i * gripGap - gripH * 0.5f,
+                                        gripW, gripH, 0.8f);
             g.setColour (Palette::textFaint);
             g.setFont (orFont (10.0f * scale));
-            g.drawText (juce::String (number + 1).paddedLeft ('0', 2),
-                        juce::Rectangle<float> (box.getX() + 10 * scale, box.getY(), 23 * scale, box.getHeight()),
+            g.drawText (juce::String (position + 1).paddedLeft ('0', 2),
+                        juce::Rectangle<float> (box.getX() + 14 * scale, box.getY(), 18 * scale, box.getHeight()),
                         juce::Justification::centredLeft, false);
             g.setColour (selected ? Palette::text : Palette::paramLabel);
             g.setFont (orFont (12.0f * scale, selected));
@@ -867,10 +903,17 @@ class OrogenEditor::FxPage : public juce::Component, private juce::Timer
                         juce::Rectangle<float> (box.getX() + 34 * scale, box.getY(),
                                                 box.getWidth() - 42 * scale, box.getHeight()),
                         juce::Justification::centredLeft, false);
+            if (dropTarget)
+            {
+                g.setColour (Palette::text);
+                g.fillRect (box.getX() + 5.0f * scale, box.getBottom() - 1.5f * scale,
+                            box.getWidth() - 10.0f * scale, 1.0f * scale);
+            }
         }
     private:
-        int number;
-        bool selected = false;
+        const int nodeId;
+        int position;
+        bool selected = false, dragging = false, dropTarget = false;
     };
 
     class Control : public juce::Component
@@ -1142,7 +1185,7 @@ class OrogenEditor::FxPage : public juce::Component, private juce::Timer
                             w - juce::roundToInt (32*s), juce::roundToInt (18*s), juce::Justification::centredLeft, false);
                 g.setColour (Palette::textDim);
                 g.setFont (orFont (11.0f * s));
-                g.drawFittedText ("1  Choose an effect and click ADD    2  Select it to edit    3  Use UP / DOWN to change the signal order",
+                g.drawFittedText ("1  Choose a type and click ADD    2  Select to edit    3  Drag a row to reorder (or use UP / DOWN)",
                                   juce::Rectangle<int> (x + juce::roundToInt (16*s), y + juce::roundToInt (36*s),
                                                         w - juce::roundToInt (32*s), juce::roundToInt (37*s)),
                                   juce::Justification::centredLeft, 2);
@@ -1226,7 +1269,9 @@ public:
             const auto title = juce::String (kFxModules[module].name) + " #" + juce::String (copy + 1);
             auto* button = new SelectButton (node, title);
             button->onClick = [this, node] { setSelected (node); };
-            button->setTooltip ("Select " + title + " to edit its independent controls");
+            button->onDragTo = [this] (int source, juce::Point<int> screenPoint) { dragRackTo (source, screenPoint); };
+            button->onDragEnd = [this] (int) { dragHighlightNode = -1; refreshDropTarget(); repaint(); };
+            button->setTooltip ("Click to select; drag the grip to reorder in the signal chain");
             button->getProperties().set ("fxSelect", node);
             selectButtons.add (button); addChildComponent (button);
             auto* power = new PowerButton (title + " power");
@@ -1264,6 +1309,30 @@ public:
     void timerCallback() override
     {
         if (isShowing() && proc.rackOrder() != order) refreshOrder();
+    }
+    void refreshDropTarget()
+    {
+        for (int node = 0; node < selectButtons.size(); ++node)
+            selectButtons[node]->setDropTarget (node == dragHighlightNode);
+    }
+    void dragRackTo (int node, juce::Point<int> screenPoint)
+    {
+        const auto source = std::find (order.begin(), order.end(), node);
+        if (source == order.end() || order.empty()) return;
+        const float scale = (float) getWidth() / OrogenEditor::kDesignW;
+        const int localY = getLocalPoint (nullptr, screenPoint).y;
+        const float designY = (float) localY / juce::jmax (0.01f, scale);
+        const int targetIndex = juce::jlimit (0, (int) order.size() - 1,
+                                              juce::roundToInt ((designY - 178.0f) / 31.0f));
+        dragHighlightNode = node;
+        const int from = (int) std::distance (order.begin(), source);
+        if (targetIndex != from && proc.moveRackNode (node, targetIndex - from))
+        {
+            status = "MOVED TO POSITION " + juce::String (targetIndex + 1).paddedLeft ('0', 2);
+            refreshOrder();
+        }
+        refreshDropTarget();
+        repaint();
     }
     void setSelected (int node)
     {
@@ -1361,7 +1430,7 @@ public:
         g.setColour (Palette::textFaint); g.setFont (orFont (10.5f));
         g.drawText ("TOP TO BOTTOM = AUDIO ORDER  /  OUTPUT SAFETY + ROBIN DRY LATENCY ACTIVE",
                     25, 764, 720, 19, juce::Justification::centredLeft, false);
-        g.drawText ("ADD  /  SELECT  /  MOVE UP OR DOWN  /  REMOVE",
+        g.drawText ("ADD  /  SELECT  /  DRAG TO REORDER  /  REMOVE",
                     729, 764, 525, 19, juce::Justification::centredRight, false);
     }
     bool keyPressed (const juce::KeyPress& key) override
@@ -1373,6 +1442,7 @@ private:
     OrogenProcessor& proc;
     RackLookAndFeel rackLookAndFeel;
     int selected = -1;
+    int dragHighlightNode = -1;
     juce::String status { "UP TO 16 EFFECTS / 4 OF EACH TYPE" };
     std::vector<UiTab> tabs;
     std::vector<int> order;

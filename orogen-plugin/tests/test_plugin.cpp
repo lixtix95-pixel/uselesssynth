@@ -3224,14 +3224,64 @@ static void testNativeFxRack (bool scrollOnly = false)
             if (down) click (down->getScreenBounds().getCentre());
             const auto movedDown = p.rackOrder();
             const bool downOk = movedDown.size() == 14 && movedDown[13] == clone;
+            const auto findRackRow = [&] (int wanted) -> juce::Button* {
+                std::function<juce::Button* (juce::Component&)> walk;
+                walk = [&] (juce::Component& parent) -> juce::Button* {
+                    for (auto* child : parent.getChildren()) {
+                        if (auto* b = dynamic_cast<juce::Button*> (child))
+                            if (child->getProperties().getWithDefault ("fxSelect", {}).toString().getIntValue() == wanted) return b;
+                        if (auto* found = walk (*child)) return found;
+                    }
+                    return nullptr;
+                };
+                return walk (*editor.fxOverlay());
+            };
+            juce::String dragTrace;
+            const auto dragRackTo = [&] (int node, int targetIndex) {
+                auto* row = findRackRow (node);
+                if (row == nullptr || targetIndex < 0 || targetIndex >= (int) p.rackOrder().size()) return false;
+                auto start = row->getScreenBounds().getCentre();
+                start.x = row->getScreenBounds().getX() + 6; // grip handle, not the effect label
+                const auto dest = editor.localPointToGlobal (juce::Point<int> (94, 178 + 31 * targetIndex));
+                move (display, -1, start.x, start.y, 0); flush(); mm->runDispatchLoopUntil (25);
+                button (display, 1, 1, 0); flush(); mm->runDispatchLoopUntil (30);
+                int bestPosition = (int) p.rackOrder().size();
+                const int steps = juce::jmax (5, std::abs (dest.y - start.y) / 18);
+                for (int step = 1; step <= steps; ++step) {
+                    const int y = start.y + (dest.y - start.y) * step / steps;
+                    move (display, -1, dest.x, y, 0); flush(); mm->runDispatchLoopUntil (15);
+                    const auto during = p.rackOrder();
+                    const auto current = std::find (during.begin(), during.end(), node);
+                    if (current != during.end()) bestPosition = juce::jmin (bestPosition, (int) std::distance (during.begin(), current));
+                }
+                button (display, 1, 0, 0); flush();
+                move (display, -1, dest.x + 1, dest.y, 0); flush(); mm->runDispatchLoopUntil (120);
+                const auto result = p.rackOrder();
+                const auto found = std::find (result.begin(), result.end(), node);
+                dragTrace += " node=" + juce::String (node) + " target=" + juce::String (targetIndex)
+                    + " start=" + juce::String (start.x) + "," + juce::String (start.y)
+                    + " dest=" + juce::String (dest.x) + "," + juce::String (dest.y)
+                    + " page=" + editor.fxOverlay()->getScreenBounds().toString()
+                    + " editor=" + editor.getScreenBounds().toString()
+                    + " best=" + juce::String (bestPosition)
+                    + " actual=" + juce::String (found == result.end() ? -1 : (int) std::distance (result.begin(), found));
+                return targetIndex < (int) result.size() && result[(size_t) targetIndex] == node;
+            };
+            const bool dragToTop = downOk && dragRackTo (clone, 0);
+            const bool dragBack = dragToTop && dragRackTo (clone, 13);
             auto* remove = findAction (*editor.fxOverlay(), "remove");
             if (remove) click (remove->getScreenBounds().getCentre());
             const auto removed = p.rackOrder();
             const bool removeOk = removed.size() == 13 && std::find (removed.begin(), removed.end(), clone) == removed.end();
-            check (addOk && independent && moveOk && downOk && removeOk,
-                   "XTEST: ADD, независимая ручка с host gesture, UP, DOWN, REMOVE",
-                   juce::String ((int) addOk) + "/" + juce::String ((int) independent) + "/"
-                   + juce::String ((int) moveOk) + "/" + juce::String ((int) downOk) + "/" + juce::String ((int) removeOk));
+            const bool rackUiOk = addOk && independent && moveOk && downOk && dragToTop && dragBack && removeOk;
+            const juce::String rackUiDetail = rackUiOk ? "all seven actions passed"
+                : juce::String ((int) addOk) + "/" + juce::String ((int) independent) + "/"
+                  + juce::String ((int) moveOk) + "/" + juce::String ((int) downOk) + "/"
+                  + juce::String ((int) dragToTop) + "/" + juce::String ((int) dragBack) + "/"
+                  + juce::String ((int) removeOk) + dragTrace;
+            check (rackUiOk,
+                   "XTEST: ADD, независимая ручка, UP/DOWN, drag reorder в начало/конец и REMOVE",
+                   rackUiDetail);
             editor.showPage (52); mm->runDispatchLoopUntil (150);
         }
         auto* slider = findSlider (*editor.fxOverlay(), "fx_chorusDelay");
