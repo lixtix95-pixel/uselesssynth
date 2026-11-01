@@ -83,6 +83,9 @@ public:
         const float levels[4] = { 0.0f, std::min (a * 8.0f, budget),
                                   std::min (b * 6.0f, budget), std::min (b * 6.0f, budget) };
         const float feedbackRadians = std::min (fb * 4.0f, budget);
+        // Keep the local self-PM loop slope below unity. Otherwise large
+        // feedback settings can period-double and create strong subharmonics.
+        const float feedbackScale = feedbackRadians > 0.6f ? 0.9f / feedbackRadians : 1.5f;
         const float carrierGain[4] = {1.0f, a, b, b};
         const auto countBits = [] (std::uint8_t m) noexcept {
             return (int) ((m & 1) != 0) + (int) ((m & 2) != 0) + (int) ((m & 4) != 0) + (int) ((m & 8) != 0);
@@ -99,7 +102,7 @@ public:
                 const auto mask = graph.mod[op];
                 for (int source = 0; source < 4; ++source)
                     if ((mask & (1u << source)) != 0) modulation += out[source] * levels[source];
-                if (op == graph.feedback) modulation += fastTanh (previousFeedback * 2.0f) * feedbackRadians;
+                if (op == graph.feedback) modulation += fastTanh (previousFeedback * feedbackScale) * feedbackRadians;
                 phase[(size_t) op] += inc[(size_t) op];
                 if (phase[(size_t) op] >= 1.0f) phase[(size_t) op] -= 1.0f;
                 float ph = phase[(size_t) op] + modulation * 0.1591549431f;
@@ -130,8 +133,8 @@ private:
     std::array<SmoothedValue, 4> ratio {};
     std::array<SmoothedValue, 2> depth {};
     SmoothedValue feedback, mix;
-    HalfbandDecimator2x<63> decimA;
-    HalfbandDecimator2x<127, 220> decimB;
+    HalfbandDecimator2x<31> decimA;
+    HalfbandDecimator2x<63, 220> decimB;
     float previousFeedback = 0.0f, dcX = 0.0f, dcY = 0.0f, dcCoef = 0.999f, gain = 0.55f;
     bool first = true;
 };

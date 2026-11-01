@@ -75,6 +75,26 @@ int main()
     std::printf("  worst nonharmonic energy: %.2f dB (32 cases, no feedback)\n",worst);
     check(worst < -55.0,"measured harmonic scenarios retain low alias energy");
 
+    double sweepWorst=-300.0;
+    int sweepWorstRate=0,sweepWorstNote=0,sweepWorstAlgorithm=0;
+    float sweepWorstFeedback=0.0f;
+    int sweepCases=0;
+    for(double sr:{22050.0,44100.0,48000.0,96000.0,192000.0})
+        for(int note:{36,48,60,72,84})
+            for(int alg=1;alg<=8;++alg)
+                for(float fb:{0.0f,0.15f,0.3f,0.6f,1.0f})
+                {
+                    auto p=params(alg);
+                    p.p[0]=(3.0f-.5f)/15.5f; p.p[1]=.25f; p.p[2]=.18f; p.p[3]=fb;
+                    p.fmRatioC=1.0f; p.fmRatioB1=2.0f; p.fmRatioB2=3.0f;
+                    const double alias=aliasDb(p,note,sr);
+                    if(alias>sweepWorst){sweepWorst=alias;sweepWorstRate=(int)sr;sweepWorstNote=note;sweepWorstAlgorithm=alg;sweepWorstFeedback=fb;}
+                    ++sweepCases;
+                }
+    std::printf("  wide sweep worst nonharmonic energy: %.2f dB (%d cases, 5 rates × 5 notes × 8 routes × 5 feedbacks; worst %d Hz / MIDI %d / algo %d / fb %.2f)\n",
+                sweepWorst,sweepCases,sweepWorstRate,sweepWorstNote,sweepWorstAlgorithm,sweepWorstFeedback);
+    check(sweepCases==1000&&sweepWorst < -55.0,"wide pitch/rate/route/feedback sweep retains low alias energy");
+
     int extreme=0, nonfinite=0;float peak=0;
     for(double sr:{8000.0,22050.0,48000.0,96000.0,192000.0})
         for(int note:{0,48,84,127})
